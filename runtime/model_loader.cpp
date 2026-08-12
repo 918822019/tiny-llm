@@ -1,9 +1,11 @@
-// .tqwen 加载器。设计规则：
-//   - 任何不一致都 fail fast，并给出人类可读的原因
-//     （损坏 / 截断 / 格式不符的文件绝不能悄悄通过）；
-//   - 整个文件读进一块 buffer；TensorView 的指针指向其中，
-//     因此 ModelFile 必须比所有使用者活得更久；
-//   - 这里不做任何计算——只负责读取和校验。
+// .tqwen 文件加载器。
+//
+// 先读 docs/infra_primer.md 第 5、9 节。本文件的核心思想是 **fail fast**：
+// 在"读文件"这个边界上把一切能检查的都检查掉，任何不一致立刻报错退出，
+// 绝不让坏数据悄悄流进后面的计算。权重文件约 2GB，读错一个偏移的代价
+// 是"结果看起来正常但全错"，这种 bug 几乎无法排查，所以宁可在这里严格。
+//
+// 流程：整个文件读进内存 -> 校验文件头 -> 校验 tensor 表 -> 建立索引。
 
 #include "model_loader.h"
 
@@ -19,13 +21,17 @@ void fail(std::string* err, const std::string& msg) {
   if (err) *err = msg;
 }
 
-// 一次性读整个文件（v1 不用 mmap；0.5B fp32 约 2GB，开发机可接受）。
+// 一次性把整个文件读进内存。
+// 为什么整读而不是按需读？v1 追求简单：拿到全部字节后，后面所有校验和
+// 取数都只是"内存里算偏移"，不再碰文件系统。（mmap 是更省的方案，见
+// known_limitations，v1 不做。）
 bool read_entire_file(const std::string& path, std::vector<uint8_t>* out, std::string* err) {
-  FILE* f = std::fopen(path.c_str(), "rb");
+  FILE* f = std::fopen(path.c_str(), "rb");  // 二进制只读打开
   if (!f) {
     fail(err, "cannot open file: " + path + " (" + std::strerror(errno) + ")");
     return false;
   }
+  // 先跳到文件末尾量出总长度，再跳回开头准备读。
   std::fseek(f, 0, SEEK_END);
   long size = std::ftell(f);
   std::fseek(f, 0, SEEK_SET);
@@ -34,18 +40,19 @@ bool read_entire_file(const std::string& path, std::vector<uint8_t>* out, std::s
     fail(err, "ftell failed: " + path);
     return false;
   }
-  out->resize(static_cast<size_t>(size));
+  out->resize(static_cast<size_t>(size));  // 一次性开好这么大的内存
   size_t got = out->empty() ? 0 : std::fread(out->data(), 1, out->size(), f);
   std::fclose(f);
-  if (got != out->size()) {
+  if (got != out->size()) {  // 实际读到的 < 预期：文件被截断/损坏
     fail(err, "short read: " + path);
     return false;
   }
   return true;
 }
 
-// e.name 是 NUL 补齐的，但占满 64 字符时不保证有终止符，
-// 所以用带长度上限的扫描，而不是 strlen。
+// 从 TensorEntry 里取出名字字符串。
+// 注意坑：name 字段是"定长 64 字节、用 NUL 补齐"，但名字恰好占满 64 字符时
+// 就没有结尾的 '\0'，不能当普通 C 字符串用 strlen，必须带长度上限地扫描。
 std::string entry_name(const TensorEntry& e) {
   size_t len = 0;
   while (len < kMaxTensorName && e.name[len] != '\0') ++len;
@@ -73,13 +80,16 @@ bool ModelFile::load(const std::string& path, std::string* err) {
 
   if (!read_entire_file(path, &data_, err)) return false;
 
-  // ---- 阶段 1：header 身份与全局不变量 ----
+  // ---- 阶段 1：校验文件头（这是不是一个合法、完整、我们认识的文件）----
+
   if (data_.size() < sizeof(TinyHeader)) {
     fail(err, "file too small for header: " + path);
     return false;
   }
+  // 把前 192 字节按 TinyHeader 的布局"看"成一个结构体。
   std::memcpy(&header_, data_.data(), sizeof(TinyHeader));
 
+  // 魔数不对 => 根本不是我们的文件（可能传错了文件）。
   if (std::memcmp(header_.magic, kMagic, sizeof(kMagic)) != 0) {
     fail(err, "bad magic (not a .tqwen file): " + path);
     return false;
@@ -92,6 +102,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     fail(err, "v1 loader only supports dtype=f32, got " + std::to_string(header_.dtype));
     return false;
   }
+  // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了。
   if (header_.total_bytes != data_.size()) {
     fail(err, "total_bytes mismatch: header=" + std::to_string(header_.total_bytes) +
                   " actual=" + std::to_string(data_.size()));
@@ -105,6 +116,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     fail(err, "implausible tensor_count: " + std::to_string(header_.tensor_count));
     return false;
   }
+  // tensor 表不能越出文件末尾。
   const uint64_t table_bytes = header_.tensor_count * sizeof(TensorEntry);
   if (header_.tensor_table_offset + table_bytes > data_.size()) {
     fail(err, "tensor table runs past end of file");
@@ -115,7 +127,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     return false;
   }
 
-  // header 中模型配置的合理性（后面建模要用，必须先过）。
+  // 模型配置本身的合理性：这些值接下来要拿来建模，必须能用。
   const TinyHeader& h = header_;
   if (h.n_layers == 0 || h.hidden_size == 0 || h.intermediate_size == 0 ||
       h.n_heads == 0 || h.n_kv_heads == 0 || h.head_dim == 0 || h.vocab_size == 0 ||
@@ -123,7 +135,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     fail(err, "model config contains zero fields");
     return false;
   }
-  if (h.n_heads % h.n_kv_heads != 0) {
+  if (h.n_heads % h.n_kv_heads != 0) {  // GQA 要求 q 头数能被 kv 头数整除
     fail(err, "n_heads % n_kv_heads != 0");
     return false;
   }
@@ -132,7 +144,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     return false;
   }
 
-  // ---- 阶段 2：逐条校验 tensor 表，然后建立索引 ----
+  // ---- 阶段 2：逐条校验 tensor 表，并建立"名字 -> 视图"索引 ----
   for (uint64_t i = 0; i < header_.tensor_count; ++i) {
     TensorEntry e;
     std::memcpy(&e, data_.data() + header_.tensor_table_offset + i * sizeof(TensorEntry),
@@ -146,6 +158,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
       fail(err, "tensor #" + std::to_string(i) + ": v1 supports f32 payloads only");
       return false;
     }
+    // 元素个数 = 各维相乘；任何一维为 0 都是非法的。
     uint64_t numel = 1;
     for (uint32_t d = 0; d < e.ndim; ++d) {
       if (e.shape[d] == 0) {
@@ -154,20 +167,24 @@ bool ModelFile::load(const std::string& path, std::string* err) {
       }
       numel *= e.shape[d];
     }
+    // 用不到的 shape 尾部必须清 0（防止垃圾值）。
     for (uint32_t d = e.ndim; d < 4; ++d) {
       if (e.shape[d] != 0) {
         fail(err, "tensor #" + std::to_string(i) + ": trailing shape must be 0");
         return false;
       }
     }
+    // 声明的字节数必须等于 元素个数 * 4（f32 每个 4 字节）。
     if (e.nbytes != numel * dtype_size(Dtype::kF32)) {
       fail(err, "tensor #" + std::to_string(i) + ": nbytes mismatch");
       return false;
     }
+    // 数据偏移必须 64B 对齐、且落在数据区内。
     if (e.offset % kAlignment != 0 || e.offset < header_.data_offset) {
       fail(err, "tensor #" + std::to_string(i) + ": unaligned / bad offset");
       return false;
     }
+    // 数据不能越出文件末尾。
     if (e.offset + e.nbytes > data_.size()) {
       fail(err, "tensor #" + std::to_string(i) + ": payload runs past end of file");
       return false;
@@ -183,7 +200,8 @@ bool ModelFile::load(const std::string& path, std::string* err) {
       return false;
     }
 
-    // 条目合法：发布一个指向文件 buffer 的视图。
+    // 这一条合法：构造一个指向文件内存的视图并存进索引。
+    // 注意 data 指针 = 文件内存起点 + 该 tensor 的偏移，零拷贝。
     TensorView view;
     view.name = name;
     view.dtype = static_cast<Dtype>(e.dtype);
@@ -195,7 +213,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     order_.push_back(std::move(name));
   }
 
-  // ---- 阶段 3：导出模型配置 ----
+  // ---- 阶段 3：把配置导出成 ModelConfig 供建模使用 ----
   config_.n_layers = h.n_layers;
   config_.hidden_size = h.hidden_size;
   config_.intermediate_size = h.intermediate_size;
@@ -225,7 +243,7 @@ void ModelFile::print_summary() const {
   std::printf("%-56s %-18s %-5s %12s %14s\n", "name", "shape", "dtype", "offset", "nbytes");
   for (const std::string& name : order_) {
     const TensorView& t = tensors_.at(name);
-    // TensorView 不保存 offset；这里用相对文件起始的指针差还原。
+    // TensorView 没单独存 offset，这里用"指针 - 文件起点"反推出来。
     uint64_t offset = static_cast<uint64_t>(t.data - data_.data());
     std::printf("%-56s %-18s %-5s %12llu %14llu\n", name.c_str(), shape_str(t).c_str(),
                 dtype_name(t.dtype), (unsigned long long)offset,

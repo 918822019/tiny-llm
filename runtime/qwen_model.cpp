@@ -1,16 +1,19 @@
-// 固定结构的 Qwen forward，batch = 1，token-by-token。
+// Qwen 前向的实现。这是整个 runtime 的核心，建议配合 docs/qwen_forward.md 阅读。
 //
-// 本文件刻意不做任何图抽象：forward 就是一个可读的函数，op 顺序与
-// docs/qwen_forward.md 一一对应，与 PyTorch 出现数值偏差时肉眼可查。
+// 一个 token 的前向大致是：
+//   查词嵌入 -> 逐层 [attention + FFN] -> 最后 norm -> 投影到词表得 logits -> argmax
+//
+// 刻意不做任何图抽象：forward 就是一个可读的函数，op 顺序与文档一一对应，
+// 跟 PyTorch 出现数值偏差时肉眼可查。
 //
 // workspace buffer（create() 时一次分配，每个 token 不再分配）：
-//   hidden_  残差流（running residual）          [hidden]
-//   normed_  喂给各 projection 的 RMSNorm 输出   [hidden]
-//   q_/k_/v_ attention 投影结果                  [q_dim] / [kv_dim] / [kv_dim]
-//   attn_    attention 输出（head 拼接）         [q_dim]
-//   o_       o_proj 输出                         [hidden]
-//   gate_/up_/ffn_  SwiGLU 中间量                [inter] / [inter] / [hidden]
-//   logits_  lm_head 输出                        [vocab]
+//   hidden_  残差流：贯穿所有层的主数据，残差不断往上加
+//   normed_  每次 RMSNorm 的输出，喂给接下来的投影
+//   q_/k_/v_ attention 的 query/key/value 投影结果
+//   attn_    attention 输出（各 head 拼接）
+//   o_       o_proj 输出
+//   gate_/up_/ffn_  SwiGLU FFN 的中间量
+//   logits_  lm_head 输出，对词表每个词一个分数
 
 #include "qwen_model.h"
 
@@ -26,13 +29,13 @@ namespace tinyqwen {
 
 namespace {
 
-// greedy 采样辅助：对下标数组做 partial_sort，复杂度 O(vocab * k)，
+// 取分数最高的 k 个 token。实现：对下标数组做 partial_sort，
+// 只把前 k 个排好序，复杂度 O(vocab * k)。结果第一个就是 argmax。
 // v1 够用（每 token 调一次，不在 kernel 热点路径上）。
-// 结果的第一个元素就是 argmax。
 void top_k_logits(const float* logits, int vocab, int k, TopKResult* out) {
   k = std::min(k, vocab);
   std::vector<int> idx(vocab);
-  std::iota(idx.begin(), idx.end(), 0);
+  std::iota(idx.begin(), idx.end(), 0);  // idx = [0,1,2,...]
   std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
                     [logits](int a, int b) { return logits[a] > logits[b]; });
   out->indices.resize(k);
@@ -54,9 +57,9 @@ std::string shape_str(const std::vector<uint64_t>& s) {
 
 }  // namespace
 
-// 按 HF 名字取 tensor，并校验 dtype/ndim/shape 是否与 forward 的预期一致。
+// 按 HF 名字取 tensor，并校验 dtype/ndim/shape 是否与 forward 预期一致。
 // shape 不对（比如导出了非 Qwen 的 checkpoint）在这里就变成明确报错，
-// 而不是后面悄悄算错。
+// 而不是后面悄悄算错（fail fast，见 primer 第 9 节）。
 const float* QwenModel::require(const ModelFile& file, const std::string& name,
                                 const std::vector<uint64_t>& shape, std::string* err) {
   const TensorView* t = file.get(name);
@@ -84,9 +87,8 @@ const float* QwenModel::require(const ModelFile& file, const std::string& name,
   return t->f32();
 }
 
-// 工厂函数：绑定权重视图、校验 forward 需要的每个 tensor、
-// 初始化 KV cache 和 workspace buffer。所有失败都经 *err 报告；
-// 成功后 *out 持有一个可直接运行的模型。
+// 工厂：绑定权重视图、校验每个 tensor、初始化 KV cache 和 workspace。
+// 所有失败经 *err 报告；成功后 *out 持有一个可直接运行的模型。
 bool QwenModel::create(const ModelFile& file, int max_seq_len, Profiler& profiler,
                        std::string* err, std::unique_ptr<QwenModel>* out) {
   out->reset();
@@ -96,6 +98,7 @@ bool QwenModel::create(const ModelFile& file, int max_seq_len, Profiler& profile
   }
   const ModelConfig& cfg = file.config();
 
+  // max_seq_len <= 0 表示"用模型训练时的上限"。
   if (max_seq_len <= 0) max_seq_len = static_cast<int>(cfg.max_seq_len);
   if (max_seq_len > static_cast<int>(cfg.max_seq_len)) {
     if (err) *err = "max_seq_len " + std::to_string(max_seq_len) +
@@ -116,19 +119,21 @@ bool QwenModel::create(const ModelFile& file, int max_seq_len, Profiler& profile
   const uint64_t qd = static_cast<uint64_t>(m->q_dim_);
   const uint64_t kvd = static_cast<uint64_t>(m->kv_dim_);
 
+  // 全局权重：词嵌入、最后 norm、lm_head。
   m->embed_ = m->require(file, "model.embed_tokens.weight", {vocab, hidden}, err);
   if (!m->embed_) return false;
   m->final_norm_ = m->require(file, "model.norm.weight", {hidden}, err);
   if (!m->final_norm_) return false;
   if (cfg.tied_embeddings) {
+    // tied：lm_head 和词嵌入共享同一份权重（0.5B 模型如此），省一份内存。
     m->lm_head_ = m->embed_;
   } else {
     m->lm_head_ = m->require(file, "lm_head.weight", {vocab, hidden}, err);
     if (!m->lm_head_) return false;
   }
 
-  // 每层权重。tensor 名字完全沿用 HuggingFace 约定，
-  // 缺哪个名字就能直接定位到 exporter 的问题。
+  // 每层权重。tensor 名字完全沿用 HuggingFace 约定，缺哪个名字
+  // 就能直接定位到 exporter 的问题。
   m->layers_.resize(cfg.n_layers);
   for (uint32_t i = 0; i < cfg.n_layers; ++i) {
     const std::string p = "model.layers." + std::to_string(i) + ".";
@@ -162,6 +167,7 @@ bool QwenModel::create(const ModelFile& file, int max_seq_len, Profiler& profile
   m->kv_.init(static_cast<int>(cfg.n_layers), static_cast<int>(cfg.n_kv_heads), max_seq_len,
               static_cast<int>(cfg.head_dim));
 
+  // 一次性开好所有 workspace，forward 里不再分配。
   m->hidden_.resize(hidden);
   m->normed_.resize(hidden);
   m->q_.resize(m->q_dim_);
@@ -183,9 +189,9 @@ void QwenModel::reset() {
   token_count_ = 0;
 }
 
-// 对单个 token 做一次完整前向。`pos` 是当前 KV 长度；调用结束后
-// cache 中有 pos+1 个条目，返回的 id 是 greedy 的下一个 token。
-// 数学定义见 docs/qwen_forward.md。
+// 对单个 token 做一次完整前向。
+// pos 是当前 KV 长度（= 这是序列里第几个位置）；调用结束后 cache 有 pos+1 条，
+// 返回值是 greedy 的下一个 token。数学定义见 docs/qwen_forward.md。
 int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
   const int hidden = static_cast<int>(cfg_.hidden_size);
   const int inter = static_cast<int>(cfg_.intermediate_size);
@@ -195,6 +201,7 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
   const int head_dim = static_cast<int>(cfg_.head_dim);
   const int pos = kv_.seq_len();
 
+  // 边界检查：token 必须在词表范围内、位置不能超容量。
   if (token_id < 0 || token_id >= vocab) {
     std::fprintf(stderr, "tinyqwen: token_id %d out of range [0, %d)\n", token_id, vocab);
     std::abort();
@@ -207,34 +214,39 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
   Profiler& prof = *profiler_;
   prof.begin_token(token_count_, pos, token_count_ < prompt_len_);
 
-  // profiler 作用域名（"layer_<i>.<op>"）写进同一个栈上 buffer：
-  // 避免每个 token 的每个 op 都分配 std::string。
+  // profiler 作用域名（"layer_<i>.<op>"）写进同一个栈上 buffer，
+  // 避免每个 op 都分配一次 std::string（那会很浪费）。
   char name[64];
   const auto scope = [&](const char* fmt, int layer) {
     std::snprintf(name, sizeof(name), fmt, layer);
     return name;
   };
 
-  // ---- embedding lookup 初始化残差流 ----
+  // ==== 第 1 步：词嵌入 ====
+  // 用 token_id 当行号，从词嵌入表里取出对应那一行，作为残差流初值。
+  // embed 布局 [vocab, hidden]，第 token_id 行起点 = embed_ + token_id*hidden。
   {
     ScopedTimer t(prof, "embed");
     std::memcpy(hidden_.data(), embed_ + static_cast<size_t>(token_id) * hidden,
                 hidden * sizeof(float));
   }
 
-  // 1/sqrt(head_dim)，不是 1/sqrt(hidden)——常见易错点。
+  // attention 的缩放系数 1/sqrt(head_dim)。注意是 head_dim，不是 hidden——常见易错点。
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
+  // ==== 第 2 步：逐层 transformer ====
   for (uint32_t i = 0; i < cfg_.n_layers; ++i) {
     const LayerWeights& w = layers_[i];
 
     // ---- attention 块：norm -> qkv(+bias) -> RoPE -> 入 cache -> attend ----
 
+    // 2a. attention 前的 RMSNorm。
     {
       ScopedTimer t(prof, scope("layer_%d.input_layernorm", i));
       rmsnorm_ref(hidden_.data(), w.input_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
     }
-    // Qwen2/2.5 的 q/k/v 有 bias；必须加在 RoPE 之前（HF 顺序）。
+    // 2b. q/k/v 投影 + bias。Qwen2/2.5 的 q/k/v 有 bias，且必须加在 RoPE 之前。
+    // matvec = 矩阵乘向量：normed_ 过投影矩阵得到 q_/k_/v_。
     {
       ScopedTimer t(prof, scope("layer_%d.q_proj", i));
       matvec_f32_ref(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
@@ -250,12 +262,13 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
       matvec_f32_ref(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden);
       for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
     }
+    // 2c. RoPE 旋转位置编码：把"位置 pos"的信息编进 q/k（v 不需要）。
     {
       ScopedTimer t(prof, scope("layer_%d.rope", i));
       rope_ref(q_.data(), k_.data(), n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
     }
-    // 先 append 再 attend：当前 token 必须能看到自己，
-    // 所以下面的 attention 读 cache 时 seq_len = pos + 1。
+    // 2d. 把当前 token 的 k/v 追加进 cache。注意必须先 append 再 attend：
+    // 当前 token 要能"看到"自己，所以下面 attention 读的 seq_len = pos+1。
     {
       ScopedTimer t(prof, scope("layer_%d.kv_append", i));
       const size_t pos_off = static_cast<size_t>(pos) * head_dim;
@@ -269,17 +282,19 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
                     head_dim * sizeof(float));
       }
     }
+    // 2e. attention：当前 q 对 cache 里 [0..pos] 所有位置加权求和。
     {
       ScopedTimer t(prof, scope("layer_%d.attention", i));
       attention_decode_ref(q_.data(), kv_.k(static_cast<int>(i)),
                            kv_.v(static_cast<int>(i)), pos + 1, max_seq_len_, n_heads,
                            n_kv_heads, head_dim, attn_scale, attn_.data());
     }
+    // 2f. 输出投影 o_proj。
     {
       ScopedTimer t(prof, scope("layer_%d.o_proj", i));
       matvec_f32_ref(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
     }
-    // 第一次残差：x = x + o_proj(attn)。
+    // 2g. 第一次残差连接：x = x + attention(x)。残差让梯度/信息能直通。
     {
       ScopedTimer t(prof, scope("layer_%d.residual_attn", i));
       for (int j = 0; j < hidden; ++j) hidden_[j] += o_[j];
@@ -287,10 +302,12 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
 
     // ---- FFN 块（SwiGLU）：norm -> gate/up -> silu*up -> down ----
 
+    // 2h. FFN 前的 RMSNorm。
     {
       ScopedTimer t(prof, scope("layer_%d.post_attn_layernorm", i));
       rmsnorm_ref(hidden_.data(), w.post_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
     }
+    // 2i. gate 和 up 两个投影并行（SwiGLU 需要两条支路）。
     {
       ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
       matvec_f32_ref(w.gate, normed_.data(), gate_.data(), inter, hidden);
@@ -299,38 +316,41 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
       ScopedTimer t(prof, scope("layer_%d.up_proj", i));
       matvec_f32_ref(w.up, normed_.data(), up_.data(), inter, hidden);
     }
+    // 2j. SwiGLU 融合：SiLU 只作用在 gate 支路，再和 up 逐元素相乘。
+    // gate_ 就地复用为融合结果，直接喂给 down_proj。
     {
-      // SiLU 只作用在 gate 分支；gate_ 就地复用为融合后的
-      // (silu(gate) * up)，直接喂给 down_proj。
       ScopedTimer t(prof, scope("layer_%d.swiglu", i));
       silu_ref(gate_.data(), gate_.data(), inter);
       for (int j = 0; j < inter; ++j) gate_[j] *= up_[j];
     }
+    // 2k. down 投影，把维度从 inter 压回 hidden。
     {
       ScopedTimer t(prof, scope("layer_%d.down_proj", i));
       matvec_f32_ref(w.down, gate_.data(), ffn_.data(), hidden, inter);
     }
-    // 第二次残差：x = x + ffn。
+    // 2l. 第二次残差连接：x = x + ffn(x)。
     {
       ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
       for (int j = 0; j < hidden; ++j) hidden_[j] += ffn_[j];
     }
   }
 
+  // ==== 第 3 步：最后的 norm + 投影到词表 ====
   {
     ScopedTimer t(prof, "final_norm");
     rmsnorm_ref(hidden_.data(), final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
   }
   {
-    // 权重 tied 时 lm_head_ 就是 embed_（Qwen2.5-0.5B 如此）。
+    // lm_head：把 hidden 向量投成 vocab 维的 logits（每个词一个分数）。
+    // tied 时 lm_head_ 就是 embed_（见 create）。
     ScopedTimer t(prof, "lm_head");
     matvec_f32_ref(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
   }
 
+  // ==== 第 4 步：greedy 取 argmax ====
   int next = 0;
   {
-    // greedy：argmax == top-1；调用方要 top-k 时直接复用 partial_sort，
-    // 不扫第二遍。
+    // 要 top-k 就顺便取，argmax 就是 top-1，不重复扫。
     ScopedTimer t(prof, "topk_argmax");
     if (topk) {
       top_k_logits(logits_.data(), vocab, topk_k, topk);
@@ -340,7 +360,7 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     }
   }
 
-  // 提交层循环中写入的 cache 槽位，然后收尾 profiler 的 token 记录。
+  // 提交本 token 写入的 cache 槽位，收尾 profiler 记录。
   kv_.advance(1);
   token_count_ += 1;
   prof.end_token();

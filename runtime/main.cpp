@@ -1,12 +1,17 @@
-// tinyqwen CLI：加载 .tqwen 模型，跑 token-by-token greedy decode。
+// tinyqwen CLI：命令行入口，把"加载模型 -> 前向 -> 输出"串起来。
 //
 //   tinyqwen --model model.tqwen \
 //            --tokens-json prompt_tokens.json \
 //            --max-new-tokens 16 \
 //            --profile-out profile.json
 //
-// token ids 来自 Python（tools/tokenize_prompt.py）：v1 的 C++ 侧
-// 刻意不内置 tokenizer。
+// 推理分两个阶段（概念见 docs/infra_primer.md 第 2 节）：
+//   - prefill：把输入的每个 prompt token 依次喂进模型，填满 KV cache，
+//     最后一步产出第一个生成 token；
+//   - decode：之后每步把上一步生成的 token 再喂回去，生成下一个，循环。
+//
+// token ids 来自 Python（tools/tokenize_prompt.py）：v1 的 C++ 侧刻意不内置
+// tokenizer（分词与研究主线无关，复用现成工具即可）。
 
 #include <cstdio>
 #include <cstdlib>
@@ -155,6 +160,7 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, &args)) return 2;
 
+  // ---- 加载权重文件并校验 ----
   tinyqwen::ModelFile file;
   std::string err;
   if (!file.load(args.model, &err)) {
@@ -167,6 +173,7 @@ int main(int argc, char** argv) {
   tinyqwen::Profiler profiler(!args.profile_out.empty());
   profiler.set_meta("qwen2.5-0.5b-like", "cpu_ref", "fp32");
 
+  // ---- 建模：校验权重、分配 KV cache 和 workspace ----
   std::unique_ptr<tinyqwen::QwenModel> model;
   if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
@@ -211,9 +218,10 @@ int main(int argc, char** argv) {
     std::printf("\n");
   };
 
-  // ---- prefill（token-by-token）----
-  // prefill 结束后，`next` 就是第一个生成 token
-  //（最后一个 prompt 位置 logits 的 argmax）。
+  // ---- prefill 阶段（token-by-token）----
+  // 把 prompt 的每个 token 依次喂进模型。每步都填 KV cache 并产生 logits，
+  // 但我们只关心最后一步——它的 argmax 就是第一个要生成的 token。
+  // prefill 结束后，`next` 就是第一个生成 token。
   int next = 0;
   tinyqwen::TopKResult topk;
   for (size_t i = 0; i < tokens.size(); ++i) {
@@ -228,9 +236,11 @@ int main(int argc, char** argv) {
     }
   }
   std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
-  if (args.topk > 0) print_topk(topk);  // g0 的分布
+  if (args.topk > 0) print_topk(topk);  // 第一个生成 token g0 的分数分布
 
-  // ---- decode ----
+  // ---- decode 阶段 ----
+  // 循环：把上一步的输出当作下一步的输入，每次生成一个新 token，
+  // 直到凑够 max_new_tokens 或遇到停止符 eos。
   std::vector<int> generated;
   for (int step = 0; step < args.max_new_tokens; ++step) {
     generated.push_back(next);

@@ -1,10 +1,16 @@
 #pragma once
 
-// tinyqwen runtime 的朴素标量 reference kernels。
+// 这是所有"reference kernel"（参考实现算子）的函数签名集合。
 //
-// 本目录下所有 kernel 的共同约定：
+// 什么是 reference kernel？
+//   就是每个数学运算的"最简单、最直白"的实现：不用 SIMD、不优化、只求正确。
+//   它有两个用途：
+//     1. 作为数值基准——后续写高性能 kernel（INT4/NEON 等）时，结果必须和它对齐；
+//     2. v1 阶段直接拿它跑通整条推理链路。
+//
+// 本目录所有 kernel 的共同约定：
 //   - 正确性和可读性优先，不用 SIMD、不开多线程；
-//   - 输入/输出指针由调用方提供，kernel 不为其分配内存；
+//   - 输入/输出指针由调用方提供，kernel 不为其分配内存（避免隐藏的 new/delete）；
 //   - shape 全部以显式参数传入，kernel 无隐藏状态；
 //   - 每个 kernel 在 tests/ 都有小 shape 单元测试。
 
@@ -25,7 +31,7 @@ void silu_ref(const float* x, float* y, int n);
 // 返回第一个最大值的下标（平局取靠前者）。
 int argmax_ref(const float* logits, int n);
 
-// 对单个 decode 位置做旋转位置编码（in-place）。
+// 对单个 decode 位置做旋转位置编码 RoPE（in-place）。
 // q: [n_heads * head_dim]，k: [n_kv_heads * head_dim]。
 // 与 HF Qwen2 的 rotate-half 约定一致：
 //   out[i]        = x[i] * cos - x[i + half] * sin
