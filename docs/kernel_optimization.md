@@ -49,8 +49,12 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()   (�
 - **可 A/B**：同一负载，切换实现各跑一遍直接对比；
 - **可兜底**：切回 ref 永远有正确结果。
 
-当前用运行时开关选择（`--matvec-impl`，默认 `ref`），micro-benchmark 时
-也能在同一个程序里同时调 ref 和优化版做对比。
+选择方式有两种，优先级 **CLI 开关 > 配置文件 > 默认**：
+
+- CLI：`--matvec-impl ref`（benchmark 时随手切换）；
+- 配置文件：`tinyqwen.conf` 里写 `matvec_impl = ref`（用 `--config` 指定）。
+
+micro-benchmark 时也能在同一个程序里同时调 ref 和优化版做对比。
 
 ## 4. 加一个新优化算子：标准流程
 

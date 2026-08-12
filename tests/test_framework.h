@@ -7,9 +7,22 @@
 #include <cstdio>
 #include <functional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace tinytest {
+
+// 把断言里的值转成可读字符串：数字走 to_string，字符串原样返回。
+template <typename T>
+inline std::string display(const T& v) {
+  if constexpr (std::is_same<T, std::string>::value) {
+    return v;
+  } else if constexpr (std::is_arithmetic<T>::value) {
+    return std::to_string(+v);  // +v 把 char/short 提升，避免 to_string 无重载
+  } else {
+    return std::string(v);  // const char* 等
+  }
+}
 
 struct Failure {
   std::string msg;
@@ -69,8 +82,8 @@ inline int run_all() {
     auto va = (a);                                                 \
     auto vb = (b);                                                 \
     if (!(va == vb)) {                                             \
-      TQ_FAIL("EXPECT_EQ(" #a ", " #b ") failed: " + std::to_string(va) + \
-              " vs " + std::to_string(vb));                        \
+      TQ_FAIL("EXPECT_EQ(" #a ", " #b ") failed: " + tinytest::display(va) + \
+              " vs " + tinytest::display(vb));                     \
     }                                                              \
   } while (0)
 

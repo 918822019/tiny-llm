@@ -4,6 +4,7 @@ add_library(tinyqwen_runtime STATIC
   model_loader.cpp
   kv_cache.cpp
   profiler.cpp
+  config.cpp
   qwen_model.cpp
 )
 target_include_directories(tinyqwen_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

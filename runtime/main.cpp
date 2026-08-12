@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "config.h"
 #include "dispatch.h"
 #include "model_loader.h"
 #include "profiler.h"
@@ -38,7 +39,8 @@ struct Args {
   int topk = 0;
   int eos = 151645;  // Qwen2.5 的 im_end；传 -1 禁用
   bool verbose = false;
-  std::string matvec_impl = "ref";  // matvec 实现：ref（默认）/ 将来的 neon 等
+  std::string config;          // 配置文件路径（可选）
+  std::string matvec_impl;     // matvec 实现；空 = 未指定，交给配置/默认值
 };
 
 void usage(const char* prog) {
@@ -53,6 +55,7 @@ void usage(const char* prog) {
                "  --dump-logits PATH      dump full logits (fp32 binary) after every forward\n"
                "  --profile-out PATH      write profiler JSON\n"
                "  --eos ID                stop token, default 151645, -1 disables\n"
+               "  --config PATH           key=value config file (CLI flags override it)\n"
                "  --matvec-impl NAME      matvec kernel: ref (default; neon later)\n"
                "  --verbose               model summary + per-token details\n",
                prog);
@@ -78,6 +81,7 @@ bool parse_args(int argc, char** argv, Args* out) {
     else if (a == "--profile-out") out->profile_out = value("--profile-out");
     else if (a == "--dump-logits") out->dump_logits = value("--dump-logits");
     else if (a == "--eos") out->eos = std::atoi(value("--eos").c_str());
+    else if (a == "--config") out->config = value("--config");
     else if (a == "--matvec-impl") out->matvec_impl = value("--matvec-impl");
     else if (a == "--verbose") out->verbose = true;
     else if (a == "--help" || a == "-h") { usage(argv[0]); std::exit(0); }
@@ -164,13 +168,27 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, &args)) return 2;
 
-  // ---- 选择 matvec 实现（默认 ref；未知值报错，保证可兜底）----
+  // ---- 读取配置文件（可选）----
+  tinyqwen::Config config;
+  if (!args.config.empty()) {
+    std::string cerr;
+    if (!config.load(args.config, &cerr)) {
+      std::fprintf(stderr, "error: %s\n", cerr.c_str());
+      return 1;
+    }
+    std::fprintf(stderr, "[init] config: %s (%zu keys)\n", args.config.c_str(),
+                 config.size());
+  }
+
+  // ---- 解析 matvec 实现：CLI > 配置文件 > 默认 ref（未知值报错，可兜底）----
+  std::string impl_name = args.matvec_impl;  // 非空 = CLI 显式指定
+  if (impl_name.empty()) impl_name = config.get("matvec_impl", "ref");
   tinyqwen::MatvecImpl impl;
-  if (args.matvec_impl == "ref") {
+  if (impl_name == "ref") {
     impl = tinyqwen::MatvecImpl::kRef;
   } else {
-    std::fprintf(stderr, "error: unknown --matvec-impl '%s' (available: ref)\n",
-                 args.matvec_impl.c_str());
+    std::fprintf(stderr, "error: unknown matvec_impl '%s' (available: ref)\n",
+                 impl_name.c_str());
     return 2;
   }
   tinyqwen::set_matvec_impl(impl);

@@ -9,6 +9,7 @@ add_executable(tinyqwen_tests
   test_softmax_argmax.cpp
   test_attention.cpp
   test_kv_cache.cpp
+  test_config.cpp
 )
 target_link_libraries(tinyqwen_tests PRIVATE tinyqwen_runtime)
 add_test(NAME tinyqwen_tests COMMAND tinyqwen_tests)

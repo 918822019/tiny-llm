@@ -117,7 +117,23 @@ tinyqwen --model <model.tqwen> [options]
 | `--dump-logits PATH` | 无 | 每次 forward 后写全量 logits（fp32 binary，按位置顺序逐行） |
 | `--profile-out PATH` | 无 | profiler JSON 输出 |
 | `--eos ID` | 151645 | stop token，-1 禁用 |
+| `--config PATH` | 无 | key=value 配置文件（见下；CLI 开关优先于它） |
+| `--matvec-impl NAME` | ref | matvec kernel 实现：`ref`（以后会有 neon 等） |
 | `--verbose` | 关 | 模型 summary + prefill 细节（stderr） |
+
+### 配置文件
+
+纯文本 `key = value`（`#` 注释），零依赖、不引 YAML。仓库里带了一份
+`tinyqwen.conf`。**优先级：CLI 开关 > 配置文件 > 默认值**——benchmark 时可
+随时用命令行覆盖。当前可配：
+
+```text
+matvec_impl = ref     # matvec kernel 实现
+```
+
+```bash
+./build/runtime/tinyqwen --config tinyqwen.conf --model model.tqwen ...
+```
 
 stdout 输出语义（面向脚本化）：
 
