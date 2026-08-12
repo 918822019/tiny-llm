@@ -11,7 +11,7 @@ tinyqwen/
 ├── CMakeLists.txt        # 顶层构建
 ├── runtime/              # loader / tensor view / kv cache / qwen forward / profiler / CLI
 ├── kernels/              # 朴素标量 reference kernels（正确性优先）
-├── tools/                # Python 侧：exporter / tokenize / reference dump / profile 分析
+├── tools/                # Python 侧：exporter / tokenize / reference dump / 数值对齐验证
 ├── tests/                # 单元测试（无第三方测试框架）
 ├── scripts/              # Android NDK 编译 / adb 运行脚本
 ├── experiments/          # 预留：run_decode / run_layer_bench 等实验入口
@@ -83,6 +83,37 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 ```
 
 `--dump-logits PATH` 可导出每步全量 logits（fp32 binary），用于逐位置排查。
+
+## CLI 参考
+
+```bash
+tinyqwen --model <model.tqwen> [options]
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--model PATH` | 必填 | .tqwen 权重文件 |
+| `--tokens CSV` | 二选一 | 逗号分隔的 token ids |
+| `--tokens-json PATH` | 二选一 | `tokenize_prompt.py` 输出的 JSON |
+| `--max-new-tokens N` | 16 | 最多生成 token 数 |
+| `--max-seq-len N` | 1024 | KV cache 容量上限，不得超过 header max_seq_len |
+| `--topk K` | 0 | 输出 top-k logits 行（0 = 关闭） |
+| `--dump-logits PATH` | 无 | 每次 forward 后写全量 logits（fp32 binary，按位置顺序逐行） |
+| `--profile-out PATH` | 无 | profiler JSON 输出 |
+| `--eos ID` | 151645 | stop token，-1 禁用 |
+| `--verbose` | 关 | 模型 summary + prefill 细节（stderr） |
+
+stdout 输出语义（面向脚本化）：
+
+```text
+topk 13:1.253097 25:1.182579   # logits 分布；第一行在 prefill 结束后输出
+gen 0 13                       # 生成 token g0；每个 topk 行描述下一个 gen 行的 token
+...
+generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
+```
+
+注意：第一个生成 token g0 = 最后一个 prompt 位置 logits 的 argmax，在 prefill
+阶段产生；decode 每步消费上一个生成 token。进度/报错信息走 stderr。
 
 ## 文档
 

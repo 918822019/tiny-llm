@@ -42,6 +42,17 @@ adb shell "cd /data/local/tmp/tinyqwen && chmod +x tinyqwen && \
              --max-new-tokens 16 --profile-out profile.json"
 ```
 
+### stdout 输出格式
+
+```text
+topk <id>:<val> ...   # logits 分布；第一行在 prefill 结束后输出
+gen <step> <token_id> # 生成 token；每个 topk 行描述下一个 gen 行的 token
+generated_ids: ...    # 末尾汇总全部生成 ids
+```
+
+需要全量 logits 做数值比对时加 `--dump-logits PATH`（每次 forward 写一行
+vocab 个 fp32，行序 = 位置序；完整语义见 README「CLI 参考」）。
+
 ## 4. 拉回 profile
 
 ```bash

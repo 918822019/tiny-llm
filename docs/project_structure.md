@@ -15,9 +15,11 @@ tinyqwen/
 │   ├── ref_ops.h           # 所有 reference kernel 的签名约定
 │   └── *_ref.cpp           # rmsnorm/rope/matvec/softmax/attention/silu/argmax
 ├── tools/                  # Python 工具（不进 CMake）
-│   ├── export_qwen_to_tiny.py   # HF safetensors -> .tqwen flat binary
+│   ├── export_qwen_to_tiny.py   # HF safetensors -> .tqwen flat binary（write_tqwen 为通用写入口）
 │   ├── tokenize_prompt.py       # prompt -> token ids JSON
-│   └── dump_qwen_reference.py   # PyTorch 参考值 dump（npz）
+│   ├── dump_qwen_reference.py   # PyTorch 参考值 dump（npz，真机对齐用）
+│   ├── make_fake_model.py       # 随机权重小 .tqwen（冒烟测试，不下载真模型）
+│   └── align_fake_model.py      # C++ vs HF Qwen2 逐位置 logits 数值对齐（改 forward 后先跑）
 ├── tests/                  # 单元测试，自带最小测试框架（test_framework.h）
 ├── scripts/                # build_android.sh / run_android.sh / pull_profile.sh
 ├── experiments/            # 预留：run_decode.cpp / run_layer_bench.cpp
