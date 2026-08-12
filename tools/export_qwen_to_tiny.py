@@ -245,7 +245,9 @@ def main() -> None:
 
     def get_shard(path: Path):
         if path not in opened:
-            opened[path] = safe_open(str(path), framework="numpy")
+            # 用 torch 框架读：真实 Qwen 权重是 bf16，numpy 不认识 bf16；
+            # 读出来后在 LazyTensors 里统一转成 fp32。
+            opened[path] = safe_open(str(path), framework="torch")
         return opened[path]
 
     # 先校验所有 tensor 都存在（任何缺失都在写文件之前报错）。
@@ -274,7 +276,8 @@ def main() -> None:
     # 相比把 2GB fp32 模型整个放进内存，这是可接受的代价。
     class LazyTensors(dict):
         def __getitem__(self, key):
-            return get_shard(shard_map[key]).get_tensor(key)
+            tensor = get_shard(shard_map[key]).get_tensor(key)
+            return tensor.float().numpy()  # bf16/fp16 -> fp32 numpy
 
     total = write_tqwen(args.out, header_cfg, LazyTensors.fromkeys(names))
 

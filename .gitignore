@@ -1,10 +1,22 @@
+# 构建产物
 build/
 build-*/
 *.o
 *.a
+
+# 模型权重 / 导出数据（体积大，不入库）
+models/
 *.tqwen
 *.npz
 *.pt
+*.safetensors
+*.bin
+
+# 运行生成物
+profile*.json
+prompt_tokens.json
+
+# Python / 编辑器 / 系统
 __pycache__/
 .DS_Store
 .idea/
