@@ -1,9 +1,8 @@
-// SiLU (swish) activation: y = x * sigmoid(x) = x / (1 + exp(-x)).
+// SiLU（swish）激活：y = x * sigmoid(x) = x / (1 + exp(-x))。
 //
-// Used on the GATE branch of the SwiGLU FFN only (see qwen_model.cpp:
-// down_proj(silu(gate) * up)). The division form is overflow-safe: for very
-// negative x, exp(-x) -> +inf and the result tends to 0, which is correct.
-// In-place calls (x == y) are supported.
+// 只用于 SwiGLU FFN 的 gate 分支（见 qwen_model.cpp：
+// down_proj(silu(gate) * up)）。除法形式不会溢出：x 为大负数时
+// exp(-x) -> +inf，结果趋于 0，行为正确。支持 in-place 调用（x == y）。
 
 #include "ref_ops.h"
 

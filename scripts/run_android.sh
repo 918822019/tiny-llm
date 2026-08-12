@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Push the tinyqwen binary + model to the device and run a decode.
+# 把 tinyqwen binary + 模型 push 到设备并运行 decode。
 #
-#   ./scripts/run_android.sh model.tqwen prompt_tokens.json [extra tinyqwen args...]
+#   ./scripts/run_android.sh model.tqwen prompt_tokens.json [tinyqwen 的额外参数...]
 #
-# Requires: adb in PATH, one device connected, files built by build_android.sh.
+# 前置：PATH 里有 adb、已连接一台设备、scripts/build_android.sh 已编译。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -24,7 +24,7 @@ adb shell "mkdir -p $DEVICE_DIR"
 adb push "$BIN" "$DEVICE_DIR/tinyqwen" >/dev/null
 adb shell "chmod +x $DEVICE_DIR/tinyqwen"
 
-# Push the model only when the remote copy is missing or size differs.
+# 仅当设备上缺少模型或大小不一致时才重新 push（模型约 2GB，避免重复传输）。
 LOCAL_SIZE=$(stat -f%z "$MODEL" 2>/dev/null || stat -c%s "$MODEL")
 REMOTE_SIZE=$(adb shell "stat -c%s $DEVICE_DIR/model.tqwen 2>/dev/null || echo 0" | tr -d '\r')
 if [[ "$LOCAL_SIZE" != "$REMOTE_SIZE" ]]; then

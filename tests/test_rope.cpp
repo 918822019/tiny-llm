@@ -8,7 +8,7 @@
 using namespace tinyqwen;
 
 TEST(rope_single_head_pos1) {
-  // head_dim=4, pos=1, theta=10000: inv_freq = [1.0, 0.01]
+  // head_dim=4、pos=1、theta=10000 时 inv_freq = [1.0, 0.01]，可手算验证。
   float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
   float k[4] = {0.0f, 1.0f, 0.0f, 0.0f};
   rope_ref(q, k, 1, 1, 4, 1, 10000.0f);
@@ -25,7 +25,7 @@ TEST(rope_single_head_pos1) {
 }
 
 TEST(rope_preserves_norm) {
-  // Rotation must preserve vector norm for every head.
+  // 旋转是正交变换：每个 head 的向量模长必须保持不变。
   const int n_heads = 3, n_kv = 1, head_dim = 8, pos = 17;
   std::vector<float> q(n_heads * head_dim), k(n_kv * head_dim);
   double norm_q = 0.0, norm_k = 0.0;
@@ -48,20 +48,21 @@ TEST(rope_preserves_norm) {
 }
 
 TEST(rope_gqa_applies_to_all_heads) {
-  // Two q heads and one kv head: each head rotated independently, same result
-  // per head as the single-head case.
+  // 2 个 q head、1 个 kv head：每个 head 独立旋转，
+  // 且每个 head 的结果与单 head 情形一致。
   float q[8] = {1, 0, 0, 0, 0, 1, 0, 0};
   float k[4] = {1, 0, 0, 0};
   rope_ref(q, k, 2, 1, 4, 1, 10000.0f);
 
   EXPECT_NEAR(q[0], std::cos(1.0), 1e-6);          // head 0
   EXPECT_NEAR(q[2], std::sin(1.0), 1e-6);
-  EXPECT_NEAR(q[5], std::cos(0.01), 1e-6);         // head 1: x1 of pair 0
+  EXPECT_NEAR(q[5], std::cos(0.01), 1e-6);         // head 1：配对 0 的 x1 分量
   EXPECT_NEAR(q[7], std::sin(0.01), 1e-6);
   EXPECT_NEAR(k[0], std::cos(1.0), 1e-6);
 }
 
 TEST(rope_position_zero_is_identity) {
+  // pos=0 时角度全为 0，RoPE 应为恒等变换。
   float q[6] = {1, 2, 3, 4, 5, 6};
   float k[2] = {7, 8};
   const float q0[6] = {1, 2, 3, 4, 5, 6};

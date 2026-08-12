@@ -1,7 +1,7 @@
 #pragma once
 
-// Minimal single-file test framework: no third-party dependency.
-// Tests self-register via TEST(name); test_main.cpp runs them all.
+// 最小单文件测试框架：不引第三方依赖。
+// 测试用 TEST(name) 自注册；test_main.cpp 统一运行全部用例。
 
 #include <cmath>
 #include <cstdio>

@@ -7,7 +7,7 @@
 using namespace tinyqwen;
 
 TEST(matvec_small) {
-  // W = [[1,2,3],[4,5,6]]  (out=2, in=3), x = [1, 0.5, -1]
+  // W = [[1,2,3],[4,5,6]]（out=2, in=3），x = [1, 0.5, -1]
   const float w[6] = {1, 2, 3, 4, 5, 6};
   const float x[3] = {1.0f, 0.5f, -1.0f};
   float y[2];
@@ -25,7 +25,7 @@ TEST(matvec_identity) {
 }
 
 TEST(matvec_matches_naive_accumulation) {
-  // Deterministic pseudo-random check against an independent double loop.
+  // 用确定性伪随机数据，和一个独立的双重循环对照。
   const int out_dim = 7, in_dim = 11;
   std::vector<float> w(out_dim * in_dim), x(in_dim);
   for (int i = 0; i < out_dim * in_dim; ++i) {

@@ -7,9 +7,9 @@
 
 namespace tinyqwen {
 
-// Non-owning view of one tensor payload inside a loaded model file.
-// The data pointer stays valid for the lifetime of the owning ModelFile.
-// Intentionally dumb: pointer + shape + dtype, no refcount, no graph.
+// 已加载模型文件中某个 tensor 数据的非拥有视图。
+// data 指针在所属 ModelFile 的生命周期内一直有效。
+// 刻意保持"哑"：只有指针 + shape + dtype，没有引用计数、没有图。
 struct TensorView {
   std::string name;
   Dtype dtype = Dtype::kF32;
@@ -21,7 +21,7 @@ struct TensorView {
   uint64_t numel() const;
   uint64_t dim(int i) const { return (i >= 0 && i < ndim) ? shape[i] : 1; }
 
-  // Typed access; aborts on dtype mismatch (programming error, fail loud).
+  // 按类型取指针；dtype 不匹配直接 abort（属于程序错误，要大声失败）。
   const float* f32() const;
 };
 

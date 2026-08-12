@@ -1,12 +1,12 @@
-// tinyqwen CLI: load a .tqwen model, run token-by-token greedy decode.
+// tinyqwen CLI：加载 .tqwen 模型，跑 token-by-token greedy decode。
 //
 //   tinyqwen --model model.tqwen \
 //            --tokens-json prompt_tokens.json \
 //            --max-new-tokens 16 \
 //            --profile-out profile.json
 //
-// Token ids come from Python (tools/tokenize_prompt.py): the C++ side
-// intentionally has no tokenizer in v1.
+// token ids 来自 Python（tools/tokenize_prompt.py）：v1 的 C++ 侧
+// 刻意不内置 tokenizer。
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +30,7 @@ struct Args {
   int max_new_tokens = 16;
   int max_seq_len = 1024;
   int topk = 0;
-  int eos = 151645;  // Qwen2.5 im_end; pass -1 to disable
+  int eos = 151645;  // Qwen2.5 的 im_end；传 -1 禁用
   bool verbose = false;
 };
 
@@ -53,6 +53,7 @@ void usage(const char* prog) {
 bool parse_args(int argc, char** argv, Args* out) {
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
+    // 取 flag 的值；缺值直接报错退出。
     const auto value = [&](const char* flag) -> std::string {
       if (i + 1 >= argc) {
         std::fprintf(stderr, "error: %s needs a value\n", flag);
@@ -81,6 +82,7 @@ bool parse_args(int argc, char** argv, Args* out) {
     std::fprintf(stderr, "error: --model is required\n");
     return false;
   }
+  // --tokens 与 --tokens-json 必须且只能提供一个。
   if (out->tokens_csv.empty() == out->tokens_json.empty()) {
     std::fprintf(stderr, "error: provide exactly one of --tokens / --tokens-json\n");
     return false;
@@ -88,7 +90,7 @@ bool parse_args(int argc, char** argv, Args* out) {
   return true;
 }
 
-// "--tokens 1,2,3" -> ids. Tolerates spaces; fails loud on garbage.
+// "--tokens 1,2,3" -> ids。容忍空格；遇到非法字符直接报错。
 std::vector<int> parse_csv(const std::string& s) {
   std::vector<int> ids;
   size_t i = 0;
@@ -107,7 +109,8 @@ std::vector<int> parse_csv(const std::string& s) {
   return ids;
 }
 
-// Minimal extraction of the "tokens" integer array; avoids a JSON dependency.
+// 从 JSON 中做最小化的 "tokens" 整数数组提取；不引 JSON 依赖。
+// 约定见 tools/tokenize_prompt.py 的输出格式。
 std::vector<int> parse_tokens_json(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) {
@@ -160,7 +163,7 @@ int main(int argc, char** argv) {
   }
   if (args.verbose) file.print_summary();
 
-  // Profiling is opt-in: without --profile-out every ScopedTimer is a no-op.
+  // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作。
   tinyqwen::Profiler profiler(!args.profile_out.empty());
   profiler.set_meta("qwen2.5-0.5b-like", "cpu_ref", "fp32");
 
@@ -172,8 +175,8 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",
                model->kv_cache().memory_bytes() / (1024.0 * 1024.0), args.max_seq_len);
 
-  // Prompt token ids (produced by tools/tokenize_prompt.py on the Python
-  // side; v1 has no C++ tokenizer by design).
+  // prompt 的 token ids（由 Python 侧 tools/tokenize_prompt.py 生成；
+  // v1 按设计不在 C++ 里做 tokenizer）。
   std::vector<int> tokens =
       args.tokens_csv.empty() ? parse_tokens_json(args.tokens_json) : parse_csv(args.tokens_csv);
   if (tokens.empty()) {
@@ -190,16 +193,16 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  // Append one row of vocab fp32 logits per forward call; row order matches
-  // sequence positions (used by tools/align_fake_model.py).
+  // 每次 forward 追加一行 vocab 个 fp32 logits；行序与序列位置一一对应
+  // （tools/align_fake_model.py 依赖这个约定）。
   const auto dump = [&]() {
     if (logits_out) {
       std::fwrite(model->last_logits(), sizeof(float), file.config().vocab_size, logits_out);
     }
   };
 
-  // Each "topk" line describes the distribution of the token on the NEXT
-  // "gen" line (the first one is emitted after prefill).
+  // 每个 "topk" 行描述的是下一个 "gen" 行 token 的分布
+  // （第一行在 prefill 结束后输出）。
   const auto print_topk = [](const tinyqwen::TopKResult& topk) {
     std::printf("topk");
     for (size_t i = 0; i < topk.indices.size(); ++i) {
@@ -208,9 +211,9 @@ int main(int argc, char** argv) {
     std::printf("\n");
   };
 
-  // ---- prefill (token-by-token) ----
-  // After prefill, `next` is the first generated token (argmax of the last
-  // prompt position).
+  // ---- prefill（token-by-token）----
+  // prefill 结束后，`next` 就是第一个生成 token
+  //（最后一个 prompt 位置 logits 的 argmax）。
   int next = 0;
   tinyqwen::TopKResult topk;
   for (size_t i = 0; i < tokens.size(); ++i) {
@@ -225,7 +228,7 @@ int main(int argc, char** argv) {
     }
   }
   std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
-  if (args.topk > 0) print_topk(topk);  // distribution of g0
+  if (args.topk > 0) print_topk(topk);  // g0 的分布
 
   // ---- decode ----
   std::vector<int> generated;
@@ -236,10 +239,10 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "[decode] hit eos %d at step %d\n", args.eos, step);
       break;
     }
-    if (step + 1 == args.max_new_tokens) break;
+    if (step + 1 == args.max_new_tokens) break;  // 最后一个 token 不用再前向
     next = model->forward_token(next, args.topk > 0 ? &topk : nullptr, args.topk);
     dump();
-    if (args.topk > 0) print_topk(topk);  // distribution of the next gen token
+    if (args.topk > 0) print_topk(topk);  // 下一个 gen token 的分布
   }
 
   std::printf("generated_ids:");

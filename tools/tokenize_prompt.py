@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Tokenize a prompt into token ids for the tinyqwen CLI.
+"""把 prompt 转成 token ids，供 tinyqwen CLI 使用。
 
-v1 keeps tokenizer logic in Python; the C++ runtime consumes token ids only.
-The SAME tokenizer config must be used for the PyTorch reference dump
-(tools/dump_qwen_reference.py), otherwise alignment results are meaningless.
+v1 把 tokenizer 逻辑留在 Python；C++ runtime 只消费 token ids。
+PyTorch reference dump（tools/dump_qwen_reference.py）必须使用同一份
+tokenizer 配置，否则对齐结果没有意义。
 
-Usage:
+用法:
     python tools/tokenize_prompt.py \
         --model Qwen/Qwen2.5-0.5B \
         --prompt "你好" \
         --chat \
         --out prompt_tokens.json
 
-Output JSON:
+输出 JSON:
     {"model": ..., "prompt": ..., "chat": true,
      "tokens": [151644, ...], "n_tokens": N}
 """
@@ -57,12 +57,12 @@ def main() -> None:
         )
         tokens = list(tokens)
     else:
-        # Qwen2 tokenizer has no BOS; do not silently add special tokens.
+        # Qwen2 的 tokenizer 没有 BOS；不要悄悄添加特殊 token。
         tokens = tokenizer(args.prompt, add_special_tokens=False)["input_ids"]
 
-    # The "tokens" array is the only field consumed downstream: the C++ CLI
-    # (runtime/main.cpp parse_tokens_json) and tools/dump_qwen_reference.py
-    # must see identical ids, or alignment comparisons are meaningless.
+    # "tokens" 数组是下游唯一消费的字段：C++ CLI
+    #（runtime/main.cpp 的 parse_tokens_json）和 tools/dump_qwen_reference.py
+    # 必须看到完全相同的 ids，否则对齐比较没有意义。
     payload = {
         "model": args.model,
         "prompt": args.prompt,

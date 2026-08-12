@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pull the profile JSON produced by run_android.sh.
+# 拉回 run_android.sh 运行产生的 profile JSON。
 #
 #   ./scripts/pull_profile.sh [local_out.json]
 set -euo pipefail

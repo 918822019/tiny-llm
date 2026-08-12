@@ -1,3 +1,4 @@
+# 单元测试：所有 test_*.cpp 编进一个可执行，共用 test_framework.h
 add_executable(tinyqwen_tests
   test_main.cpp
   test_format.cpp

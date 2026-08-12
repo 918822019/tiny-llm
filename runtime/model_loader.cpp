@@ -1,9 +1,9 @@
-// .tqwen loader. Design rules:
-//   - fail fast with a human-readable reason on ANY inconsistency
-//     (corrupted / truncated / foreign files must never slip through);
-//   - the whole file is read into one buffer; TensorView pointers point into
-//     it, so the ModelFile must outlive every consumer;
-//   - no computation happens here — loading and validation only.
+// .tqwen 加载器。设计规则：
+//   - 任何不一致都 fail fast，并给出人类可读的原因
+//     （损坏 / 截断 / 格式不符的文件绝不能悄悄通过）；
+//   - 整个文件读进一块 buffer；TensorView 的指针指向其中，
+//     因此 ModelFile 必须比所有使用者活得更久；
+//   - 这里不做任何计算——只负责读取和校验。
 
 #include "model_loader.h"
 
@@ -19,6 +19,7 @@ void fail(std::string* err, const std::string& msg) {
   if (err) *err = msg;
 }
 
+// 一次性读整个文件（v1 不用 mmap；0.5B fp32 约 2GB，开发机可接受）。
 bool read_entire_file(const std::string& path, std::vector<uint8_t>* out, std::string* err) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) {
@@ -43,8 +44,8 @@ bool read_entire_file(const std::string& path, std::vector<uint8_t>* out, std::s
   return true;
 }
 
-// e.name is NUL-padded but NOT guaranteed to be terminated when it uses all
-// 64 characters, so scan with a bounded length instead of strlen.
+// e.name 是 NUL 补齐的，但占满 64 字符时不保证有终止符，
+// 所以用带长度上限的扫描，而不是 strlen。
 std::string entry_name(const TensorEntry& e) {
   size_t len = 0;
   while (len < kMaxTensorName && e.name[len] != '\0') ++len;
@@ -72,7 +73,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
 
   if (!read_entire_file(path, &data_, err)) return false;
 
-  // ---- stage 1: header identity & global invariants ----
+  // ---- 阶段 1：header 身份与全局不变量 ----
   if (data_.size() < sizeof(TinyHeader)) {
     fail(err, "file too small for header: " + path);
     return false;
@@ -114,7 +115,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     return false;
   }
 
-  // Header config sanity (needed before building the model from it).
+  // header 中模型配置的合理性（后面建模要用，必须先过）。
   const TinyHeader& h = header_;
   if (h.n_layers == 0 || h.hidden_size == 0 || h.intermediate_size == 0 ||
       h.n_heads == 0 || h.n_kv_heads == 0 || h.head_dim == 0 || h.vocab_size == 0 ||
@@ -131,7 +132,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     return false;
   }
 
-  // ---- stage 2: validate every table entry, then index it ----
+  // ---- 阶段 2：逐条校验 tensor 表，然后建立索引 ----
   for (uint64_t i = 0; i < header_.tensor_count; ++i) {
     TensorEntry e;
     std::memcpy(&e, data_.data() + header_.tensor_table_offset + i * sizeof(TensorEntry),
@@ -182,7 +183,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
       return false;
     }
 
-    // Entry is valid: publish a view into the file buffer.
+    // 条目合法：发布一个指向文件 buffer 的视图。
     TensorView view;
     view.name = name;
     view.dtype = static_cast<Dtype>(e.dtype);
@@ -194,7 +195,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     order_.push_back(std::move(name));
   }
 
-  // ---- stage 3: surface the model config ----
+  // ---- 阶段 3：导出模型配置 ----
   config_.n_layers = h.n_layers;
   config_.hidden_size = h.hidden_size;
   config_.intermediate_size = h.intermediate_size;
@@ -224,7 +225,7 @@ void ModelFile::print_summary() const {
   std::printf("%-56s %-18s %-5s %12s %14s\n", "name", "shape", "dtype", "offset", "nbytes");
   for (const std::string& name : order_) {
     const TensorView& t = tensors_.at(name);
-    // Offset is not stored in TensorView; recover it relative to file start.
+    // TensorView 不保存 offset；这里用相对文件起始的指针差还原。
     uint64_t offset = static_cast<uint64_t>(t.data - data_.data());
     std::printf("%-56s %-18s %-5s %12llu %14llu\n", name.c_str(), shape_str(t).c_str(),
                 dtype_name(t.dtype), (unsigned long long)offset,

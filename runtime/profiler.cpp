@@ -1,11 +1,10 @@
-// Profiler implementation. Recording model:
-//   - begin_token()/end_token() delimit one forward pass;
-//   - enter()/leave() (via ScopedTimer) push/pop a small stack, so nested
-//     scopes are tolerated, though the v1 forward uses flat, disjoint scopes;
-//   - every recorded op is appended to the current token in execution order
-//     AND aggregated into op_totals, so both per-token traces and global
-//     op shares come from one pass over the data.
-// The JSON layout written below is specified in docs/profiling_schema.md.
+// Profiler 实现。记录模型：
+//   - begin_token()/end_token() 框定一次 forward；
+//   - enter()/leave()（经 ScopedTimer）压入/弹出一个小型作用域栈，
+//     因此允许嵌套作用域，不过 v1 的 forward 用的是扁平、互不重叠的作用域；
+//   - 每个记录的 op 既按执行顺序追加到当前 token，也累加进 op_totals，
+//     于是一次数据就能同时得到 per-token trace 和全局 op 占比。
+// 下面写出的 JSON 布局见 docs/profiling_schema.md。
 
 #include "profiler.h"
 
@@ -45,8 +44,7 @@ void Profiler::end_token() {
   stack_.clear();
 }
 
-// Ops outside a token record are dropped on purpose (model loading etc.
-// should not pollute per-token traces).
+// token 记录之外的 op 有意丢弃（模型加载等耗时不应污染 per-token trace）。
 void Profiler::enter(const char* name) {
   if (!enabled_ || !in_token_) return;
   stack_.push_back(Frame{std::string(name), Clock::now()});
@@ -69,6 +67,7 @@ void Profiler::leave(const char* name) {
 
 namespace {
 
+// 手写 JSON 需要的最小转义。
 std::string json_escape(const std::string& s) {
   std::string out;
   out.reserve(s.size() + 8);
@@ -95,7 +94,7 @@ std::string json_escape(const std::string& s) {
 }  // namespace
 
 bool Profiler::write_json(const std::string& path, std::string* err) const {
-  // Aggregate summary.
+  // 汇总统计。
   double total_ms = 0.0;
   double prefill_ms = 0.0;
   double decode_ms = 0.0;
@@ -117,9 +116,9 @@ bool Profiler::write_json(const std::string& path, std::string* err) const {
     return false;
   }
 
-  // Hand-written JSON (no third-party dependency). Field semantics:
-  //   first_token_ms = sum of prefill token latencies (~TTFT for
-  //                    token-by-token prefill), decode_avg_ms over the rest.
+  // 手写 JSON（不引第三方库）。字段语义：
+  //   first_token_ms = prefill token 耗时之和（token-by-token prefill 下
+  //                    近似 TTFT）；decode_avg_ms 只统计 decode token。
   std::fprintf(f, "{\n");
   std::fprintf(f, "  \"model\": \"%s\",\n", json_escape(model_).c_str());
   std::fprintf(f, "  \"backend\": \"%s\",\n", json_escape(backend_).c_str());

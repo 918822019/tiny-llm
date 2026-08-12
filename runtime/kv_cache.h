@@ -5,23 +5,23 @@
 
 namespace tinyqwen {
 
-// K/V cache for batch = 1, decode-style appending, fp32.
+// batch = 1、decode 式追加的 K/V 缓存，fp32。
 //
-// Layout (K block first, then V block):
+// 布局（先是 K 块，然后是 V 块）：
 //   K: [n_layers][n_kv_heads][max_seq_len][head_dim]
 //   V: [n_layers][n_kv_heads][max_seq_len][head_dim]
 //
-// v1 notes:
-//   - positions [0, seq_len) are valid;
-//   - speculative rollback is NOT implemented; future extension point is a
-//     truncate_to(new_seq_len) on this class, no layout change needed.
+// v1 说明：
+//   - 有效位置为 [0, seq_len)；
+//   - speculative rollback 未实现；将来的扩展点是在本类上加
+//     truncate_to(new_seq_len)，布局无需改动。
 class KvCache {
  public:
   KvCache() = default;
   KvCache(int n_layers, int n_kv_heads, int max_seq_len, int head_dim);
 
   void init(int n_layers, int n_kv_heads, int max_seq_len, int head_dim);
-  void reset();  // seq_len = 0, keeps allocation
+  void reset();  // seq_len = 0，保留已分配的内存
 
   int seq_len() const { return seq_len_; }
   int max_seq_len() const { return max_seq_len_; }
@@ -29,13 +29,13 @@ class KvCache {
   int n_kv_heads() const { return n_kv_heads_; }
   int head_dim() const { return head_dim_; }
 
-  // Whole-layer block pointers: [n_kv_heads][max_seq_len][head_dim].
+  // 整层块指针：[n_kv_heads][max_seq_len][head_dim]。
   float* k(int layer);
   float* v(int layer);
   const float* k(int layer) const;
   const float* v(int layer) const;
 
-  // seq_len += n; aborts if it would exceed max_seq_len (fail loud in v1).
+  // seq_len += n；超过 max_seq_len 直接 abort（v1 大声失败）。
   void advance(int n);
 
   size_t memory_bytes() const { return data_.size() * sizeof(float); }
@@ -46,8 +46,8 @@ class KvCache {
   int max_seq_len_ = 0;
   int head_dim_ = 0;
   int seq_len_ = 0;
-  size_t layer_stride_ = 0;  // floats per one-layer block
-  std::vector<float> data_;  // 2 * n_layers * layer_stride_ floats
+  size_t layer_stride_ = 0;  // 单层块的 float 数
+  std::vector<float> data_;  // 2 * n_layers * layer_stride_ 个 float
 };
 
 }  // namespace tinyqwen

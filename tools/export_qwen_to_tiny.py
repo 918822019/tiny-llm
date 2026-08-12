@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Export Qwen2.5 (HF) weights to the tinyqwen flat binary format (.tqwen).
+"""将 Qwen2.5（HF）权重导出为 tinyqwen 扁平二进制格式（.tqwen）。
 
-The binary contract is defined in runtime/tiny_format.h and docs/weight_format.md.
-Keep the struct layouts below in sync with that header.
+二进制契约定义在 runtime/tiny_format.h 和 docs/weight_format.md，
+下面的 struct 布局必须与该头文件保持同步。
 
-Usage:
+用法:
     python tools/export_qwen_to_tiny.py \
         --model Qwen/Qwen2.5-0.5B \
         --out model.tqwen
 
-Notes:
-    - v1 exports float32 only.
-    - Linear weights keep the HF [out_dim, in_dim] row-major layout (no transpose).
-    - Tokenizer is NOT handled here; see tools/tokenize_prompt.py.
+说明:
+    - v1 只导出 float32。
+    - linear 权重保持 HF 的 [out_dim, in_dim] 行主序，不转置。
+    - 不处理 tokenizer，见 tools/tokenize_prompt.py。
 """
 
 from __future__ import annotations
@@ -24,19 +24,19 @@ import struct
 import sys
 from pathlib import Path
 
-# Must match runtime/tiny_format.h -------------------------------------------
+# 必须与 runtime/tiny_format.h 保持一致 -------------------------------
 MAGIC = b"TINYQWEN"
 FORMAT_VERSION = 1
 ALIGN = 64
 DTYPE_F32 = 0
 MAX_NAME = 64
 
-HEADER_FMT = "<8s12Iff4Q96s"  # 192 bytes
-ENTRY_FMT = "<64sII4QQQ"      # 120 bytes
+HEADER_FMT = "<8s12Iff4Q96s"  # 192 字节
+ENTRY_FMT = "<64sII4QQQ"      # 120 字节
 
 assert struct.calcsize(HEADER_FMT) == 192
 assert struct.calcsize(ENTRY_FMT) == 120
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 
 def align_up(x: int, align: int = ALIGN) -> int:
@@ -44,19 +44,20 @@ def align_up(x: int, align: int = ALIGN) -> int:
 
 
 def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -> int:
-    """Write a .tqwen file. Returns total file size in bytes.
+    """写一个 .tqwen 文件，返回文件总字节数。
 
-    cfg keys (all required):
+    cfg 必需的键：
         n_layers, hidden_size, intermediate_size, n_heads, n_kv_heads,
         head_dim, vocab_size, max_seq_len, tied (0/1), rms_norm_eps, rope_theta
-    tensors: ordered mapping name -> array-like with .shape and
-        .astype("float32").tobytes() (numpy arrays work).
+    tensors: 有序映射 name -> 数组对象，要求有 .shape 属性以及
+        .astype("float32").tobytes() 方法（numpy 数组可直接使用）。
     """
     names = list(tensors.keys())
 
     table_end = struct.calcsize(HEADER_FMT) + len(names) * struct.calcsize(ENTRY_FMT)
     data_offset = align_up(table_end)
 
+    # 第一遍：只取 shape，计算每个 tensor 的对齐偏移，得到文件总大小。
     entries = []
     offset = data_offset
     for name in names:
@@ -97,8 +98,8 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
         b"\x00" * 96,
     )
 
-    # Write order mirrors the on-disk layout (docs/weight_format.md):
-    #   header -> tensor table -> zero padding -> 64B-aligned payloads.
+    # 写入顺序与磁盘布局一致（docs/weight_format.md）：
+    #   header -> tensor 表 -> 补零对齐 -> 64B 对齐的数据区。
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as out:
@@ -114,7 +115,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
                 off,
                 nbytes,
             ))
-        # Zero-fill the gap between table end and the first aligned payload.
+        # 表区末尾到第一个数据偏移之间补零。
         out.write(b"\x00" * (data_offset - out.tell()))
 
         for name, shape, off, nbytes in entries:
@@ -122,7 +123,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
             data = tensors[name].astype("float32", copy=False).tobytes()
             assert len(data) == nbytes, f"size bug at {name}"
             out.write(data)
-            # Pad each payload up to the next 64B boundary.
+            # 每个 payload 之后补零到下一个 64B 边界。
             out.write(b"\x00" * (align_up(off + nbytes) - (off + nbytes)))
         assert out.tell() == total_bytes
 
@@ -133,14 +134,15 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
 
 
 def print_table_summary(out_path: str | Path) -> None:
-    """Re-read the written file's header + tensor table and print a summary."""
+    """回读刚写出文件的 header + tensor 表，打印摘要（验收用）。"""
     with open(out_path, "rb") as f:
         header = f.read(struct.calcsize(HEADER_FMT))
         fields = struct.unpack(HEADER_FMT, header)
         magic, version, dtype = fields[0], fields[1], fields[2]
         assert magic == MAGIC and version == FORMAT_VERSION and dtype == DTYPE_F32
-        # fields: 0 magic, 1 version, 2 dtype, 3..12 ten u32s, 13 eps, 14 theta,
-        #         15 tensor_count, 16 tensor_table_offset, 17 data_offset, 18 total
+        # fields 下标: 0 magic, 1 version, 2 dtype, 3..12 十个 u32,
+        #   13 eps, 14 theta, 15 tensor_count, 16 tensor_table_offset,
+        #   17 data_offset, 18 total
         tensor_count = fields[15]
         table_offset = fields[16]
         f.seek(table_offset)
@@ -153,7 +155,7 @@ def print_table_summary(out_path: str | Path) -> None:
             print(f"{name:<56} {str(shape):<22} {'f32':<6} {off:>12} {nbytes:>14}")
 
 
-# ---- HF model collection ---------------------------------------------------
+# ---- HF 模型收集 ------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,8 +169,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_local_dir(model: str) -> Path:
-    """Resolve a local model directory. Repo-id download is left to the user
-    (e.g. `huggingface-cli download`) so this script stays dependency-light."""
+    """解析本地模型目录。repo id 的下载留给用户自己执行
+    （如 `huggingface-cli download`），让本脚本保持轻依赖。"""
     path = Path(model)
     if path.is_dir() and (path / "config.json").exists():
         return path
@@ -177,6 +179,7 @@ def find_local_dir(model: str) -> Path:
 
 
 def load_config(model_dir: Path) -> dict:
+    """读取 HF config.json 并校验导出所需字段；head_dim 缺省时推导。"""
     cfg = json.loads((model_dir / "config.json").read_text())
     required = ["hidden_size", "intermediate_size", "num_hidden_layers",
                 "num_attention_heads", "num_key_value_heads", "vocab_size",
@@ -194,6 +197,7 @@ def load_config(model_dir: Path) -> dict:
 
 
 def tensor_names(cfg: dict) -> list[str]:
+    """按 HF 命名列出需要导出的全部 tensor（q/k/v 含 bias）。"""
     names = ["model.embed_tokens.weight"]
     for i in range(cfg["num_hidden_layers"]):
         names += [
@@ -217,7 +221,7 @@ def tensor_names(cfg: dict) -> list[str]:
 
 
 def build_shard_map(model_dir: Path, names: list[str]) -> dict[str, Path]:
-    """Map each tensor name to the safetensors shard that contains it."""
+    """把每个 tensor 名字映射到包含它的 safetensors 分片文件。"""
     index_file = model_dir / "model.safetensors.index.json"
     if index_file.exists():
         index = json.loads(index_file.read_text())["weight_map"]
@@ -235,7 +239,7 @@ def main() -> None:
     names = tensor_names(cfg)
     shard_map = build_shard_map(model_dir, names)
 
-    from safetensors import safe_open  # lazy import: fail late, fail clearly
+    from safetensors import safe_open  # 延迟导入：晚失败、报错清晰
 
     opened: dict[Path, object] = {}
 
@@ -244,7 +248,7 @@ def main() -> None:
             opened[path] = safe_open(str(path), framework="numpy")
         return opened[path]
 
-    # Validate presence and collect shapes first (fail before writing anything).
+    # 先校验所有 tensor 都存在（任何缺失都在写文件之前报错）。
     for name in names:
         f = get_shard(shard_map[name])
         if name not in f.keys():
@@ -264,11 +268,10 @@ def main() -> None:
         "rope_theta": cfg["rope_theta"],
     }
 
-    # Stream one tensor at a time to keep memory flat: write_tqwen needs all
-    # tensors as a mapping, so for very large models we hand it a lazy dict
-    # that loads a tensor from its safetensors shard on access. Note each
-    # tensor is read twice (shape pass + payload pass) — acceptable trade-off
-    # vs. holding a 2GB fp32 model in RAM.
+    # 逐个流式读取 tensor，保持内存占用平稳：write_tqwen 需要一个映射，
+    # 所以这里传给它一个惰性 dict，访问时才从对应分片加载 tensor。
+    # 注意每个 tensor 会被读两次（shape 一遍 + payload 一遍）——
+    # 相比把 2GB fp32 模型整个放进内存，这是可接受的代价。
     class LazyTensors(dict):
         def __getitem__(self, key):
             return get_shard(shard_map[key]).get_tensor(key)

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Numerical alignment check: tinyqwen C++ runtime vs PyTorch (HF Qwen2).
+"""数值对齐检查：tinyqwen C++ runtime vs PyTorch（HF Qwen2）。
 
-Builds the tiny random-weight model (tools/make_fake_model.py), runs the C++
-binary for greedy decode with full logits dumped (--dump-logits, fp32 exact),
-then loads the SAME weights into a HF Qwen2 model (fp32, eager attention) and
-compares logits at EVERY position (prefill + decode).
+流程：用 tools/make_fake_model.py 生成随机权重小模型，跑 C++ binary 做
+greedy decode 并用 --dump-logits 导出全量 logits（fp32 精确值），然后把
+同一份权重灌进 HF Qwen2 模型（fp32、eager attention），逐位置
+（prefill + decode）比对 logits。
 
-This exercises the whole forward path (RMSNorm/RoPE/q-k-v bias/GQA/SwiGLU/
-tied lm_head) without downloading the real model. For the real-model workflow
-see docs/pytorch_alignment.md.
+这条链路完整覆盖 RMSNorm / q-k-v bias / RoPE / GQA / SwiGLU / tied lm_head，
+且不需要下载真模型。真模型的对齐流程见 docs/pytorch_alignment.md。
 
-Usage:
+用法:
     python tools/align_fake_model.py [--binary build/runtime/tinyqwen]
 """
 
@@ -32,6 +31,7 @@ TOL = 1e-5
 
 
 def read_tqwen(path: Path):
+    """Python 侧的最小 .tqwen 读取器（与 C++ loader 同一格式契约）。"""
     import numpy as np
 
     with open(path, "rb") as f:
@@ -60,11 +60,11 @@ def read_tqwen(path: Path):
 
 
 def run_cpp(binary: Path, model: Path, tmp: Path):
-    """Run the C++ binary and collect its exact logits.
+    """跑 C++ binary，收集精确 logits。
 
-    Returns (generated_ids, logits) where logits[i] is the fp32 row produced
-    after consuming sequence position i — row order == position order, which
-    is the --dump-logits contract of runtime/main.cpp.
+    返回 (generated_ids, logits)，其中 logits[i] 是消费完序列位置 i 后
+    产生的 fp32 行——行序 == 位置序，这是 runtime/main.cpp 的
+    --dump-logits 契约。
     """
     import numpy as np
 
@@ -81,7 +81,7 @@ def run_cpp(binary: Path, model: Path, tmp: Path):
     assert len(gen_ids) == MAX_NEW, gen_ids
     vocab = None
     rows = np.fromfile(logits_path, dtype=np.float32)
-    # forwards = len(PROMPT) prefill + (MAX_NEW - 1) decode advances
+    # forward 次数 = len(PROMPT) 次 prefill + (MAX_NEW - 1) 次 decode 推进
     n_rows = len(PROMPT) + MAX_NEW - 1
     assert rows.size % n_rows == 0, (rows.size, n_rows)
     vocab = rows.size // n_rows
@@ -105,6 +105,7 @@ def main() -> None:
         cfg, tensors = read_tqwen(model_path)
         gen_ids, cpp_logits = run_cpp(Path(args.binary), model_path, tmp)
 
+    # 用完全相同的配置和权重构造 HF 参考模型。
     hf_cfg = Qwen2Config(
         hidden_size=cfg["hidden_size"],
         intermediate_size=cfg["intermediate_size"],
@@ -123,15 +124,16 @@ def main() -> None:
     model = Qwen2ForCausalLM(hf_cfg).eval()
     missing, unexpected = model.load_state_dict(
         {k: torch.from_numpy(v) for k, v in tensors.items()}, strict=False)
+    # tied 模型里 lm_head.weight 与 embed 共享，允许缺省。
     allowed_missing = {"lm_head.weight"} if cfg["tied"] else set()
     assert set(missing) <= allowed_missing, missing
     assert not unexpected, unexpected
 
-    # C++ forward rows: positions 0..P-1 are prefill, then decode positions.
-    # Greedy token g_s = argmax(logits[P - 1 + s]).
+    # C++ 的 forward 行：位置 0..P-1 是 prefill，之后是 decode 位置。
+    # greedy token g_s = argmax(logits[P - 1 + s])。
     P = len(PROMPT)
-    # HF needs the same token schedule as input; the last generated token is
-    # never consumed by any compared position, so drop it.
+    # HF 需要与 C++ 相同的 token 序列作为输入；最后一个生成 token
+    # 不会出现在任何被比较位置的输入里，所以去掉。
     full_seq = PROMPT + gen_ids[: MAX_NEW - 1]
     input_ids = torch.tensor([full_seq], dtype=torch.long)
     with torch.no_grad():

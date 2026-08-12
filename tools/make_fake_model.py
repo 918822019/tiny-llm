@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate a small random-weight .tqwen file for smoke-testing the C++ runtime.
+"""生成随机权重的小 .tqwen 文件，用于 C++ runtime 的冒烟测试。
 
-The config is tiny (hidden=16, 2 layers) so the whole loop — loader, forward,
-KV cache, profiler — runs in milliseconds with random weights. This does NOT
-produce meaningful text; it validates plumbing and the binary format.
+配置刻意很小（hidden=16，2 层），让 loader、forward、KV cache、profiler
+整条链路在毫秒级跑完。权重是随机的，生成结果没有语义，只用于验证
+管道和二进制格式。
 
-Usage:
+用法:
     python tools/make_fake_model.py --out /tmp/fake.tqwen [--seed 0]
 """
 
@@ -27,6 +27,7 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
 
+    # 与真实 Qwen2.5 同构但极小的配置（GQA：4 个 q head 共享 2 个 kv head）。
     cfg = {
         "n_layers": 2,
         "hidden_size": 16,
@@ -51,13 +52,13 @@ def main() -> None:
     tensors = {"model.embed_tokens.weight": w((V, H))}
     for i in range(cfg["n_layers"]):
         pfx = f"model.layers.{i}."
-        # RMSNorm weights = 1 (neutral scaling): keeps activations in a
-        # well-conditioned range so alignment checks test math, not overflow.
+        # RMSNorm 权重取 1（中性缩放）：让激活保持在良态范围内，
+        # 对齐测试检验的是数学实现，而不是溢出行为。
         tensors[pfx + "input_layernorm.weight"] = np.ones(H, dtype=np.float32)
         tensors[pfx + "self_attn.q_proj.weight"] = w((qd, H))
         tensors[pfx + "self_attn.k_proj.weight"] = w((kvd, H))
         tensors[pfx + "self_attn.v_proj.weight"] = w((kvd, H))
-        # Qwen2/2.5 attention has q/k/v biases (attention_bias=True).
+        # Qwen2/2.5 的 attention 带 q/k/v bias（attention_bias=True）。
         tensors[pfx + "self_attn.q_proj.bias"] = w((qd,))
         tensors[pfx + "self_attn.k_proj.bias"] = w((kvd,))
         tensors[pfx + "self_attn.v_proj.bias"] = w((kvd,))

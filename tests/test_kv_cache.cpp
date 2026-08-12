@@ -14,8 +14,8 @@ TEST(kv_cache_layout_and_append) {
   EXPECT_EQ(cache.memory_bytes(),
             (size_t)2 * n_layers * n_kv * max_seq * head_dim * sizeof(float));
 
-  // Append one position across all layers/heads using the same index math the
-  // model uses: (h * max_seq + pos) * head_dim.
+  // 用和模型完全相同的索引公式 (h * max_seq + pos) * head_dim
+  // 向所有层/头追加一个位置，再读回验证。
   const int pos = 0;
   for (int l = 0; l < n_layers; ++l) {
     for (int h = 0; h < n_kv; ++h) {
@@ -41,6 +41,7 @@ TEST(kv_cache_layout_and_append) {
 }
 
 TEST(kv_cache_k_v_independent) {
+  // K、V 是两块独立内存，写一边不影响另一边。
   KvCache cache(1, 1, 2, 2);
   cache.k(0)[0] = 1.0f;
   cache.v(0)[0] = 2.0f;

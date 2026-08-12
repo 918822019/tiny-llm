@@ -10,7 +10,7 @@ size_t dtype_size(Dtype dtype) {
     case Dtype::kF32: return 4;
     case Dtype::kF16: return 2;
     case Dtype::kI8: return 1;
-    case Dtype::kI4: return 0;  // sub-byte; layout is kernel-specific
+    case Dtype::kI4: return 0;  // 亚字节类型，布局由具体 kernel 决定
   }
   return 0;
 }

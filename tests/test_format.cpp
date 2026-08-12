@@ -19,12 +19,12 @@ TEST(format_dtype_sizes) {
   EXPECT_EQ(dtype_size(Dtype::kF32), (size_t)4);
   EXPECT_EQ(dtype_size(Dtype::kF16), (size_t)2);
   EXPECT_EQ(dtype_size(Dtype::kI8), (size_t)1);
-  EXPECT_EQ(dtype_size(Dtype::kI4), (size_t)0);  // sub-byte: kernel-specific
+  EXPECT_EQ(dtype_size(Dtype::kI4), (size_t)0);  // 亚字节类型，布局由 kernel 决定
   EXPECT_EQ(std::strcmp(dtype_name(Dtype::kF32), "f32"), 0);
 }
 
 TEST(format_field_offsets) {
-  // These lock the on-disk layout; keep in sync with tools/export_qwen_to_tiny.py.
+  // 这些断言锁死磁盘布局；必须与 tools/export_qwen_to_tiny.py 保持同步。
   EXPECT_EQ(offsetof(TinyHeader, magic), (size_t)0);
   EXPECT_EQ(offsetof(TinyHeader, version), (size_t)8);
   EXPECT_EQ(offsetof(TinyHeader, n_layers), (size_t)16);

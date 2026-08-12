@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Cross-compile the tinyqwen CLI for Android (arm64-v8a).
+# 为 Android（arm64-v8a）交叉编译 tinyqwen CLI。
 #
-#   export ANDROID_NDK=/path/to/ndk      # or pass it as $1
+#   export ANDROID_NDK=/path/to/ndk      # 或者作为 $1 传入
 #   ./scripts/build_android.sh
 #
-# Output: build-android/runtime/tinyqwen
+# 产物：build-android/runtime/tinyqwen
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

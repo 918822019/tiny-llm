@@ -16,40 +16,41 @@ struct TopKResult {
   std::vector<float> values;
 };
 
-// Fixed-structure Qwen-like decoder-only model.
-// batch = 1, token-by-token, greedy, fp32 reference path.
+// 固定结构的 Qwen-like decoder-only 模型。
+// batch = 1，token-by-token，greedy，fp32 reference 路径。
 //
-// No graph abstraction: one hardcoded forward with explicit buffers, so the
-// computation order matches docs/qwen_forward.md 1:1 and stays auditable.
+// 不做图抽象：forward 是一个写死的函数，用显式 buffer，
+// 计算顺序与 docs/qwen_forward.md 一一对应，方便人工审查。
 class QwenModel {
  public:
-  // Validates every required tensor (name + shape) against the header config.
-  // max_seq_len: runtime KV capacity; must be <= header max_seq_len.
+  // 校验所有必需 tensor（name + shape）与 header 配置一致。
+  // max_seq_len：运行时 KV 容量，必须 <= header 的 max_seq_len。
   static bool create(const ModelFile& file, int max_seq_len, Profiler& profiler,
                      std::string* err, std::unique_ptr<QwenModel>* out);
 
-  // Runs one token at the current position (== kv_cache().seq_len()).
-  // Returns the greedy next token id; optionally fills top-k logits (topk_k).
+  // 在当前位置（== kv_cache().seq_len()）上跑一个 token。
+  // 返回 greedy 的下一个 token id；可选填 top-k logits（topk_k）。
   int forward_token(int token_id, TopKResult* topk = nullptr, int topk_k = 5);
 
-  void reset();  // clears KV cache and token counter
-  void set_prompt_len(int n) { prompt_len_ = n; }  // for profiler is_prefill
+  void reset();  // 清空 KV cache 和 token 计数
+  void set_prompt_len(int n) { prompt_len_ = n; }  // 供 profiler 判断 is_prefill
 
   const ModelConfig& config() const { return cfg_; }
   KvCache& kv_cache() { return kv_; }
   int token_count() const { return token_count_; }
-  // Logits of the most recent forward_token (vocab_size floats).
+  // 最近一次 forward_token 的 logits（vocab_size 个 float）。
   const float* last_logits() const { return logits_.data(); }
 
  private:
   QwenModel() = default;
 
+  // 每层权重的裸指针视图（全部指向 ModelFile 内部，不拥有内存）。
   struct LayerWeights {
     const float* input_ln = nullptr;
     const float* q_proj = nullptr;
     const float* k_proj = nullptr;
     const float* v_proj = nullptr;
-    // Qwen2/2.5 attention has q/k/v biases (attention_bias=True); no o bias.
+    // Qwen2/2.5 attention 带 q/k/v bias（attention_bias=True）；o 无 bias。
     const float* q_bias = nullptr;
     const float* k_bias = nullptr;
     const float* v_bias = nullptr;
@@ -60,6 +61,7 @@ class QwenModel {
     const float* down = nullptr;
   };
 
+  // 按名字取 tensor 并校验 shape，失败时填 *err 并返回 nullptr。
   const float* require(const ModelFile& file, const std::string& name,
                        const std::vector<uint64_t>& shape, std::string* err);
 
@@ -73,11 +75,11 @@ class QwenModel {
 
   const float* embed_ = nullptr;
   const float* final_norm_ = nullptr;
-  const float* lm_head_ = nullptr;  // == embed_ when tied
+  const float* lm_head_ = nullptr;  // tied 时 == embed_
   std::vector<LayerWeights> layers_;
   KvCache kv_;
 
-  // Workspace buffers, allocated once in create().
+  // workspace buffer，create() 时一次分配，forward 中不再分配。
   std::vector<float> hidden_, normed_, q_, k_, v_, attn_, o_, gate_, up_, ffn_, logits_;
 };
 

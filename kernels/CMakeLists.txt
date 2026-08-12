@@ -1,4 +1,4 @@
-# Naive scalar reference kernels. Correctness first, no SIMD in v1.
+# 朴素标量 reference kernels：正确性优先，v1 不用 SIMD。
 add_library(tinyqwen_kernels STATIC
   rmsnorm_ref.cpp
   rope_ref.cpp

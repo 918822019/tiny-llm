@@ -1,10 +1,9 @@
-// RMSNorm (Qwen variant): y = x / sqrt(mean(x^2) + eps) * weight.
+// RMSNorm（Qwen 变体）：y = x / sqrt(mean(x^2) + eps) * weight。
 //
-// - weight-only (no bias), matching Qwen2/2.5 layernorm modules;
-// - sum of squares accumulates in double, then the result returns to fp32:
-//   this stays closer to the PyTorch fp32 reference than naive fp32
-//   accumulation over ~900+ elements;
-// - used for input_layernorm, post_attention_layernorm and the final norm.
+// - 只有 weight、没有 bias，与 Qwen2/2.5 的 layernorm 模块一致；
+// - 平方和用 double 累加，结果再回到 fp32：相比朴素 fp32 累加，
+//   在 ~900+ 元素规模上更贴近 PyTorch fp32 参考实现；
+// - input_layernorm、post_attention_layernorm 和 final norm 都用它。
 
 #include "ref_ops.h"
 
@@ -13,9 +12,9 @@
 namespace tinyqwen {
 
 void rmsnorm_ref(const float* x, const float* weight, float* y, int n, float eps) {
-  double sumsq = 0.0;  // double accumulation: closer to the fp32 ground truth
+  double sumsq = 0.0;  // double 累加：更贴近 fp32 参考值
   for (int i = 0; i < n; ++i) sumsq += static_cast<double>(x[i]) * x[i];
-  // Single fused scale: 1 / rms. eps sits INSIDE the sqrt (HF definition).
+  // 融合成一个 scale = 1 / rms；注意 eps 在 sqrt 内部（HF 定义）。
   const float scale = 1.0f / std::sqrt(static_cast<float>(sumsq / n) + eps);
   for (int i = 0; i < n; ++i) y[i] = x[i] * scale * weight[i];
 }

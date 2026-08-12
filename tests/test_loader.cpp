@@ -19,7 +19,7 @@ struct T {
 
 uint64_t align_up(uint64_t x) { return (x + kAlignment - 1) / kAlignment * kAlignment; }
 
-// Writes a valid .tqwen file with the given tensors (same rules as the exporter).
+// 按 exporter 同样的规则写一个合法的 .tqwen 文件，供 loader 测试使用。
 void write_file(const std::string& path, const std::vector<T>& tensors,
                 bool corrupt_magic = false) {
   const uint64_t table_end = sizeof(TinyHeader) + tensors.size() * sizeof(TensorEntry);
@@ -74,7 +74,7 @@ void write_file(const std::string& path, const std::vector<T>& tensors,
     std::fseek(f, static_cast<long>(offsets[i]), SEEK_SET);
     std::fwrite(tensors[i].data.data(), 4, tensors[i].data.size(), f);
   }
-  // Guarantee the file length equals total (padding bytes stay zero).
+  // 保证文件长度恰为 total（中间的 padding 字节保持为 0）。
   std::fseek(f, static_cast<long>(total) - 1, SEEK_SET);
   const char z = 0;
   std::fwrite(&z, 1, 1, f);
@@ -116,7 +116,8 @@ TEST(loader_round_trip) {
   EXPECT_EQ(a->shape[0], (uint64_t)2);
   EXPECT_EQ(a->shape[1], (uint64_t)3);
   EXPECT_EQ(a->numel(), (uint64_t)6);
-  // File offsets are 64B aligned; check relative to the file base pointer.
+  // 文件内偏移保证 64B 对齐；指针是否对齐取决于分配基址，
+  // 所以这里相对文件 base 检查。
   EXPECT_TRUE(static_cast<uintptr_t>(a->data - file.base()) % kAlignment == 0);
   for (int i = 0; i < 6; ++i) EXPECT_NEAR(a->f32()[i], (float)i, 0.0);
 
@@ -144,7 +145,7 @@ TEST(loader_rejects_truncated_file) {
   const std::string bad = "tinyqwen_test_trunc.tqwen";
   write_file(good, sample_tensors());
 
-  // Copy all but the last 64 bytes.
+  // 复制时砍掉最后 64 字节，模拟截断文件。
   FILE* in = std::fopen(good.c_str(), "rb");
   std::fseek(in, 0, SEEK_END);
   long size = std::ftell(in);
@@ -168,7 +169,7 @@ TEST(loader_rejects_truncated_file) {
 TEST(loader_rejects_duplicate_names) {
   const std::string path = "tinyqwen_test_dup.tqwen";
   std::vector<T> tensors = sample_tensors();
-  tensors[1].name = "a.weight";  // duplicate
+  tensors[1].name = "a.weight";  // 制造重名
   write_file(path, tensors);
 
   ModelFile file;

@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
-"""Dump PyTorch/HF reference activations for aligning the tinyqwen C++ runtime.
+"""dump PyTorch/HF 参考激活值，用于 tinyqwen C++ runtime 的数值对齐。
 
-For a fixed token sequence (single forward pass, eager attention, fp32, cpu),
-dumps:
+对固定的 token 序列（单次前向、eager attention、fp32、cpu）dump：
     embed_out                     [seq, hidden]
-    layer_0_attn_norm             input_layernorm output          [seq, hidden]
-    layer_0_q / k / v             q/k/v_proj outputs (pre-RoPE)   [seq, n_heads*head_dim] etc.
-    layer_0_attn_out              self_attn output (post o_proj)  [seq, hidden]
-    layer_0_post_attn_residual    input of post_attention_layernorm [seq, hidden]
-    layer_0_ffn_norm              post_attention_layernorm output [seq, hidden]
-    layer_0_gate / layer_0_up     mlp gate/up proj outputs        [seq, inter]
-    layer_0_ffn_out               mlp down_proj output            [seq, hidden]
-    layer_0_output                decoder layer 0 output          [seq, hidden]
-    final_norm                    model.norm output               [seq, hidden]
+    layer_0_attn_norm             input_layernorm 输出              [seq, hidden]
+    layer_0_q / k / v             q/k/v_proj 输出（RoPE 之前）      [seq, n_heads*head_dim] 等
+    layer_0_attn_out              self_attn 输出（o_proj 之后）     [seq, hidden]
+    layer_0_post_attn_residual    post_attention_layernorm 的输入   [seq, hidden]
+    layer_0_ffn_norm              post_attention_layernorm 输出     [seq, hidden]
+    layer_0_gate / layer_0_up     mlp gate/up 投影输出              [seq, inter]
+    layer_0_ffn_out               mlp down_proj 输出                [seq, hidden]
+    layer_0_output                decoder layer 0 输出              [seq, hidden]
+    final_norm                    model.norm 输出                   [seq, hidden]
     logits                        [seq, vocab]
-    topk_values / topk_indices    top-k of the LAST position      [k]
+    topk_values / topk_indices    最后一个位置的 top-k              [k]
 
-A sidecar <out>.meta.json records everything needed to reproduce the run
-(tokens, dtype, attention impl, ...). Alignment workflow: docs/pytorch_alignment.md.
+旁边的 <out>.meta.json 记录复现本次运行所需的全部信息
+（tokens、dtype、attention 实现等）。对齐流程见 docs/pytorch_alignment.md。
 
-Usage:
+用法:
     python tools/dump_qwen_reference.py \
         --model Qwen/Qwen2.5-0.5B \
         --tokens-json prompt_tokens.json \
@@ -63,7 +62,7 @@ def main() -> None:
     import torch
     from transformers import AutoModelForCausalLM
 
-    # Deterministic reference: fp32, cpu, eager attention, eval mode.
+    # 确定性参考实现：fp32、cpu、eager attention、eval 模式。
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.float32,
@@ -79,22 +78,22 @@ def main() -> None:
 
     hooks = []
 
-    # reg: capture a submodule OUTPUT. HF returns tuples from attention /
-    # decoder layers, so unwrap to the hidden-state tensor.
+    # reg：捕获子模块的输出。HF 的 attention / decoder layer 返回元组，
+    # 这里统一解包取 hidden-state 张量。
     def reg(module: torch.nn.Module, name: str) -> None:
         hooks.append(module.register_forward_hook(
             lambda _m, _i, out, n=name: save(n, out[0] if isinstance(out, tuple) else out)))
 
-    # reg_pre: capture a submodule INPUT — used for the post-attention
-    # residual state, which is exactly the input of post_attention_layernorm.
+    # reg_pre：捕获子模块的输入——用于取 post-attention 残差状态，
+    # 它恰好就是 post_attention_layernorm 的输入。
     def reg_pre(module: torch.nn.Module, name: str) -> None:
         hooks.append(module.register_forward_pre_hook(
             lambda _m, inp, n=name: save(n, inp[0])))
 
-    # Hook placement mirrors docs/qwen_forward.md op-by-op; dump key names
-    # are the contract used by docs/pytorch_alignment.md.
-    # Note: q/k/v dumps are PRE-RoPE (projection outputs), matching the C++
-    # buffer state right after the q/k/v projections.
+    # hook 的位置与 docs/qwen_forward.md 的 op 一一对应；dump 的 key 名
+    # 是 docs/pytorch_alignment.md 使用的契约。
+    # 注意：q/k/v dump 的是 RoPE 之前的值（投影输出），与 C++ 侧
+    # q/k/v 投影刚结束时的 buffer 状态对应。
     layer0 = lm.layers[L]
     save("embed_out", lm.embed_tokens(torch.tensor(tokens)))
     reg(layer0.input_layernorm, f"layer_{L}_attn_norm")
@@ -112,8 +111,8 @@ def main() -> None:
 
     input_ids = torch.tensor([tokens], dtype=torch.long)
     with torch.no_grad():
-        # Explicit position_ids keep the reference comparable with the C++
-        # runtime where pos == KV cache length (0-based, identical schedule).
+        # 显式 position_ids 保证与 C++ runtime 可比：C++ 侧
+        # pos == KV cache 长度（0 起始，调度完全一致）。
         position_ids = torch.arange(len(tokens), dtype=torch.long).unsqueeze(0)
         out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
 
