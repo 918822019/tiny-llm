@@ -96,6 +96,10 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 每个优化单独一个 commit，测完把一行记录追加到 `docs/optimization_log.md`。
 当前基线：**fp32 单线程 decode ≈ 230 ms/token**（commit `5f679ea`）。
 
+优化会逐步叠加（NEON、多线程、量化……）。叠加时加速比**不能简单相乘**，
+要同时记"vs 原始基线"和"vs 上一配置"两个数——组合评测方法见
+`docs/benchmarking.md` 第 7–9 节。
+
 ## CLI 参考
 
 ```bash
