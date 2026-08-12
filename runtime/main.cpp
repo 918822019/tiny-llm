@@ -226,9 +226,10 @@ int main(int argc, char** argv) {
   tinyqwen::TopKResult topk;
   for (size_t i = 0; i < tokens.size(); ++i) {
     const bool last_prefill = i + 1 == tokens.size();
-    next = model->forward_token(
-        tokens[i], (args.topk > 0 && last_prefill) || args.verbose ? &topk : nullptr,
-        args.topk);
+    // 是否要让 forward 顺带返回 top-k：verbose 时需要；或者开了 --topk
+    // 且这是最后一个 prompt token（要打印第一个生成 token 的分布）。
+    const bool need_topk = args.verbose || (args.topk > 0 && last_prefill);
+    next = model->forward_token(tokens[i], need_topk ? &topk : nullptr, args.topk);
     dump();
     if (args.verbose) {
       std::fprintf(stderr, "[prefill] %zu/%zu id=%d -> next=%d\n", i + 1, tokens.size(),

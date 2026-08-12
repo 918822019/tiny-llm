@@ -78,9 +78,11 @@ const float* QwenModel::require(const ModelFile& file, const std::string& name,
   }
   for (size_t i = 0; i < shape.size(); ++i) {
     if (t->shape[i] != shape[i]) {
-      if (err) *err = "tensor " + name + " shape mismatch: got " + shape_str(
-                          std::vector<uint64_t>(t->shape, t->shape + t->ndim)) +
-                      " expected " + shape_str(shape);
+      if (err) {
+        const std::vector<uint64_t> got_shape(t->shape, t->shape + t->ndim);
+        *err = "tensor " + name + " shape mismatch: got " + shape_str(got_shape) +
+               " expected " + shape_str(shape);
+      }
       return nullptr;
     }
   }

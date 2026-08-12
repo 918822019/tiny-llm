@@ -38,8 +38,9 @@ void rope_ref(float* q, float* k, int n_heads, int n_kv_heads, int head_dim, int
   float cs[kMaxHalf];
   float sn[kMaxHalf];
   for (int i = 0; i < half; ++i) {
-    const float inv_freq =
-        std::pow(theta, -static_cast<float>(2 * i) / static_cast<float>(head_dim));
+    // 指数部分 -2i / head_dim 单独算，避免一行里塞满强转。
+    const float exponent = -static_cast<float>(2 * i) / static_cast<float>(head_dim);
+    const float inv_freq = std::pow(theta, exponent);
     const float angle = static_cast<float>(pos) * inv_freq;
     cs[i] = std::cos(angle);
     sn[i] = std::sin(angle);

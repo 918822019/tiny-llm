@@ -18,8 +18,13 @@ void rmsnorm_ref(const float* x, const float* weight, float* y, int n, float eps
   // 第 1 遍：求平方和。用 double 累加减少误差（见 matvec 里的说明）。
   double sumsq = 0.0;
   for (int i = 0; i < n; ++i) sumsq += static_cast<double>(x[i]) * x[i];
-  // 融合成一个缩放系数 scale = 1 / RMS。注意 eps 在 sqrt 内部（HF 的定义）。
-  const float scale = 1.0f / std::sqrt(static_cast<float>(sumsq / n) + eps);
+  // 下面三步就是把公式里的 RMS 一层层算出来：
+  //   平方和取平均
+  const float mean_sq = static_cast<float>(sumsq / n);
+  //   加 eps 后开方得 RMS（注意 eps 在 sqrt 内部，这是 HF 的定义）
+  const float rms = std::sqrt(mean_sq + eps);
+  //   融合成缩放系数 scale = 1 / RMS
+  const float scale = 1.0f / rms;
   // 第 2 遍：每个分量乘 scale 和对应的 weight。
   for (int i = 0; i < n; ++i) y[i] = x[i] * scale * weight[i];
 }
