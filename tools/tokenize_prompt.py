@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
                    help="wrap prompt with the model chat template "
                         "(recommended for Qwen2.5 instruct models)")
     p.add_argument("--system", default="You are Qwen, created by Alibaba Cloud. "
-                   "You are a helpful assistant.",
+                                       "You are a helpful assistant.",
                    help="system prompt used only with --chat")
     p.add_argument("--out", default="prompt_tokens.json")
     return p.parse_args()
@@ -61,7 +61,7 @@ def main() -> None:
         tokens = tokenizer(args.prompt, add_special_tokens=False)["input_ids"]
 
     # "tokens" 数组是下游唯一消费的字段：C++ CLI
-    #（runtime/main.cpp 的 parse_tokens_json）和 tools/dump_qwen_reference.py
+    # （runtime/main.cpp 的 parse_tokens_json）和 tools/dump_qwen_reference.py
     # 必须看到完全相同的 ids，否则对齐比较没有意义。
     payload = {
         "model": args.model,

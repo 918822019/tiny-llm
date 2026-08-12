@@ -14,12 +14,12 @@ dispatch.h / dispatch.cpp     # 分发层：model 只调通用入口，由它选
 
 命名示例：
 
-| 文件 | 含义 |
-|---|---|
-| `matvec_f32_ref.cpp` | fp32 参考实现（base） |
-| `matvec_f32_neon.cpp` | fp32 + NEON SIMD（以后加） |
+| 文件                       | 含义                     |
+|--------------------------|------------------------|
+| `matvec_f32_ref.cpp`     | fp32 参考实现（base）        |
+| `matvec_f32_neon.cpp`    | fp32 + NEON SIMD（以后加）  |
 | `matvec_f32_neon_mt.cpp` | fp32 + NEON + 多线程（以后加） |
-| `matvec_i8_neon.cpp` | INT8 量化 + NEON（以后加） |
+| `matvec_i8_neon.cpp`     | INT8 量化 + NEON（以后加）    |
 
 ## 当前状态
 

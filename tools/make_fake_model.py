@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import argparse
-
 import numpy as np
 
 from export_qwen_to_tiny import write_tqwen

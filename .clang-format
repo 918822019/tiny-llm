@@ -1,0 +1,23 @@
+# tinyqwen 的 C++ 格式约定。
+#
+# 核心目标：可读、不挤——
+#   - 循环 / if / 块一律展开成多行并带大括号，禁止单行紧凑形式；
+#   - 指针/引用符号靠左（float* x）；
+#   - 2 空格缩进，namespace 内不额外缩进。
+#
+# 这份配置是给编辑器/clang-format 用的，保证"你格式化的结果"和"手写的结果"
+# 一致，不再互相打架。配合 docs 的代码风格说明。
+BasedOnStyle: LLVM
+IndentWidth: 2
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Left
+BreakBeforeBraces: Attach
+AllowShortLoopsOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: Empty
+IndentCaseLabels: false
+FixNamespaceComments: true
+SpaceBeforeParens: ControlStatements
+Standard: c++17

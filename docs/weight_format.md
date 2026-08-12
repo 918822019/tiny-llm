@@ -16,66 +16,66 @@ data_offset     tensor 数据区（每个 tensor 的 offset 均为 64B 对齐）
 - 所有整数 **little-endian**；所有 offset 均为**文件内绝对偏移**。
 - C++ 侧结构体自然对齐即等于磁盘布局（有 `static_assert` 保护）。
 - Python 侧用 `struct` 标准大小（`<` 前缀），不依赖平台 padding：
-  - header：`<8s 12I ff 4Q 96s` → 192 B
-  - entry：`<64s II 4Q QQ` → 120 B
+    - header：`<8s 12I ff 4Q 96s` → 192 B
+    - entry：`<64s II 4Q QQ` → 120 B
 
 ## 2. TinyHeader（192 B）
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| magic | char[8] | `"TINYQWEN"` |
-| version | u32 | 格式版本，v1 = 1 |
-| dtype | u32 | 全部 tensor 的默认 dtype：0=f32（v1 仅支持 0），1=f16，2=i8，3=i4（保留） |
-| n_layers | u32 | Qwen2.5-0.5B: 24 |
-| hidden_size | u32 | 896 |
-| intermediate_size | u32 | 4864 |
-| n_heads | u32 | 14 |
-| n_kv_heads | u32 | 2 |
-| head_dim | u32 | 64 |
-| vocab_size | u32 | 151936 |
-| max_seq_len | u32 | 32768（HF `max_position_embeddings`） |
-| tied_embeddings | u32 | 1 = lm_head 与 embed_tokens 共享权重（0.5B 为 1） |
-| reserved_u32 | u32 | 必须为 0 |
-| rms_norm_eps | f32 | 1e-6 |
-| rope_theta | f32 | 1e6 |
-| tensor_count | u64 | tensor 数量 |
-| tensor_table_offset | u64 | v1 固定 = 192 |
-| data_offset | u64 | 第一个 tensor 数据偏移，64B 对齐 |
-| total_bytes | u64 | 文件总字节数 |
-| reserved | char[96] | 必须为 0 |
+| 字段                  | 类型       | 说明                                                      |
+|---------------------|----------|---------------------------------------------------------|
+| magic               | char[8]  | `"TINYQWEN"`                                            |
+| version             | u32      | 格式版本，v1 = 1                                             |
+| dtype               | u32      | 全部 tensor 的默认 dtype：0=f32（v1 仅支持 0），1=f16，2=i8，3=i4（保留） |
+| n_layers            | u32      | Qwen2.5-0.5B: 24                                        |
+| hidden_size         | u32      | 896                                                     |
+| intermediate_size   | u32      | 4864                                                    |
+| n_heads             | u32      | 14                                                      |
+| n_kv_heads          | u32      | 2                                                       |
+| head_dim            | u32      | 64                                                      |
+| vocab_size          | u32      | 151936                                                  |
+| max_seq_len         | u32      | 32768（HF `max_position_embeddings`）                     |
+| tied_embeddings     | u32      | 1 = lm_head 与 embed_tokens 共享权重（0.5B 为 1）               |
+| reserved_u32        | u32      | 必须为 0                                                   |
+| rms_norm_eps        | f32      | 1e-6                                                    |
+| rope_theta          | f32      | 1e6                                                     |
+| tensor_count        | u64      | tensor 数量                                               |
+| tensor_table_offset | u64      | v1 固定 = 192                                             |
+| data_offset         | u64      | 第一个 tensor 数据偏移，64B 对齐                                  |
+| total_bytes         | u64      | 文件总字节数                                                  |
+| reserved            | char[96] | 必须为 0                                                   |
 
 ## 3. TensorEntry（120 B）
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| name | char[64] | NUL 补齐；满 64 字符时无终止符 |
-| dtype | u32 | 同 header dtype |
-| ndim | u32 | 1..4 |
-| shape | u64[4] | shape[ndim..3] = 0 |
-| offset | u64 | 数据绝对偏移，% 64 == 0 |
-| nbytes | u64 | numel × dtype_size |
+| 字段     | 类型       | 说明                  |
+|--------|----------|---------------------|
+| name   | char[64] | NUL 补齐；满 64 字符时无终止符 |
+| dtype  | u32      | 同 header dtype      |
+| ndim   | u32      | 1..4                |
+| shape  | u64[4]   | shape[ndim..3] = 0  |
+| offset | u64      | 数据绝对偏移，% 64 == 0    |
+| nbytes | u64      | numel × dtype_size  |
 
 ## 4. tensor 命名与 shape（Qwen2.5-0.5B）
 
 命名与 HuggingFace 保持一致，便于对齐排查：
 
-| name | shape |
-|---|---|
-| `model.embed_tokens.weight` | [151936, 896] |
-| `model.layers.{i}.input_layernorm.weight` | [896] |
-| `model.layers.{i}.self_attn.q_proj.weight` | [896, 896]（n_heads*head_dim × hidden） |
-| `model.layers.{i}.self_attn.k_proj.weight` | [128, 896]（n_kv_heads*head_dim × hidden） |
-| `model.layers.{i}.self_attn.v_proj.weight` | [128, 896] |
-| `model.layers.{i}.self_attn.q_proj.bias` | [896] |
-| `model.layers.{i}.self_attn.k_proj.bias` | [128] |
-| `model.layers.{i}.self_attn.v_proj.bias` | [128] |
-| `model.layers.{i}.self_attn.o_proj.weight` | [896, 896] |
-| `model.layers.{i}.post_attention_layernorm.weight` | [896] |
-| `model.layers.{i}.mlp.gate_proj.weight` | [4864, 896] |
-| `model.layers.{i}.mlp.up_proj.weight` | [4864, 896] |
-| `model.layers.{i}.mlp.down_proj.weight` | [896, 4864] |
-| `model.norm.weight` | [896] |
-| `lm_head.weight` | [151936, 896]（tied 时不存在，loader 用 embed_tokens） |
+| name                                               | shape                                          |
+|----------------------------------------------------|------------------------------------------------|
+| `model.embed_tokens.weight`                        | [151936, 896]                                  |
+| `model.layers.{i}.input_layernorm.weight`          | [896]                                          |
+| `model.layers.{i}.self_attn.q_proj.weight`         | [896, 896]（n_heads*head_dim × hidden）          |
+| `model.layers.{i}.self_attn.k_proj.weight`         | [128, 896]（n_kv_heads*head_dim × hidden）       |
+| `model.layers.{i}.self_attn.v_proj.weight`         | [128, 896]                                     |
+| `model.layers.{i}.self_attn.q_proj.bias`           | [896]                                          |
+| `model.layers.{i}.self_attn.k_proj.bias`           | [128]                                          |
+| `model.layers.{i}.self_attn.v_proj.bias`           | [128]                                          |
+| `model.layers.{i}.self_attn.o_proj.weight`         | [896, 896]                                     |
+| `model.layers.{i}.post_attention_layernorm.weight` | [896]                                          |
+| `model.layers.{i}.mlp.gate_proj.weight`            | [4864, 896]                                    |
+| `model.layers.{i}.mlp.up_proj.weight`              | [4864, 896]                                    |
+| `model.layers.{i}.mlp.down_proj.weight`            | [896, 4864]                                    |
+| `model.norm.weight`                                | [896]                                          |
+| `lm_head.weight`                                   | [151936, 896]（tied 时不存在，loader 用 embed_tokens） |
 
 layout 约定：**linear 权重保持 HF 的 `[out_dim, in_dim]` 行主序，v1 不转置**；
 matvec reference 直接按行点积。后续 INT4/KronQ kernel 如需 packing，

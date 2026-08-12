@@ -78,9 +78,9 @@ attention 读取 `seq_len = p + 1`（含当前 token，先 append 再 attend）�
 
 ## 与 HF 实现的差异点（v1）
 
-| 点 | HF | tinyqwen v1 |
-|---|---|---|
-| prefill | 一次并行 | token-by-token 串行（数值等价，causal 下结果一致） |
-| attention | SDPA/eager | 手写 decode kernel（online softmax） |
-| 累加精度 | fp32 | matvec/rmsnorm 用 double 累加，输出 fp32 |
-| tokenizer | 内置 | 外部 Python 提供 token ids |
+| 点         | HF         | tinyqwen v1                          |
+|-----------|------------|--------------------------------------|
+| prefill   | 一次并行       | token-by-token 串行（数值等价，causal 下结果一致） |
+| attention | SDPA/eager | 手写 decode kernel（online softmax）     |
+| 累加精度      | fp32       | matvec/rmsnorm 用 double 累加，输出 fp32   |
+| tokenizer | 内置         | 外部 Python 提供 token ids               |

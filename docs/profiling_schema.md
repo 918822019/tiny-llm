@@ -18,25 +18,31 @@
       "pos": 0,
       "is_prefill": true,
       "latency_ms": 0.0,
-      "ops": {"layer_0.input_layernorm": 0.0, "layer_0.q_proj": 0.0}
+      "ops": {
+        "layer_0.input_layernorm": 0.0,
+        "layer_0.q_proj": 0.0
+      }
     }
   ],
   "op_totals": {
-    "layer_0.q_proj": {"calls": 25, "total_ms": 0.0}
+    "layer_0.q_proj": {
+      "calls": 25,
+      "total_ms": 0.0
+    }
   }
 }
 ```
 
 字段语义：
 
-| 字段 | 说明 |
-|---|---|
-| `prompt_tokens` / `generated_tokens` | `is_prefill` 为 true / false 的 token 数 |
-| `total_ms` | 所有 token latency 之和（不含加载模型） |
-| `first_token_ms` | prefill 阶段总耗时（token-by-token prefill 下 = 各 prefill token 之和，近似 TTFT） |
-| `decode_avg_ms` | decode 阶段平均每 token 耗时 |
-| `tokens[].ops` | 该 token 内按执行顺序记录的 op 耗时；op 命名如 `layer_3.q_proj`、`lm_head` |
-| `op_totals` | 跨 token 聚合，用于看 op 占比 |
+| 字段                                   | 说明                                                                   |
+|--------------------------------------|----------------------------------------------------------------------|
+| `prompt_tokens` / `generated_tokens` | `is_prefill` 为 true / false 的 token 数                                |
+| `total_ms`                           | 所有 token latency 之和（不含加载模型）                                          |
+| `first_token_ms`                     | prefill 阶段总耗时（token-by-token prefill 下 = 各 prefill token 之和，近似 TTFT） |
+| `decode_avg_ms`                      | decode 阶段平均每 token 耗时                                                |
+| `tokens[].ops`                       | 该 token 内按执行顺序记录的 op 耗时；op 命名如 `layer_3.q_proj`、`lm_head`            |
+| `op_totals`                          | 跨 token 聚合，用于看 op 占比                                                 |
 
 注意事项：
 

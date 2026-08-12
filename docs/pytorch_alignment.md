@@ -47,11 +47,11 @@ SwiGLU / tied lm_head。当前基线：worst max_abs_err ≈ 4e-7。
 
 ## 建议容差（fp32, CPU）
 
-| 量 | max_abs_err 经验容差 |
-|---|---|
-| rmsnorm / rope / 单 matvec（小 shape 单测） | 1e-5 |
-| layer 输出（896 维，24 层之前） | 1e-4 ~ 1e-3 |
-| logits | 1e-2 以内且 top-k 集合一致 |
+| 量                                     | max_abs_err 经验容差    |
+|---------------------------------------|---------------------|
+| rmsnorm / rope / 单 matvec（小 shape 单测） | 1e-5                |
+| layer 输出（896 维，24 层之前）                | 1e-4 ~ 1e-3         |
+| logits                                | 1e-2 以内且 top-k 集合一致 |
 
 注意：误差随层数累积是正常现象；关键是**序关系和结构**不能变
 （例如某个 op 误差突然比相邻 op 大一个量级 → 该 op 实现有问题）。

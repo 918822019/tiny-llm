@@ -33,9 +33,9 @@ from pathlib import Path
 # ---- 标准负载（固定，保证跨版本可比）-------------------------------------
 # "中国的首都是" 的 token 序列。写死 id 是为了让 bench 不依赖 tokenizer。
 CANONICAL_PROMPT = [105538, 59975, 100132]
-DECODE_TOKENS = 32      # 生成的 token 数（样本量）
-WARMUP = 4              # 丢弃前几个 decode token（预热，避免冷启动抖动）
-MAX_SEQ_LEN = 64        # 足够容纳 prompt + decode
+DECODE_TOKENS = 32  # 生成的 token 数（样本量）
+WARMUP = 4  # 丢弃前几个 decode token（预热，避免冷启动抖动）
+MAX_SEQ_LEN = 64  # 足够容纳 prompt + decode
 
 
 def env_info() -> dict:
@@ -78,7 +78,7 @@ def run_once(binary: str, model: str) -> dict:
         "--tokens", ",".join(map(str, CANONICAL_PROMPT)),
         "--max-new-tokens", str(DECODE_TOKENS),
         "--max-seq-len", str(MAX_SEQ_LEN),
-        "--eos", "-1",                 # 禁用停止符，保证生成固定数量，样本量稳定
+        "--eos", "-1",  # 禁用停止符，保证生成固定数量，样本量稳定
         "--profile-out", profile_path,
     ]
     subprocess.run(cmd, capture_output=True, check=True)

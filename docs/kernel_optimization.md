@@ -25,13 +25,13 @@ kernels/
 
 `<算子>_<数据类型>_<优化手段>`，可叠加：
 
-| 文件名 | 含义 |
-|---|---|
-| `matvec_f32_ref` | fp32 参考实现（base） |
-| `matvec_f32_neon` | fp32 + NEON SIMD |
-| `matvec_f32_neon_mt` | fp32 + NEON + 多线程 |
-| `matvec_i8_neon` | INT8 weight-only + NEON |
-| `rmsnorm_neon` | RMSNorm 的 NEON 版 |
+| 文件名                  | 含义                      |
+|----------------------|-------------------------|
+| `matvec_f32_ref`     | fp32 参考实现（base）         |
+| `matvec_f32_neon`    | fp32 + NEON SIMD        |
+| `matvec_f32_neon_mt` | fp32 + NEON + 多线程       |
+| `matvec_i8_neon`     | INT8 weight-only + NEON |
+| `rmsnorm_neon`       | RMSNorm 的 NEON 版        |
 
 ## 3. 分发层：model 不感知具体实现
 
@@ -64,9 +64,9 @@ micro-benchmark 时也能在同一个程序里同时调 ref 和优化版做对�
    `void matvec_f32_neon(const float*, const float*, float*, int, int);`
    （签名和 `_ref` 完全一致）。
 2. **接进分发**：
-   - `dispatch.h`：给 `MatvecImpl` 加 `kNeon`；
-   - `dispatch.cpp`：`switch` 里加 `case kNeon: matvec_f32_neon(...);`，
-     并在 `matvec_impl_name()` 加名字。
+    - `dispatch.h`：给 `MatvecImpl` 加 `kNeon`；
+    - `dispatch.cpp`：`switch` 里加 `case kNeon: matvec_f32_neon(...);`，
+      并在 `matvec_impl_name()` 加名字。
 3. **CMake**：把新 `.cpp` 加进 `kernels/CMakeLists.txt`。
 4. **加开关值**：`main.cpp` 的 `--matvec-impl` 接受 `neon`。
 5. **正确性门禁**：写单测/脚本，确认 `neon` 输出与 `ref` 误差在容差内

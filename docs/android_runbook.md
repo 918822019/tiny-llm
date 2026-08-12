@@ -61,13 +61,13 @@ vocab 个 fp32，行序 = 位置序；完整语义见 README「CLI 参考」）�
 
 ## 5. 常见坑
 
-| 现象 | 处理 |
-|---|---|
+| 现象                       | 处理                                                                  |
+|--------------------------|---------------------------------------------------------------------|
 | `CANNOT LINK EXECUTABLE` | 确认 ABI 与设备匹配（`adb shell getprop ro.product.cpu.abi`），用 `c++_static` |
-| push 后权限报错 | `adb shell chmod +x /data/local/tmp/tinyqwen/tinyqwen` |
-| OOM / 被杀 | 0.5B fp32 权重约 2GB + KV cache；先降 `--max-seq-len`，或等 INT8/INT4 |
-| 输出乱码 token id | 确认 prompt 用了 chat template，且 eos 设置正确（默认 151645） |
-| 时延抖动大 | 手机热降频/大小核迁移；v1 不绑核，解读 profile 时看 p50/p95 而不是单次值 |
+| push 后权限报错               | `adb shell chmod +x /data/local/tmp/tinyqwen/tinyqwen`              |
+| OOM / 被杀                 | 0.5B fp32 权重约 2GB + KV cache；先降 `--max-seq-len`，或等 INT8/INT4        |
+| 输出乱码 token id            | 确认 prompt 用了 chat template，且 eos 设置正确（默认 151645）                    |
+| 时延抖动大                    | 手机热降频/大小核迁移；v1 不绑核，解读 profile 时看 p50/p95 而不是单次值                     |
 
 ## 6. 性能解读注意
 

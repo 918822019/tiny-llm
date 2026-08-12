@@ -11,58 +11,56 @@
 #include <vector>
 
 namespace tinytest {
-
-// 把断言里的值转成可读字符串：数字走 to_string，字符串原样返回。
-template <typename T>
-inline std::string display(const T& v) {
-  if constexpr (std::is_same<T, std::string>::value) {
-    return v;
-  } else if constexpr (std::is_arithmetic<T>::value) {
-    return std::to_string(+v);  // +v 把 char/short 提升，避免 to_string 无重载
-  } else {
-    return std::string(v);  // const char* 等
-  }
-}
-
-struct Failure {
-  std::string msg;
-};
-
-struct Case {
-  std::string name;
-  std::function<void()> fn;
-};
-
-inline std::vector<Case>& registry() {
-  static std::vector<Case> cases;
-  return cases;
-}
-
-struct Registrar {
-  Registrar(const std::string& name, std::function<void()> fn) {
-    registry().push_back(Case{name, std::move(fn)});
-  }
-};
-
-inline int run_all() {
-  int failed = 0;
-  for (const Case& c : registry()) {
-    try {
-      c.fn();
-      std::printf("[ OK ] %s\n", c.name.c_str());
-    } catch (const Failure& f) {
-      std::printf("[FAIL] %s\n       %s\n", c.name.c_str(), f.msg.c_str());
-      ++failed;
-    } catch (const std::exception& e) {
-      std::printf("[FAIL] %s\n       exception: %s\n", c.name.c_str(), e.what());
-      ++failed;
+    // 把断言里的值转成可读字符串：数字走 to_string，字符串原样返回。
+    template<typename T>
+    inline std::string display(const T &v) {
+        if constexpr (std::is_same<T, std::string>::value) {
+            return v;
+        } else if constexpr (std::is_arithmetic<T>::value) {
+            return std::to_string(+v); // +v 把 char/short 提升，避免 to_string 无重载
+        } else {
+            return std::string(v); // const char* 等
+        }
     }
-  }
-  std::printf("%zu tests, %d failed\n", registry().size(), failed);
-  return failed;
-}
 
-}  // namespace tinytest
+    struct Failure {
+        std::string msg;
+    };
+
+    struct Case {
+        std::string name;
+        std::function<void()> fn;
+    };
+
+    inline std::vector<Case> &registry() {
+        static std::vector<Case> cases;
+        return cases;
+    }
+
+    struct Registrar {
+        Registrar(const std::string &name, std::function<void()> fn) {
+            registry().push_back(Case{name, std::move(fn)});
+        }
+    };
+
+    inline int run_all() {
+        int failed = 0;
+        for (const Case &c: registry()) {
+            try {
+                c.fn();
+                std::printf("[ OK ] %s\n", c.name.c_str());
+            } catch (const Failure &f) {
+                std::printf("[FAIL] %s\n       %s\n", c.name.c_str(), f.msg.c_str());
+                ++failed;
+            } catch (const std::exception &e) {
+                std::printf("[FAIL] %s\n       exception: %s\n", c.name.c_str(), e.what());
+                ++failed;
+            }
+        }
+        std::printf("%zu tests, %d failed\n", registry().size(), failed);
+        return failed;
+    }
+} // namespace tinytest
 
 #define TEST(name)                                                     \
   static void test_fn_##name();                                        \

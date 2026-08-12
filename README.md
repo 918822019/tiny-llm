@@ -8,7 +8,8 @@
 > - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，16 个生成 token 与 HuggingFace 逐位一致；
 > - 性能基线：单线程 fp32 **decode ≈ 230 ms/token**（tag `v0.1-fp32-baseline`）；
 > - 已就位：可复现基准（`scripts/bench.sh`）、优化日志、kernel 分发层（保留 base
->   + 可插拔优化位）、key=value 配置；
+    >
++ 可插拔优化位）、key=value 配置；
 > - 下一步：第一个 kernel 优化（NEON matvec）。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
@@ -115,20 +116,20 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 tinyqwen --model <model.tqwen> [options]
 ```
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--model PATH` | 必填 | .tqwen 权重文件 |
-| `--tokens CSV` | 二选一 | 逗号分隔的 token ids |
-| `--tokens-json PATH` | 二选一 | `tokenize_prompt.py` 输出的 JSON |
-| `--max-new-tokens N` | 16 | 最多生成 token 数 |
-| `--max-seq-len N` | 1024 | KV cache 容量上限，不得超过 header max_seq_len |
-| `--topk K` | 0 | 输出 top-k logits 行（0 = 关闭） |
-| `--dump-logits PATH` | 无 | 每次 forward 后写全量 logits（fp32 binary，按位置顺序逐行） |
-| `--profile-out PATH` | 无 | profiler JSON 输出 |
-| `--eos ID` | 151645 | stop token，-1 禁用 |
-| `--config PATH` | 无 | key=value 配置文件（见下；CLI 开关优先于它） |
-| `--matvec-impl NAME` | ref | matvec kernel 实现：`ref`（以后会有 neon 等） |
-| `--verbose` | 关 | 模型 summary + prefill 细节（stderr） |
+| 参数                   | 默认     | 说明                                          |
+|----------------------|--------|---------------------------------------------|
+| `--model PATH`       | 必填     | .tqwen 权重文件                                 |
+| `--tokens CSV`       | 二选一    | 逗号分隔的 token ids                             |
+| `--tokens-json PATH` | 二选一    | `tokenize_prompt.py` 输出的 JSON               |
+| `--max-new-tokens N` | 16     | 最多生成 token 数                                |
+| `--max-seq-len N`    | 1024   | KV cache 容量上限，不得超过 header max_seq_len       |
+| `--topk K`           | 0      | 输出 top-k logits 行（0 = 关闭）                   |
+| `--dump-logits PATH` | 无      | 每次 forward 后写全量 logits（fp32 binary，按位置顺序逐行） |
+| `--profile-out PATH` | 无      | profiler JSON 输出                            |
+| `--eos ID`           | 151645 | stop token，-1 禁用                            |
+| `--config PATH`      | 无      | key=value 配置文件（见下；CLI 开关优先于它）               |
+| `--matvec-impl NAME` | ref    | matvec kernel 实现：`ref`（以后会有 neon 等）         |
+| `--verbose`          | 关      | 模型 summary + prefill 细节（stderr）             |
 
 ### 配置文件
 
@@ -158,20 +159,20 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 
 ## 文档
 
-| 文档 | 内容 |
-|---|---|
-| `docs/infra_primer.md` | **infra 新手导读**：内存布局/对齐/字节序/KV cache/RAII 等概念 |
-| `docs/benchmarking.md` | **测量方法论**：怎么科学测性能、怎么归因 |
-| `docs/optimization_log.md` | **优化日志**：每次优化改了什么/提升多少/为什么 |
-| `docs/kernel_optimization.md` | **算子优化指南**：保留 base、改进版往哪加 |
-| `docs/weight_format.md` | tiny binary format（header / tensor table / 对齐） |
-| `docs/qwen_forward.md` | Qwen forward 数学定义与 shape 约定 |
-| `docs/profiling_schema.md` | profiler JSON 输出 schema |
-| `docs/pytorch_alignment.md` | C++ 与 PyTorch reference 对齐流程 |
-| `docs/build_android.md` | NDK 交叉编译 |
-| `docs/android_runbook.md` | adb push / run / pull 全流程 |
-| `docs/project_structure.md` | 目录职责说明 |
-| `docs/known_limitations.md` | v1 已知限制 |
+| 文档                            | 内容                                             |
+|-------------------------------|------------------------------------------------|
+| `docs/infra_primer.md`        | **infra 新手导读**：内存布局/对齐/字节序/KV cache/RAII 等概念   |
+| `docs/benchmarking.md`        | **测量方法论**：怎么科学测性能、怎么归因                         |
+| `docs/optimization_log.md`    | **优化日志**：每次优化改了什么/提升多少/为什么                     |
+| `docs/kernel_optimization.md` | **算子优化指南**：保留 base、改进版往哪加                      |
+| `docs/weight_format.md`       | tiny binary format（header / tensor table / 对齐） |
+| `docs/qwen_forward.md`        | Qwen forward 数学定义与 shape 约定                    |
+| `docs/profiling_schema.md`    | profiler JSON 输出 schema                        |
+| `docs/pytorch_alignment.md`   | C++ 与 PyTorch reference 对齐流程                   |
+| `docs/build_android.md`       | NDK 交叉编译                                       |
+| `docs/android_runbook.md`     | adb push / run / pull 全流程                      |
+| `docs/project_structure.md`   | 目录职责说明                                         |
+| `docs/known_limitations.md`   | v1 已知限制                                        |
 
 ## 边界声明
 

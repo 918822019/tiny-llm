@@ -1,0 +1,19 @@
+# 跨编辑器的基础排版约定（editorconfig.org）。
+# 让不同编辑器对空白、换行、行尾的处理一致。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾空格可能是硬换行，不裁剪
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab

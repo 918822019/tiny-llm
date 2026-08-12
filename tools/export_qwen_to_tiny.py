@@ -32,10 +32,12 @@ DTYPE_F32 = 0
 MAX_NAME = 64
 
 HEADER_FMT = "<8s12Iff4Q96s"  # 192 字节
-ENTRY_FMT = "<64sII4QQQ"      # 120 字节
+ENTRY_FMT = "<64sII4QQQ"  # 120 字节
 
 assert struct.calcsize(HEADER_FMT) == 192
 assert struct.calcsize(ENTRY_FMT) == 120
+
+
 # ---------------------------------------------------------------------
 
 
@@ -288,7 +290,7 @@ def main() -> None:
           f"vocab={header_cfg['vocab_size']} tied={header_cfg['tied']}")
     print_table_summary(args.out)
     print(f"out        : {args.out}")
-    print(f"file size  : {total} bytes ({total / 2**20:.1f} MB) OK")
+    print(f"file size  : {total} bytes ({total / 2 ** 20:.1f} MB) OK")
 
 
 if __name__ == "__main__":

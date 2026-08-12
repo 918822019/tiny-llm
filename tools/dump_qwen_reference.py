@@ -29,9 +29,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-
 import numpy as np
+from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
