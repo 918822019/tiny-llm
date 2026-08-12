@@ -40,10 +40,11 @@ void attention_decode_ref(const float* q, const float* k_cache, const float* v_c
     //   m  = 已见 score 的最大值（用来做数值稳定，防止 exp 上溢）
     //   l  = sum_j exp(s_j - m)（归一化分母）
     //   oh = sum_j exp(s_j - m) * v_j（未归一化的加权和，即输出）
-    // 遇到更大的 score 时，旧的累加量要乘 exp(m - m_new) 重新标定。
     float m = -std::numeric_limits<float>::infinity();
     float l = 0.0f;
-    for (int i = 0; i < head_dim; ++i) oh[i] = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+      oh[i] = 0.0f;
+    }
 
     // 扫描该 kv head 下所有有效位置 [0, seq_len)。
     for (int t = 0; t < seq_len; ++t) {
@@ -52,20 +53,35 @@ void attention_decode_ref(const float* q, const float* k_cache, const float* v_c
 
       // 相关度 = q 和 k 的点积，再乘缩放系数 scale。
       double dot = 0.0;
-      for (int i = 0; i < head_dim; ++i) dot += static_cast<double>(qh[i]) * kt[i];
+      for (int i = 0; i < head_dim; ++i) {
+        const double qi = static_cast<double>(qh[i]);
+        dot += qi * kt[i];
+      }
       const float s = static_cast<float>(dot) * scale;
 
-      const float m_new = s > m ? s : m;          // 更新最大值
-      const float rescale = std::exp(m - m_new);  // 旧累加量的重标定系数
+      // 更新最大值，并算出旧累加量的重标定系数、当前位置的未归一化权重。
+      const float m_new = s > m ? s : m;
+      const float rescale = std::exp(m - m_new);  // 旧累加量按新旧 max 之差重标定
       const float p = std::exp(s - m_new);        // 当前位置的未归一化权重
-      for (int i = 0; i < head_dim; ++i) oh[i] = oh[i] * rescale + p * vt[i];
-      l = l * rescale + p;
+
+      // oh = oh * rescale + p * vt（逐元素）。
+      for (int i = 0; i < head_dim; ++i) {
+        const float rescaled_old = oh[i] * rescale;
+        const float contrib = p * vt[i];
+        oh[i] = rescaled_old + contrib;
+      }
+
+      // 分母 l 同样重标定并累加当前权重。
+      const float rescaled_l = l * rescale;
+      l = rescaled_l + p;
       m = m_new;
     }
 
     // 归一化：除以指数和 l，得到最终的加权平均输出。
     const float inv_l = 1.0f / l;  // decode 时恒有 seq_len >= 1，不会除零
-    for (int i = 0; i < head_dim; ++i) oh[i] *= inv_l;
+    for (int i = 0; i < head_dim; ++i) {
+      oh[i] = oh[i] * inv_l;
+    }
   }
 }
 

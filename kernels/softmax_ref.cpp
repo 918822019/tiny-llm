@@ -19,8 +19,11 @@ void softmax_ref(const float* x, float* y, int n) {
   // 第 1 遍：找最大值，用于数值稳定。
   float m = x[0];
   for (int i = 1; i < n; ++i) {
-    if (x[i] > m) m = x[i];
+    if (x[i] > m) {
+      m = x[i];
+    }
   }
+
   // 第 2 遍：算 exp(x - m) 并累加分母。用 double 累加减少舍入漂移
   //（Qwen2.5 词表有 151936 这么大，连加误差不可忽视）。
   double sum = 0.0;
@@ -28,9 +31,12 @@ void softmax_ref(const float* x, float* y, int n) {
     y[i] = std::exp(x[i] - m);
     sum += y[i];
   }
+
   // 第 3 遍：除以分母归一化。用"乘倒数"只做一次除法，更快。
   const float inv = static_cast<float>(1.0 / sum);
-  for (int i = 0; i < n; ++i) y[i] *= inv;
+  for (int i = 0; i < n; ++i) {
+    y[i] = y[i] * inv;
+  }
 }
 
 }  // namespace tinyqwen

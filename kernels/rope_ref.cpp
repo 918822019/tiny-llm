@@ -38,7 +38,6 @@ void rope_ref(float* q, float* k, int n_heads, int n_kv_heads, int head_dim, int
   float cs[kMaxHalf];
   float sn[kMaxHalf];
   for (int i = 0; i < half; ++i) {
-    // 指数部分 -2i / head_dim 单独算，避免一行里塞满强转。
     const float exponent = -static_cast<float>(2 * i) / static_cast<float>(head_dim);
     const float inv_freq = std::pow(theta, exponent);
     const float angle = static_cast<float>(pos) * inv_freq;
@@ -51,14 +50,22 @@ void rope_ref(float* q, float* k, int n_heads, int n_kv_heads, int head_dim, int
     for (int i = 0; i < half; ++i) {
       const float x0 = x[i];
       const float x1 = x[i + half];
-      x[i] = x0 * cs[i] - x1 * sn[i];
-      x[i + half] = x1 * cs[i] + x0 * sn[i];
+      const float c = cs[i];
+      const float s = sn[i];
+      const float rotated0 = x0 * c - x1 * s;
+      const float rotated1 = x1 * c + x0 * s;
+      x[i] = rotated0;
+      x[i + half] = rotated1;
     }
   };
 
   // q 的每个 head、k 的每个 head 都要旋转（v 不需要）。
-  for (int h = 0; h < n_heads; ++h) apply(q + static_cast<size_t>(h) * head_dim);
-  for (int h = 0; h < n_kv_heads; ++h) apply(k + static_cast<size_t>(h) * head_dim);
+  for (int h = 0; h < n_heads; ++h) {
+    apply(q + static_cast<size_t>(h) * head_dim);
+  }
+  for (int h = 0; h < n_kv_heads; ++h) {
+    apply(k + static_cast<size_t>(h) * head_dim);
+  }
 }
 
 }  // namespace tinyqwen

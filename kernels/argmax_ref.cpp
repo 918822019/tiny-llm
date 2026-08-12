@@ -14,7 +14,9 @@ namespace tinyqwen {
 int argmax_ref(const float* logits, int n) {
   int best = 0;
   for (int i = 1; i < n; ++i) {
-    if (logits[i] > logits[best]) best = i;  // 严格 '>'：平局取第一个
+    if (logits[i] > logits[best]) {  // 严格 '>'：平局取第一个
+      best = i;
+    }
   }
   return best;
 }
