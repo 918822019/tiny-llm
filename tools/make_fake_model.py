@@ -51,6 +51,8 @@ def main() -> None:
     tensors = {"model.embed_tokens.weight": w((V, H))}
     for i in range(cfg["n_layers"]):
         pfx = f"model.layers.{i}."
+        # RMSNorm weights = 1 (neutral scaling): keeps activations in a
+        # well-conditioned range so alignment checks test math, not overflow.
         tensors[pfx + "input_layernorm.weight"] = np.ones(H, dtype=np.float32)
         tensors[pfx + "self_attn.q_proj.weight"] = w((qd, H))
         tensors[pfx + "self_attn.k_proj.weight"] = w((kvd, H))

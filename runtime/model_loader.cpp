@@ -1,3 +1,10 @@
+// .tqwen loader. Design rules:
+//   - fail fast with a human-readable reason on ANY inconsistency
+//     (corrupted / truncated / foreign files must never slip through);
+//   - the whole file is read into one buffer; TensorView pointers point into
+//     it, so the ModelFile must outlive every consumer;
+//   - no computation happens here — loading and validation only.
+
 #include "model_loader.h"
 
 #include <cerrno>
@@ -36,6 +43,8 @@ bool read_entire_file(const std::string& path, std::vector<uint8_t>* out, std::s
   return true;
 }
 
+// e.name is NUL-padded but NOT guaranteed to be terminated when it uses all
+// 64 characters, so scan with a bounded length instead of strlen.
 std::string entry_name(const TensorEntry& e) {
   size_t len = 0;
   while (len < kMaxTensorName && e.name[len] != '\0') ++len;
@@ -63,6 +72,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
 
   if (!read_entire_file(path, &data_, err)) return false;
 
+  // ---- stage 1: header identity & global invariants ----
   if (data_.size() < sizeof(TinyHeader)) {
     fail(err, "file too small for header: " + path);
     return false;
@@ -104,7 +114,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     return false;
   }
 
-  // Header config sanity.
+  // Header config sanity (needed before building the model from it).
   const TinyHeader& h = header_;
   if (h.n_layers == 0 || h.hidden_size == 0 || h.intermediate_size == 0 ||
       h.n_heads == 0 || h.n_kv_heads == 0 || h.head_dim == 0 || h.vocab_size == 0 ||
@@ -121,6 +131,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     return false;
   }
 
+  // ---- stage 2: validate every table entry, then index it ----
   for (uint64_t i = 0; i < header_.tensor_count; ++i) {
     TensorEntry e;
     std::memcpy(&e, data_.data() + header_.tensor_table_offset + i * sizeof(TensorEntry),
@@ -171,6 +182,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
       return false;
     }
 
+    // Entry is valid: publish a view into the file buffer.
     TensorView view;
     view.name = name;
     view.dtype = static_cast<Dtype>(e.dtype);
@@ -182,6 +194,7 @@ bool ModelFile::load(const std::string& path, std::string* err) {
     order_.push_back(std::move(name));
   }
 
+  // ---- stage 3: surface the model config ----
   config_.n_layers = h.n_layers;
   config_.hidden_size = h.hidden_size;
   config_.intermediate_size = h.intermediate_size;

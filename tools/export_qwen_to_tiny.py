@@ -97,6 +97,8 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
         b"\x00" * 96,
     )
 
+    # Write order mirrors the on-disk layout (docs/weight_format.md):
+    #   header -> tensor table -> zero padding -> 64B-aligned payloads.
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as out:
@@ -112,6 +114,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
                 off,
                 nbytes,
             ))
+        # Zero-fill the gap between table end and the first aligned payload.
         out.write(b"\x00" * (data_offset - out.tell()))
 
         for name, shape, off, nbytes in entries:
@@ -119,6 +122,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
             data = tensors[name].astype("float32", copy=False).tobytes()
             assert len(data) == nbytes, f"size bug at {name}"
             out.write(data)
+            # Pad each payload up to the next 64B boundary.
             out.write(b"\x00" * (align_up(off + nbytes) - (off + nbytes)))
         assert out.tell() == total_bytes
 
@@ -261,7 +265,10 @@ def main() -> None:
     }
 
     # Stream one tensor at a time to keep memory flat: write_tqwen needs all
-    # tensors as a mapping, so for very large models we hand it a lazy-ish dict.
+    # tensors as a mapping, so for very large models we hand it a lazy dict
+    # that loads a tensor from its safetensors shard on access. Note each
+    # tensor is read twice (shape pass + payload pass) — acceptable trade-off
+    # vs. holding a 2GB fp32 model in RAM.
     class LazyTensors(dict):
         def __getitem__(self, key):
             return get_shard(shard_map[key]).get_tensor(key)

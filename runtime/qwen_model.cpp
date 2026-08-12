@@ -1,3 +1,18 @@
+// Fixed-structure Qwen forward, batch = 1, token by token.
+//
+// This file deliberately contains NO graph abstraction: the forward pass is
+// one readable function whose op order matches docs/qwen_forward.md 1:1, so
+// numerical divergence from PyTorch can be located by eye.
+//
+// Workspace buffers (allocated once in create(), never per-token):
+//   hidden_  running residual stream          [hidden]
+//   normed_  RMSNorm output fed to projections [hidden]
+//   q_/k_/v_ attention projections            [q_dim] / [kv_dim] / [kv_dim]
+//   attn_    attention output (concat heads)  [q_dim]
+//   o_       o_proj output                    [hidden]
+//   gate_/up_/ffn_  SwiGLU intermediates      [inter] / [inter] / [hidden]
+//   logits_  lm_head output                   [vocab]
+
 #include "qwen_model.h"
 
 #include <algorithm>
@@ -12,6 +27,9 @@ namespace tinyqwen {
 
 namespace {
 
+// Greedy sampling helper: partial_sort of index array is O(vocab * k),
+// fine for v1 (called once per token; not on the kernel hot path).
+// The first element of the result is the argmax.
 void top_k_logits(const float* logits, int vocab, int k, TopKResult* out) {
   k = std::min(k, vocab);
   std::vector<int> idx(vocab);
@@ -37,6 +55,9 @@ std::string shape_str(const std::vector<uint64_t>& s) {
 
 }  // namespace
 
+// Fetch a tensor by its HF name and verify dtype/ndim/shape against what the
+// forward expects. A wrong shape here (e.g. exporting a non-Qwen checkpoint)
+// becomes an explicit error instead of a silent miscompute later.
 const float* QwenModel::require(const ModelFile& file, const std::string& name,
                                 const std::vector<uint64_t>& shape, std::string* err) {
   const TensorView* t = file.get(name);
@@ -64,6 +85,9 @@ const float* QwenModel::require(const ModelFile& file, const std::string& name,
   return t->f32();
 }
 
+// Factory: binds weight views, validates every tensor the forward needs,
+// sizes the KV cache and the workspace buffers. All failure modes report
+// through *err; on success *out owns a ready-to-run model.
 bool QwenModel::create(const ModelFile& file, int max_seq_len, Profiler& profiler,
                        std::string* err, std::unique_ptr<QwenModel>* out) {
   out->reset();
@@ -104,6 +128,8 @@ bool QwenModel::create(const ModelFile& file, int max_seq_len, Profiler& profile
     if (!m->lm_head_) return false;
   }
 
+  // Per-layer weights. Tensor names keep the HuggingFace convention exactly,
+  // so a missing entry points straight at the exporter problem.
   m->layers_.resize(cfg.n_layers);
   for (uint32_t i = 0; i < cfg.n_layers; ++i) {
     const std::string p = "model.layers." + std::to_string(i) + ".";
@@ -158,6 +184,9 @@ void QwenModel::reset() {
   token_count_ = 0;
 }
 
+// One full model evaluation for a single token. `pos` is the current KV
+// length; after the call the cache holds pos+1 entries and the returned id
+// is the greedy continuation. See docs/qwen_forward.md for the math.
 int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
   const int hidden = static_cast<int>(cfg_.hidden_size);
   const int inter = static_cast<int>(cfg_.intermediate_size);
@@ -179,28 +208,34 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
   Profiler& prof = *profiler_;
   prof.begin_token(token_count_, pos, token_count_ < prompt_len_);
 
+  // Build profiler scope names ("layer_<i>.<op>") into one stack buffer:
+  // avoids std::string allocation on every op of every token.
   char name[64];
   const auto scope = [&](const char* fmt, int layer) {
     std::snprintf(name, sizeof(name), fmt, layer);
     return name;
   };
 
-  // ---- embedding ----
+  // ---- embedding lookup initializes the residual stream ----
   {
     ScopedTimer t(prof, "embed");
     std::memcpy(hidden_.data(), embed_ + static_cast<size_t>(token_id) * hidden,
                 hidden * sizeof(float));
   }
 
+  // 1/sqrt(head_dim), NOT 1/sqrt(hidden) — a common mix-up.
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
   for (uint32_t i = 0; i < cfg_.n_layers; ++i) {
     const LayerWeights& w = layers_[i];
 
+    // ---- attention block: norm -> qkv(+bias) -> RoPE -> cache -> attend ----
+
     {
       ScopedTimer t(prof, scope("layer_%d.input_layernorm", i));
       rmsnorm_ref(hidden_.data(), w.input_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
     }
+    // Qwen2/2.5 has q/k/v biases; they must be added BEFORE RoPE (HF order).
     {
       ScopedTimer t(prof, scope("layer_%d.q_proj", i));
       matvec_f32_ref(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
@@ -220,6 +255,8 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
       ScopedTimer t(prof, scope("layer_%d.rope", i));
       rope_ref(q_.data(), k_.data(), n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
     }
+    // Append BEFORE attending: the current token must see itself, so the
+    // attention below reads seq_len = pos + 1 entries from the cache.
     {
       ScopedTimer t(prof, scope("layer_%d.kv_append", i));
       const size_t pos_off = static_cast<size_t>(pos) * head_dim;
@@ -243,10 +280,13 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
       ScopedTimer t(prof, scope("layer_%d.o_proj", i));
       matvec_f32_ref(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
     }
+    // First residual: x = x + o_proj(attn).
     {
       ScopedTimer t(prof, scope("layer_%d.residual_attn", i));
       for (int j = 0; j < hidden; ++j) hidden_[j] += o_[j];
     }
+
+    // ---- FFN block (SwiGLU): norm -> gate/up -> silu*up -> down ----
     {
       ScopedTimer t(prof, scope("layer_%d.post_attn_layernorm", i));
       rmsnorm_ref(hidden_.data(), w.post_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
@@ -260,6 +300,8 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
       matvec_f32_ref(w.up, normed_.data(), up_.data(), inter, hidden);
     }
     {
+      // SiLU acts on the gate branch only; gate_ is reused in place as the
+      // fused (silu(gate) * up) buffer feeding down_proj.
       ScopedTimer t(prof, scope("layer_%d.swiglu", i));
       silu_ref(gate_.data(), gate_.data(), inter);
       for (int j = 0; j < inter; ++j) gate_[j] *= up_[j];
@@ -268,6 +310,7 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
       ScopedTimer t(prof, scope("layer_%d.down_proj", i));
       matvec_f32_ref(w.down, gate_.data(), ffn_.data(), hidden, inter);
     }
+    // Second residual: x = x + ffn.
     {
       ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
       for (int j = 0; j < hidden; ++j) hidden_[j] += ffn_[j];
@@ -279,12 +322,15 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     rmsnorm_ref(hidden_.data(), final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
   }
   {
+    // lm_head_ aliases embed_ when the model ties embeddings (Qwen2.5-0.5B).
     ScopedTimer t(prof, "lm_head");
     matvec_f32_ref(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
   }
 
   int next = 0;
   {
+    // Greedy: argmax == top-1; when the caller wants top-k we reuse the
+    // partial sort instead of scanning twice.
     ScopedTimer t(prof, "topk_argmax");
     if (topk) {
       top_k_logits(logits_.data(), vocab, topk_k, topk);
@@ -294,6 +340,8 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     }
   }
 
+  // Commit the cache slot written during the layer loop, then close the
+  // profiler token record.
   kv_.advance(1);
   token_count_ += 1;
   prof.end_token();

@@ -79,14 +79,22 @@ def main() -> None:
 
     hooks = []
 
+    # reg: capture a submodule OUTPUT. HF returns tuples from attention /
+    # decoder layers, so unwrap to the hidden-state tensor.
     def reg(module: torch.nn.Module, name: str) -> None:
         hooks.append(module.register_forward_hook(
             lambda _m, _i, out, n=name: save(n, out[0] if isinstance(out, tuple) else out)))
 
+    # reg_pre: capture a submodule INPUT — used for the post-attention
+    # residual state, which is exactly the input of post_attention_layernorm.
     def reg_pre(module: torch.nn.Module, name: str) -> None:
         hooks.append(module.register_forward_pre_hook(
             lambda _m, inp, n=name: save(n, inp[0])))
 
+    # Hook placement mirrors docs/qwen_forward.md op-by-op; dump key names
+    # are the contract used by docs/pytorch_alignment.md.
+    # Note: q/k/v dumps are PRE-RoPE (projection outputs), matching the C++
+    # buffer state right after the q/k/v projections.
     layer0 = lm.layers[L]
     save("embed_out", lm.embed_tokens(torch.tensor(tokens)))
     reg(layer0.input_layernorm, f"layer_{L}_attn_norm")
@@ -104,6 +112,8 @@ def main() -> None:
 
     input_ids = torch.tensor([tokens], dtype=torch.long)
     with torch.no_grad():
+        # Explicit position_ids keep the reference comparable with the C++
+        # runtime where pos == KV cache length (0-based, identical schedule).
         position_ids = torch.arange(len(tokens), dtype=torch.long).unsqueeze(0)
         out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
 

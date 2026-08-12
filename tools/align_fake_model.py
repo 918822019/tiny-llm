@@ -60,7 +60,12 @@ def read_tqwen(path: Path):
 
 
 def run_cpp(binary: Path, model: Path, tmp: Path):
-    """Returns (generated_ids, cpp_logits rows for every forward)."""
+    """Run the C++ binary and collect its exact logits.
+
+    Returns (generated_ids, logits) where logits[i] is the fp32 row produced
+    after consuming sequence position i — row order == position order, which
+    is the --dump-logits contract of runtime/main.cpp.
+    """
     import numpy as np
 
     logits_path = tmp / "logits.bin"
@@ -125,6 +130,8 @@ def main() -> None:
     # C++ forward rows: positions 0..P-1 are prefill, then decode positions.
     # Greedy token g_s = argmax(logits[P - 1 + s]).
     P = len(PROMPT)
+    # HF needs the same token schedule as input; the last generated token is
+    # never consumed by any compared position, so drop it.
     full_seq = PROMPT + gen_ids[: MAX_NEW - 1]
     input_ids = torch.tensor([full_seq], dtype=torch.long)
     with torch.no_grad():

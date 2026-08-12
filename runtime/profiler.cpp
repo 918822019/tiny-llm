@@ -1,3 +1,12 @@
+// Profiler implementation. Recording model:
+//   - begin_token()/end_token() delimit one forward pass;
+//   - enter()/leave() (via ScopedTimer) push/pop a small stack, so nested
+//     scopes are tolerated, though the v1 forward uses flat, disjoint scopes;
+//   - every recorded op is appended to the current token in execution order
+//     AND aggregated into op_totals, so both per-token traces and global
+//     op shares come from one pass over the data.
+// The JSON layout written below is specified in docs/profiling_schema.md.
+
 #include "profiler.h"
 
 #include <cstdio>
@@ -36,6 +45,8 @@ void Profiler::end_token() {
   stack_.clear();
 }
 
+// Ops outside a token record are dropped on purpose (model loading etc.
+// should not pollute per-token traces).
 void Profiler::enter(const char* name) {
   if (!enabled_ || !in_token_) return;
   stack_.push_back(Frame{std::string(name), Clock::now()});
@@ -106,6 +117,9 @@ bool Profiler::write_json(const std::string& path, std::string* err) const {
     return false;
   }
 
+  // Hand-written JSON (no third-party dependency). Field semantics:
+  //   first_token_ms = sum of prefill token latencies (~TTFT for
+  //                    token-by-token prefill), decode_avg_ms over the rest.
   std::fprintf(f, "{\n");
   std::fprintf(f, "  \"model\": \"%s\",\n", json_escape(model_).c_str());
   std::fprintf(f, "  \"backend\": \"%s\",\n", json_escape(backend_).c_str());

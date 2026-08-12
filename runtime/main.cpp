@@ -88,6 +88,7 @@ bool parse_args(int argc, char** argv, Args* out) {
   return true;
 }
 
+// "--tokens 1,2,3" -> ids. Tolerates spaces; fails loud on garbage.
 std::vector<int> parse_csv(const std::string& s) {
   std::vector<int> ids;
   size_t i = 0;
@@ -159,6 +160,7 @@ int main(int argc, char** argv) {
   }
   if (args.verbose) file.print_summary();
 
+  // Profiling is opt-in: without --profile-out every ScopedTimer is a no-op.
   tinyqwen::Profiler profiler(!args.profile_out.empty());
   profiler.set_meta("qwen2.5-0.5b-like", "cpu_ref", "fp32");
 
@@ -170,6 +172,8 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",
                model->kv_cache().memory_bytes() / (1024.0 * 1024.0), args.max_seq_len);
 
+  // Prompt token ids (produced by tools/tokenize_prompt.py on the Python
+  // side; v1 has no C++ tokenizer by design).
   std::vector<int> tokens =
       args.tokens_csv.empty() ? parse_tokens_json(args.tokens_json) : parse_csv(args.tokens_csv);
   if (tokens.empty()) {
@@ -186,6 +190,8 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  // Append one row of vocab fp32 logits per forward call; row order matches
+  // sequence positions (used by tools/align_fake_model.py).
   const auto dump = [&]() {
     if (logits_out) {
       std::fwrite(model->last_logits(), sizeof(float), file.config().vocab_size, logits_out);

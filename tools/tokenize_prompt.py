@@ -60,6 +60,9 @@ def main() -> None:
         # Qwen2 tokenizer has no BOS; do not silently add special tokens.
         tokens = tokenizer(args.prompt, add_special_tokens=False)["input_ids"]
 
+    # The "tokens" array is the only field consumed downstream: the C++ CLI
+    # (runtime/main.cpp parse_tokens_json) and tools/dump_qwen_reference.py
+    # must see identical ids, or alignment comparisons are meaningless.
     payload = {
         "model": args.model,
         "prompt": args.prompt,

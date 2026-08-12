@@ -1,3 +1,13 @@
+// Rotary position embedding (reference, in-place).
+//
+// Pairing convention (must match HF Qwen2 "rotate_half"):
+//   the rotation partner of x[i] is x[i + head_dim/2] — the head vector is
+//   split into two halves, NOT interleaved pairs. Getting this wrong still
+//   produces plausible output but silently diverges from PyTorch.
+//
+// cos/sin are computed once per position (shared by all heads), which matches
+// HF's apply_rotary_pos_emb semantics.
+
 #include "ref_ops.h"
 
 #include <cmath>
@@ -26,6 +36,7 @@ void rope_ref(float* q, float* k, int n_heads, int n_kv_heads, int head_dim, int
     sn[i] = std::sin(angle);
   }
 
+  // Apply the 2D rotation to every (x0, x1) pair of one head.
   const auto apply = [&](float* x) {
     for (int i = 0; i < half; ++i) {
       const float x0 = x[i];

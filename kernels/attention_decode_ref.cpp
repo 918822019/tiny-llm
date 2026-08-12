@@ -1,3 +1,10 @@
+// Decode-step attention (one query position against the cached KV).
+//
+// Uses the online-softmax recurrence (same idea as FlashDecoding), so the
+// kernel needs O(1) scratch memory: no per-position score buffer. This keeps
+// the reference allocation-free and already mirrors the access pattern a
+// fused kernel will use later.
+
 #include "ref_ops.h"
 
 #include <cmath>
@@ -9,7 +16,9 @@ namespace tinyqwen {
 void attention_decode_ref(const float* q, const float* k_cache, const float* v_cache,
                           int seq_len, int max_seq_len, int n_heads, int n_kv_heads,
                           int head_dim, float scale, float* out) {
-  const int heads_per_kv = n_heads / n_kv_heads;
+  const int heads_per_kv = n_heads / n_kv_heads;  // GQA fan-out factor
+  // Stride between two kv heads inside one layer block:
+  // layout is [n_kv_heads][max_seq_len][head_dim].
   const size_t kv_layer_stride = static_cast<size_t>(max_seq_len) * head_dim;
 
   for (int h = 0; h < n_heads; ++h) {
@@ -19,7 +28,12 @@ void attention_decode_ref(const float* q, const float* k_cache, const float* v_c
     const float* vh = v_cache + static_cast<size_t>(kv) * kv_layer_stride;
     float* oh = out + static_cast<size_t>(h) * head_dim;
 
-    // Online softmax over the cached positions: O(1) scratch, stable.
+    // Online softmax state. Invariant after processing positions [0, t):
+    //   m  = max score seen so far
+    //   l  = sum_j exp(s_j - m)
+    //   oh = sum_j exp(s_j - m) * v_j        (unnormalized output)
+    // A new maximum m_new rescales the old accumulation by exp(m - m_new),
+    // which is exactly 1 until the first real score arrives (m == -inf).
     float m = -std::numeric_limits<float>::infinity();
     float l = 0.0f;
     for (int i = 0; i < head_dim; ++i) oh[i] = 0.0f;
