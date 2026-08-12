@@ -1,0 +1,10 @@
+build/
+build-*/
+*.o
+*.a
+*.tqwen
+*.npz
+*.pt
+__pycache__/
+.DS_Store
+.idea/
