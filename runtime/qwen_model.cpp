@@ -23,6 +23,7 @@
 #include <cstring>
 #include <numeric>
 
+#include "dispatch.h"  // matvec_f32 通用入口（分发到 _ref / 将来的优化版）
 #include "ref_ops.h"
 
 namespace tinyqwen {
@@ -251,17 +252,17 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     // matvec = 矩阵乘向量：normed_ 过投影矩阵得到 q_/k_/v_。
     {
       ScopedTimer t(prof, scope("layer_%d.q_proj", i));
-      matvec_f32_ref(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
+      matvec_f32(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
       for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
     }
     {
       ScopedTimer t(prof, scope("layer_%d.k_proj", i));
-      matvec_f32_ref(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden);
+      matvec_f32(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden);
       for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
     }
     {
       ScopedTimer t(prof, scope("layer_%d.v_proj", i));
-      matvec_f32_ref(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden);
+      matvec_f32(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden);
       for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
     }
     // 2c. RoPE 旋转位置编码：把"位置 pos"的信息编进 q/k（v 不需要）。
@@ -294,7 +295,7 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     // 2f. 输出投影 o_proj。
     {
       ScopedTimer t(prof, scope("layer_%d.o_proj", i));
-      matvec_f32_ref(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
+      matvec_f32(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
     }
     // 2g. 第一次残差连接：x = x + attention(x)。残差让梯度/信息能直通。
     {
@@ -312,11 +313,11 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     // 2i. gate 和 up 两个投影并行（SwiGLU 需要两条支路）。
     {
       ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
-      matvec_f32_ref(w.gate, normed_.data(), gate_.data(), inter, hidden);
+      matvec_f32(w.gate, normed_.data(), gate_.data(), inter, hidden);
     }
     {
       ScopedTimer t(prof, scope("layer_%d.up_proj", i));
-      matvec_f32_ref(w.up, normed_.data(), up_.data(), inter, hidden);
+      matvec_f32(w.up, normed_.data(), up_.data(), inter, hidden);
     }
     // 2j. SwiGLU 融合：SiLU 只作用在 gate 支路，再和 up 逐元素相乘。
     // gate_ 就地复用为融合结果，直接喂给 down_proj。
@@ -328,7 +329,7 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     // 2k. down 投影，把维度从 inter 压回 hidden。
     {
       ScopedTimer t(prof, scope("layer_%d.down_proj", i));
-      matvec_f32_ref(w.down, gate_.data(), ffn_.data(), hidden, inter);
+      matvec_f32(w.down, gate_.data(), ffn_.data(), hidden, inter);
     }
     // 2l. 第二次残差连接：x = x + ffn(x)。
     {
@@ -346,7 +347,7 @@ int QwenModel::forward_token(int token_id, TopKResult* topk, int topk_k) {
     // lm_head：把 hidden 向量投成 vocab 维的 logits（每个词一个分数）。
     // tied 时 lm_head_ 就是 embed_（见 create）。
     ScopedTimer t(prof, "lm_head");
-    matvec_f32_ref(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+    matvec_f32(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
   }
 
   // ==== 第 4 步：greedy 取 argmax ====

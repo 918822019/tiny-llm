@@ -138,6 +138,7 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | `docs/infra_primer.md` | **infra 新手导读**：内存布局/对齐/字节序/KV cache/RAII 等概念 |
 | `docs/benchmarking.md` | **测量方法论**：怎么科学测性能、怎么归因 |
 | `docs/optimization_log.md` | **优化日志**：每次优化改了什么/提升多少/为什么 |
+| `docs/kernel_optimization.md` | **算子优化指南**：保留 base、改进版往哪加 |
 | `docs/weight_format.md` | tiny binary format（header / tensor table / 对齐） |
 | `docs/qwen_forward.md` | Qwen forward 数学定义与 shape 约定 |
 | `docs/profiling_schema.md` | profiler JSON 输出 schema |

@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "dispatch.h"
 #include "model_loader.h"
 #include "profiler.h"
 #include "qwen_model.h"
@@ -37,6 +38,7 @@ struct Args {
   int topk = 0;
   int eos = 151645;  // Qwen2.5 的 im_end；传 -1 禁用
   bool verbose = false;
+  std::string matvec_impl = "ref";  // matvec 实现：ref（默认）/ 将来的 neon 等
 };
 
 void usage(const char* prog) {
@@ -51,6 +53,7 @@ void usage(const char* prog) {
                "  --dump-logits PATH      dump full logits (fp32 binary) after every forward\n"
                "  --profile-out PATH      write profiler JSON\n"
                "  --eos ID                stop token, default 151645, -1 disables\n"
+               "  --matvec-impl NAME      matvec kernel: ref (default; neon later)\n"
                "  --verbose               model summary + per-token details\n",
                prog);
 }
@@ -75,6 +78,7 @@ bool parse_args(int argc, char** argv, Args* out) {
     else if (a == "--profile-out") out->profile_out = value("--profile-out");
     else if (a == "--dump-logits") out->dump_logits = value("--dump-logits");
     else if (a == "--eos") out->eos = std::atoi(value("--eos").c_str());
+    else if (a == "--matvec-impl") out->matvec_impl = value("--matvec-impl");
     else if (a == "--verbose") out->verbose = true;
     else if (a == "--help" || a == "-h") { usage(argv[0]); std::exit(0); }
     else {
@@ -159,6 +163,18 @@ std::vector<int> parse_tokens_json(const std::string& path) {
 int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, &args)) return 2;
+
+  // ---- 选择 matvec 实现（默认 ref；未知值报错，保证可兜底）----
+  tinyqwen::MatvecImpl impl;
+  if (args.matvec_impl == "ref") {
+    impl = tinyqwen::MatvecImpl::kRef;
+  } else {
+    std::fprintf(stderr, "error: unknown --matvec-impl '%s' (available: ref)\n",
+                 args.matvec_impl.c_str());
+    return 2;
+  }
+  tinyqwen::set_matvec_impl(impl);
+  std::fprintf(stderr, "[init] matvec impl: %s\n", tinyqwen::matvec_impl_name());
 
   // ---- 加载权重文件并校验 ----
   tinyqwen::ModelFile file;
