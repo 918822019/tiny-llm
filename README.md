@@ -7,9 +7,7 @@
 > **当前状态**
 > - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，16 个生成 token 与 HuggingFace 逐位一致；
 > - 性能基线：单线程 fp32 **decode ≈ 230 ms/token**（tag `v0.1-fp32-baseline`）；
-> - 已就位：可复现基准（`scripts/bench.sh`）、优化日志、kernel 分发层（保留 base
-    >
-+ 可插拔优化位）、key=value 配置；
+> - 已就位：可复现基准、优化日志、kernel 分发层、key=value 配置；
 > - 下一步：第一个 kernel 优化（NEON matvec）。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。

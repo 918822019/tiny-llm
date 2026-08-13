@@ -13,29 +13,27 @@
 #include <cmath>
 
 namespace tinyqwen {
+  void rmsnorm_ref(const float *x, const float *weight, float *y, int n, float eps) {
+    // 第 1 遍：求平方和。用 double 累加减少误差（见 matvec 里的说明）。
+    double sumsq = 0.0;
+    for (int i = 0; i < n; ++i) {
+      const double xi = static_cast<double>(x[i]);
+      sumsq += xi * xi;
+    }
 
-void rmsnorm_ref(const float* x, const float* weight, float* y, int n, float eps) {
-  // 第 1 遍：求平方和。用 double 累加减少误差（见 matvec 里的说明）。
-  double sumsq = 0.0;
-  for (int i = 0; i < n; ++i) {
-    const double xi = static_cast<double>(x[i]);
-    sumsq += xi * xi;
+    // 平方和取平均，得 mean(x^2)。
+    const float mean_sq = static_cast<float>(sumsq / n);
+
+    // 加 eps 后开方得 RMS。注意 eps 在 sqrt 内部（这是 HF 的定义）。
+    const float rms = std::sqrt(mean_sq + eps);
+
+    // 融合成缩放系数 scale = 1 / RMS。
+    const float scale = 1.0f / rms;
+
+    // 第 2 遍：每个分量先归一化，再乘对应的 weight。
+    for (int i = 0; i < n; ++i) {
+      const float normed = x[i] * scale;
+      y[i] = normed * weight[i];
+    }
   }
-
-  // 平方和取平均，得 mean(x^2)。
-  const float mean_sq = static_cast<float>(sumsq / n);
-
-  // 加 eps 后开方得 RMS。注意 eps 在 sqrt 内部（这是 HF 的定义）。
-  const float rms = std::sqrt(mean_sq + eps);
-
-  // 融合成缩放系数 scale = 1 / RMS。
-  const float scale = 1.0f / rms;
-
-  // 第 2 遍：每个分量先归一化，再乘对应的 weight。
-  for (int i = 0; i < n; ++i) {
-    const float normed = x[i] * scale;
-    y[i] = normed * weight[i];
-  }
-}
-
-}  // namespace tinyqwen
+} // namespace tinyqwen

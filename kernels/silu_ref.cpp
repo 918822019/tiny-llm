@@ -13,12 +13,10 @@
 #include <cmath>
 
 namespace tinyqwen {
-
-void silu_ref(const float* x, float* y, int n) {
-  for (int i = 0; i < n; ++i) {
-    const float denom = 1.0f + std::exp(-x[i]);  // 分母 = 1 + exp(-x)
-    y[i] = x[i] / denom;                         // y = x / (1 + exp(-x))
+  void silu_ref(const float *x, float *y, int n) {
+    for (int i = 0; i < n; ++i) {
+      const float denom = 1.0f + std::exp(-x[i]); // 分母 = 1 + exp(-x)
+      y[i] = x[i] / denom; // y = x / (1 + exp(-x))
+    }
   }
-}
-
-}  // namespace tinyqwen
+} // namespace tinyqwen

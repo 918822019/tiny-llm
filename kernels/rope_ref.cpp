@@ -22,50 +22,48 @@
 #include <cstdlib>
 
 namespace tinyqwen {
-
-void rope_ref(float* q, float* k, int n_heads, int n_kv_heads, int head_dim, int pos,
-              float theta) {
-  const int half = head_dim / 2;  // 配对的"前半"长度
-  constexpr int kMaxHalf = 256;   // 支持 head_dim <= 512，远超任何 Qwen 配置
-  if (half <= 0 || half > kMaxHalf) {
-    std::fprintf(stderr, "rope_ref: unsupported head_dim %d\n", head_dim);
-    std::abort();
-  }
-
-  // 先算好本位置所有配对要用的 cos/sin。
-  // inv_freq[i] = theta ^ (-2i / head_dim)：不同配对用不同"频率"，
-  // 低维转得快、高维转得慢，这样能编码丰富的位置信息。
-  float cs[kMaxHalf];
-  float sn[kMaxHalf];
-  for (int i = 0; i < half; ++i) {
-    const float exponent = -static_cast<float>(2 * i) / static_cast<float>(head_dim);
-    const float inv_freq = std::pow(theta, exponent);
-    const float angle = static_cast<float>(pos) * inv_freq;
-    cs[i] = std::cos(angle);
-    sn[i] = std::sin(angle);
-  }
-
-  // 对单个 head 的所有 (x0, x1) 配对施加二维旋转（就地修改）。
-  const auto apply = [&](float* x) {
-    for (int i = 0; i < half; ++i) {
-      const float x0 = x[i];
-      const float x1 = x[i + half];
-      const float c = cs[i];
-      const float s = sn[i];
-      const float rotated0 = x0 * c - x1 * s;
-      const float rotated1 = x1 * c + x0 * s;
-      x[i] = rotated0;
-      x[i + half] = rotated1;
+  void rope_ref(float *q, float *k, int n_heads, int n_kv_heads, int head_dim, int pos,
+                float theta) {
+    const int half = head_dim / 2; // 配对的"前半"长度
+    constexpr int kMaxHalf = 256; // 支持 head_dim <= 512，远超任何 Qwen 配置
+    if (half <= 0 || half > kMaxHalf) {
+      std::fprintf(stderr, "rope_ref: unsupported head_dim %d\n", head_dim);
+      std::abort();
     }
-  };
 
-  // q 的每个 head、k 的每个 head 都要旋转（v 不需要）。
-  for (int h = 0; h < n_heads; ++h) {
-    apply(q + static_cast<size_t>(h) * head_dim);
-  }
-  for (int h = 0; h < n_kv_heads; ++h) {
-    apply(k + static_cast<size_t>(h) * head_dim);
-  }
-}
+    // 先算好本位置所有配对要用的 cos/sin。
+    // inv_freq[i] = theta ^ (-2i / head_dim)：不同配对用不同"频率"，
+    // 低维转得快、高维转得慢，这样能编码丰富的位置信息。
+    float cs[kMaxHalf];
+    float sn[kMaxHalf];
+    for (int i = 0; i < half; ++i) {
+      const float exponent = -static_cast<float>(2 * i) / static_cast<float>(head_dim);
+      const float inv_freq = std::pow(theta, exponent);
+      const float angle = static_cast<float>(pos) * inv_freq;
+      cs[i] = std::cos(angle);
+      sn[i] = std::sin(angle);
+    }
 
-}  // namespace tinyqwen
+    // 对单个 head 的所有 (x0, x1) 配对施加二维旋转（就地修改）。
+    const auto apply = [&](float *x) {
+      for (int i = 0; i < half; ++i) {
+        const float x0 = x[i];
+        const float x1 = x[i + half];
+        const float c = cs[i];
+        const float s = sn[i];
+        const float rotated0 = x0 * c - x1 * s;
+        const float rotated1 = x1 * c + x0 * s;
+        x[i] = rotated0;
+        x[i + half] = rotated1;
+      }
+    };
+
+    // q 的每个 head、k 的每个 head 都要旋转（v 不需要）。
+    for (int h = 0; h < n_heads; ++h) {
+      apply(q + static_cast<size_t>(h) * head_dim);
+    }
+    for (int h = 0; h < n_kv_heads; ++h) {
+      apply(k + static_cast<size_t>(h) * head_dim);
+    }
+  }
+} // namespace tinyqwen
