@@ -1,22 +1,28 @@
-# tinyqwen 的 C++ 格式约定。
+# tinyqwen 的 C++ 格式约定（权威配置，CLion 开启 clang-format 后以此为准）。
 #
-# 核心目标：可读、不挤——
+# 核心原则：可读、不挤——
 #   - 循环 / if / 块一律展开成多行并带大括号，禁止单行紧凑形式；
-#   - 指针/引用符号靠左（float* x）；
-#   - 2 空格缩进，namespace 内不额外缩进。
+#   - 复合表达式拆成命名中间变量（这条靠写代码时自觉，clang-format 管不了）。
 #
-# 这份配置是给编辑器/clang-format 用的，保证"你格式化的结果"和"手写的结果"
-# 一致，不再互相打架。配合 docs 的代码风格说明。
+# 风格对齐 CLion 现有习惯，减少切换后的漂移：
+#   - 指针/引用靠右（float *x）；
+#   - namespace 内容缩进（NamespaceIndentation: All）；
+#   - 2 空格缩进，行宽 100。
+#
+# CLion 启用方法：Settings → Editor → Code Style → C/C++ → 勾选
+# "Enable clang-format"，即会读取本文件。
 BasedOnStyle: LLVM
 IndentWidth: 2
 UseTab: Never
 ColumnLimit: 100
-PointerAlignment: Left
+PointerAlignment: Right
+NamespaceIndentation: All
 BreakBeforeBraces: Attach
 AllowShortLoopsOnASingleLine: false
 AllowShortIfStatementsOnASingleLine: Never
 AllowShortBlocksOnASingleLine: Never
 AllowShortFunctionsOnASingleLine: Empty
+AlignTrailingComments: false
 IndentCaseLabels: false
 FixNamespaceComments: true
 SpaceBeforeParens: ControlStatements
