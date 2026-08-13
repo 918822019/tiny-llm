@@ -7,7 +7,7 @@ project(tinyqwen CXX)
 # 范围刻意收窄：
 #   - 只做 CPU-only 的 reference 路径（FP32），batch = 1，token-by-token decode。
 #   - 不做 graph executor、不做 operator registry、不做 scheduler。
-#   - Android 通过 NDK toolchain 文件支持（见 docs/build_android.md）。
+#   - Android 通过 NDK toolchain 文件支持（见 docs/android.md）。
 # ---------------------------------------------------------------------------
 
 set(CMAKE_CXX_STANDARD 17)

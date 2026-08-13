@@ -38,7 +38,7 @@ ctest --test-dir build --output-on-failure
 
 要求：CMake ≥ 3.16，C++17 编译器，Python 3（仅工具侧）。
 
-Android NDK 交叉编译见 `docs/build_android.md`，真机运行流程见 `docs/android_runbook.md`。
+Android NDK 交叉编译与真机运行流程见 `docs/android.md`。
 
 ## 端到端流程
 
@@ -168,8 +168,7 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | `docs/qwen_forward.md`        | Qwen forward 数学定义与 shape 约定                    |
 | `docs/profiling_schema.md`    | profiler JSON 输出 schema                        |
 | `docs/pytorch_alignment.md`   | C++ 与 PyTorch reference 对齐流程                   |
-| `docs/build_android.md`       | NDK 交叉编译                                       |
-| `docs/android_runbook.md`     | adb push / run / pull 全流程                      |
+| `docs/android.md`             | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
 | `docs/project_structure.md`   | 目录职责说明                                         |
 | `docs/known_limitations.md`   | v1 已知限制                                        |
 

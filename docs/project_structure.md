@@ -48,7 +48,7 @@ tinyqwen/
 | `qwen_forward.md`                         | Qwen forward 数学定义与 shape 约定        |
 | `profiling_schema.md`                     | profiler JSON 输出 schema            |
 | `pytorch_alignment.md`                    | C++ 与 PyTorch 对齐流程                 |
-| `build_android.md` / `android_runbook.md` | NDK 编译 / adb 运行                    |
+| `android.md`                                | Android 端侧：NDK 编译 / adb 运行 / 常见坑   |
 | `known_limitations.md`                    | v1 已知限制                            |
 | `project_structure.md`                    | 本文件                                |
 
