@@ -5,7 +5,7 @@ tinyqwen/
 ├── CMakeLists.txt          # 顶层：C++17、Release 默认、开关测试
 ├── tinyqwen.conf           # 运行时配置（key=value；CLI 开关优先于它）
 │
-├── runtime/                # 运行时（静态库 tinyqwen_runtime + 可执行 tinyqwen）
+├── runtime/                # 运行时（OBJECT 库 tinyqwen_runtime + 可执行 tinyqwen）
 │   ├── tiny_format.h       # .tqwen 二进制格式的 C/Python 共同契约（头文件即规范）
 │   ├── tensor.h/.cpp       # TensorView：name/shape/dtype/data 指针，不拥有内存
 │   ├── model_loader.h/.cpp # 读取并校验 .tqwen，name -> TensorView 映射（fail fast）
@@ -15,9 +15,10 @@ tinyqwen/
 │   ├── profiler.h/.cpp     # ScopedTimer + per-token/per-op 记录 + JSON 输出
 │   └── main.cpp            # CLI 入口（prefill + decode 循环）
 │
-├── kernels/                # kernel 库（静态库 tinyqwen_kernels）
+├── kernels/                # kernel 库（OBJECT 库 tinyqwen_kernels）
 │   ├── ref_ops.h           # 所有 reference kernel 的签名约定（共用）
-│   ├── dispatch.h/.cpp     # 分发层：model 调通用入口 matvec_f32()，由它选实现（共用）
+│   ├── dispatch.h/.cpp     # 分发层 + 注册表：model 调通用入口 matvec_f32()；
+│   │                       # 变体用 TINYQWEN_MATVEC_VARIANT 宏自注册（共用）
 │   └── <op>/               # 每个算子一个文件夹：rmsnorm/rope/matvec/softmax/attention/silu/argmax
 │       ├── <op>_<dtype>_ref.cpp          # 参考实现（base）
 │       └── <op>_<dtype>_<variant>.cpp    # 【改进位】优化版 kernel，只增不删（见 kernel_optimization.md）

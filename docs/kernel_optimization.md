@@ -10,10 +10,11 @@
 ```text
 kernels/
 ├── ref_ops.h                     # 所有 kernel 的签名契约（共用）
-├── dispatch.h / dispatch.cpp     # 分发层：model 只调通用入口，由它选实现（共用）
+├── dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口；
+│                                 # 变体用 TINYQWEN_MATVEC_VARIANT 宏自注册（共用）
 └── <op>/                         # 每个算子一个文件夹
     ├── <op>_<dtype>_ref.cpp      # 参考实现（base）：永不删、永不覆盖
-    └── <op>_<dtype>_<variant>.cpp  # 优化版（改进位）：只增不删
+    └── <op>_<dtype>_<variant>.cpp  # 优化版（改进位）：只增不删，末尾一行自注册
 ```
 
 三条铁律：
@@ -48,8 +49,10 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()   (�
 
 好处：
 
-- **加优化不用动 model**——只加文件 + 枚举值 + dispatch 的 case；
-- **可 A/B**：同一负载，切换实现各跑一遍直接对比；
+- **加优化不用动 model，也不用动 dispatch/main**——只加实现文件
+  （含一行自注册宏）+ CMake 一行；
+- **可 A/B**：同一负载，切换实现各跑一遍直接对比
+  （`record.sh --extra-args` 已内置同场 A/B）；
 - **可兜底**：切回 ref 永远有正确结果。
 
 选择方式有两种，优先级 **CLI 开关 > 配置文件 > 默认**：
@@ -61,21 +64,23 @@ micro-benchmark 时也能在同一个程序里同时调 ref 和优化版做对�
 
 ## 4. 加一个新优化算子：标准流程
 
-以"给 matvec 加 NEON 版"为例：
+变体**自注册**：实现文件末尾一行宏把自己登记进 dispatch，
+dispatch / main / conf **零改动**。以"给 matvec 加 NEON 版"为例：
 
-1. **写实现**：新建 `kernels/matvec/matvec_f32_neon.cpp`，声明
-   `void matvec_f32_neon(const float*, const float*, float*, int, int);`
-   （签名和 `_ref` 完全一致）。
-2. **接进分发**：
-    - `dispatch.h`：给 `MatvecImpl` 加 `kNeon`；
-    - `dispatch.cpp`：`switch` 里加 `case kNeon: matvec_f32_neon(...);`，
-      并在 `matvec_impl_name()` 加名字。
-3. **CMake**：把新 `.cpp` 加进 `kernels/CMakeLists.txt`。
-4. **加开关值**：`main.cpp` 的 `--matvec-impl` 接受 `neon`。
-5. **正确性门禁**：写单测/脚本，确认 `neon` 输出与 `ref` 误差在容差内
-   （**先证明算对了**）。
-6. **测速**：micro-benchmark 测 kernel 提速，`bench.sh` 测整机提速，
-   两个数都填进 `optimization_log.md`（见 `benchmarking.md` 第 7–9 节）。
+1. **写实现 + 注册**：新建 `kernels/matvec/matvec_f32_neon.cpp`，函数签名
+   和 `_ref` 完全一致；`#include "dispatch.h"`，在文件末尾（namespace 内）加一行：
+   `TINYQWEN_MATVEC_VARIANT(matvec_f32_neon, "neon");`
+2. **CMake**：把新 `.cpp` 加进 `kernels/CMakeLists.txt`。
+   到此 `--matvec-impl neon` / `tinyqwen.conf` 即可选用——实现名按注册表
+   查表，未知名字会报错并自动列出所有可用实现。
+3. **正确性门禁**：写单测，确认变体输出与 `ref` 误差在容差内
+   （**先证明算对了**）。注意：测试里切换实现必须
+   `EXPECT_TRUE(set_matvec_impl_by_name("neon"))`——set 失败时 dispatch
+   会静默兜底到 ref，断言不加就是假通过。
+4. **测速 + 记录**：`./scripts/record.sh neon --extra-args "--matvec-impl neon"`
+   ——内置同场 A/B（对照 = ref，vs 历史基线会被机器漂移掩盖，同场才是真贡献），
+   自动写 `optimization_log.md`；人工补全归因/教训后 `commit_opt.sh` 提交
+   （日志里留着 `<填...>` 占位会被拒绝提交）。
 
 ## 5. 正确性门禁（不可跳过）
 

@@ -7,8 +7,10 @@
 > **当前状态**
 > - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，16 个生成 token 与 HuggingFace 逐位一致；
 > - 性能基线：单线程 fp32 **decode ≈ 230 ms/token**（tag `v0.1-fp32-baseline`）；
-> - 已就位：可复现基准、优化日志、kernel 分发层、key=value 配置；
-> - 下一步：第一个 kernel 优化（NEON matvec）。
+>   已落地变体 `double_2_float`（同场 A/B ~1.09–1.12×，见优化日志）；
+> - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、kernel 分发层
+>   （变体自注册）、key=value 配置；
+> - 下一步：NEON matvec。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
 
@@ -126,7 +128,7 @@ tinyqwen --model <model.tqwen> [options]
 | `--profile-out PATH` | 无      | profiler JSON 输出                            |
 | `--eos ID`           | 151645 | stop token，-1 禁用                            |
 | `--config PATH`      | 无      | key=value 配置文件（见下；CLI 开关优先于它）               |
-| `--matvec-impl NAME` | ref    | matvec kernel 实现：`ref`（以后会有 neon 等）         |
+| `--matvec-impl NAME` | ref    | matvec kernel 实现：任意已注册名（当前 `ref` / `double_2_float`），未知值报错并列出可用 |
 | `--verbose`          | 关      | 模型 summary + prefill 细节（stderr）             |
 
 ### 配置文件
@@ -136,7 +138,7 @@ tinyqwen --model <model.tqwen> [options]
 随时用命令行覆盖。当前可配：
 
 ```text
-matvec_impl = ref     # matvec kernel 实现
+matvec_impl = ref     # matvec kernel 实现（任意已注册名；变体自注册，见 kernels/dispatch.h）
 ```
 
 ```bash
