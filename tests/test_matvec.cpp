@@ -154,3 +154,61 @@ TEST (matvec_neon_matches_ref) {
     // NEON 版 4 链并行累加，每条链仅 in_dim/16 项，误差上界同数量级，5e-3 充分宽裕。
     for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
 }
+
+TEST (matvec_neon_mt_matches_ref) {
+    // 正确性门禁：neon_mt 只在 aarch64 构建注册；其他平台 skip。
+    if (!set_matvec_impl_by_name("neon_mt")) {
+        std::printf("[skip] current build has no 'neon_mt' matvec (not aarch64)\n");
+        return;
+    }
+
+    // 1) 并行路径：out_dim=301 故意不整除常见线程数（5/6），行块会有 ±1 的
+    //    不均分；in_dim=4103 三种尾段全覆盖。循环多遍，压线程池的重复
+    //    发布/归位（代数计数器、空块、参数可见性都要经得起反复）。
+    {
+        const int out_dim = 301, in_dim = 4103;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 8; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 2) 内联路径：权重 0.25MB < 1MB 阈值，应走单线程直算，数值同样要对。
+    {
+        const int out_dim = 16, in_dim = 4103;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    // 3) 极端：行数（3）少于线程数，多数线程分到空块——仍要正确归位。
+    //    in_dim 取大让总权重过并行阈值；数值调小（0.0625）把长累加链的
+    //    float 舍入压进容差。
+    {
+        const int out_dim = 3, in_dim = 100003;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.0625f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.0625f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}

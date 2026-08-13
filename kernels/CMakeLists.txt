@@ -20,6 +20,8 @@ add_library(tinyqwen_kernels OBJECT
         matvec/matvec_f32_acc4.cpp
         matvec/matvec_f32_neon_nofma.cpp
         matvec/matvec_f32_neon.cpp
+        # neon_mt = neon + 多线程行切分（常驻线程池，仅 aarch64；其他平台编译为空）。
+        matvec/matvec_f32_neon_mt.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp
         silu/silu_ref.cpp
@@ -27,3 +29,8 @@ add_library(tinyqwen_kernels OBJECT
         dispatch.cpp
 )
 target_include_directories(tinyqwen_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# neon_mt 用 std::thread 建常驻线程池。OBJECT 库的 PUBLIC 链接需求会传播给
+# 所有链 tinyqwen_kernels 的目标（runtime/tests），无需各处重复写。
+find_package(Threads REQUIRED)
+target_link_libraries(tinyqwen_kernels PUBLIC Threads::Threads)

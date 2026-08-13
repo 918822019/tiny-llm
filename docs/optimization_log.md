@@ -22,6 +22,7 @@
 | neon | fd430db | 28.25 | 30.14 | 7.88× | 8.05×（同场） | matvec NEON 向量化（4 路 FMA + 4 累加器展开）；decode 纯权重带宽瓶颈，有效带宽 8.7→72 GB/s，kernel 加速比几乎全额传导到端到端 |
 | acc4（阶梯 L2：隔离累加结构） | 2dfb2c8 | 89.32 | 99.92 | 2.49× | 2.65×（同场） | 标量 4 链并行累加，隐藏乘加延迟；阶梯口径 vs double_2_float = 2.41× |
 | neon_nofma（阶梯 L3：隔离 SIMD 宽度） | 2dfb2c8 | 28.62 | 29.03 | 7.78× | 7.97×（同场） | NEON 向量化但故意不用 FMA；SIMD 是最大单项（vs acc4 = 3.02×），并撞带宽墙 |
+| neon_mt | 56f51ba | 10.50 | 11.26 | 21.19× | 2.69×（vs neon） | NEON + 常驻线程池行切分（默认 6 线程）：单核带宽 72 GB/s 打满后，多核接力整机带宽 ~199 GB/s；同场 vs ref 21.42× |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -233,6 +234,49 @@
      FMA 的价值暂时只在数值侧（单次舍入）与未来余量（量化减少搬运后
      若算术重新成为瓶颈，它才会显形）。
 - **复现**：`./scripts/bench.sh neon_nofma --extra-args "--matvec-impl neon_nofma"`
+
+---
+
+### neon_mt（2026-08-13）
+
+- **优化栈**：fp32-baseline + matvec neon_mt 变体（与 neon/double_2_float 互斥——
+  dispatch 单选，本变体替代 neon 成为当前优化选择，默认仍是 ref）
+- **是什么**：新增 `kernels/matvec/matvec_f32_neon_mt.cpp`：NEON 行点积之上叠加
+  多线程行切分。常驻线程池（原子 generation 自旋唤醒，无 OS 锁），master 也
+  参与算第 0 块后自旋等归位；权重 <1MB 的小矩阵（k/v_proj）内联单线程；
+  默认并行度 = Apple P 核数 + 1，`TINYQWEN_MT_THREADS` 可调。
+- **假设**：并行类 + 带宽类。单核 NEON 已打到 ~72 GB/s（单核份额天花板），
+  但 decode 每 token ~2GB 权重流量是纯带宽瓶颈，整机统一内存带宽远未吃满；
+  多核并行读权重应接近线性提速，直到撞上总带宽上限。
+- **结果**：decode 中位 **10.50 ms/token**（3 遍取中位，每遍 27 样本），p95 11.26
+- **vs 上一配置**：**2.69×（vs neon：28.25 → 10.50）**——这才是本步的真实贡献。
+  同场 A/B 对照（无额外参数 = ref）中位 224.93（p95 236.09）→ 变体 10.50，
+  即 vs ref 21.42×，同 binary 同场交错测量。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 21.19×
+- **验证**：scripts/verify.sh（37 单测全过，含新增 `matvec_neon_mt_matches_ref`：
+  并行路径 out_dim=301×in_dim=4103 不整除线程数 ×8 轮重复压线程池、内联路径
+  小矩阵、行数 3 < 线程数的空块极端形；golden token 16 个与 ref 逐位一致）。
+- **瓶颈转移**：top op = `lm_head`、`topk_argmax`、`layer_3.up_proj`。matvec
+  占比 98% → **93.9%**，有效带宽 72 → **~199 GB/s**（1.97GB ÷ 9.9ms/tok）——
+  整机带宽已吃了大半，matvec 单点继续堆核收益递减。标量小算子开始露头：
+  attention 2.1%、topk_argmax 1.9%、swiglu 1.6%（合计 ~6%）。下一刀：
+  ① INT4 量化——权重流量 ÷8，带宽瓶颈下最直接的量级收益，且能重新打开
+  多线程的带宽空间；② topk_argmax/swiglu/attention 的 NEON 化（从 6% 里抠）。
+  优先①。
+- **意外 / 教训**：
+  1. **线程甜蜜点是 6（5P+1E），不是越多越好**：扫了 TINYQWEN_MT_THREADS，
+     5 线程 10.9ms、6 线程 10.2、8 线程起抖动变大（10.3~12.7）、10+ 稳定更差。
+     带宽瓶颈下并行度被总带宽封顶：6 线程已到 ~199 GB/s，再加核只是互踩。
+     默认值因此取 P 核数 + 1（E 核单核带宽低，但白送的那一份还是正的）。
+  2. **实测 2.69× < 线程数 6 的理论值——这是带宽版的 Amdahl**：单核 72 →
+     整机 199 GB/s 只有 ~2.8× 的空间，并行收益在带宽墙处饱和，与线程数无关。
+     反过来看，这正预告了量化（流量 ÷8）才是下一阶段的主升浪。
+  3. **同步机制是这个变体的生死线**：每 token ~170 次 matvec 调用，若每次
+     现起线程或用 mutex/condvar，微秒级开销 ×170 会把收益吃光。本实现用
+     原子 generation + 自旋（master release-store 发布、worker acquire 读参、
+     done 计数归位），单次 fork-join 亚微秒，全程无系统调用。粒度阈值
+     （<1MB 内联）同样关键：k/v_proj 只有 0.45MB，并行必亏。
+- **复现**：`./scripts/bench.sh neon_mt --extra-args "--matvec-impl neon_mt"`
 
 ---
 
