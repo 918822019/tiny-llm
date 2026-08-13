@@ -90,7 +90,8 @@ def main() -> None:
     args = ap.parse_args()
 
     extra = shlex.split(args.extra_args)
-    extra_suffix = (" " + args.extra_args.strip()) if extra else ""
+    # 日志"复现"行要能直接执行：额外参数走 bench.sh 的 --extra-args 通道。
+    extra_suffix = f' --extra-args "{args.extra_args.strip()}"' if extra else ""
 
     print(f"[record] label={args.label} runs={args.runs}"
           + (f"  额外参数: {' '.join(extra)}" if extra else ""))
