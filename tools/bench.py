@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import shlex
 import statistics
 import subprocess
 import sys
@@ -68,8 +69,12 @@ def percentile(data: list[float], p: float) -> float:
     return s[lo] * (1 - frac) + s[hi] * frac
 
 
-def run_once(binary: str, model: str) -> dict:
-    """跑一次标准负载，返回 profiler JSON。"""
+def run_once(binary: str, model: str, extra_args: list[str] | None = None) -> dict:
+    """跑一次标准负载，返回 profiler JSON。
+
+    extra_args：原样追加给 binary 的额外 CLI 参数。测"需要开关才生效"的
+    优化变体时用，例如 ["--matvec-impl", "double_2_float"]。
+    """
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
         profile_path = tf.name
     cmd = [
@@ -81,6 +86,7 @@ def run_once(binary: str, model: str) -> dict:
         "--eos", "-1",  # 禁用停止符，保证生成固定数量，样本量稳定
         "--profile-out", profile_path,
     ]
+    cmd += list(extra_args or [])
     subprocess.run(cmd, capture_output=True, check=True)
     with open(profile_path) as f:
         profile = json.load(f)
@@ -124,16 +130,22 @@ def main() -> None:
     p.add_argument("--runs", type=int, default=1,
                    help="把标准负载跑几遍，取各遍中位数的中位数（抗单次波动）")
     p.add_argument("--json", default=None, help="可选：把结果也写成 JSON 文件")
+    p.add_argument("--extra-args", default="",
+                   help="原样传给 binary 的额外 CLI 参数（引号括起），"
+                        "如 '--matvec-impl double_2_float'")
     args = p.parse_args()
 
+    extra = shlex.split(args.extra_args)
     runs = max(1, args.runs)
     print(f"[bench] label={args.label} runs={runs}  负载: prompt={len(CANONICAL_PROMPT)} tok, "
           f"decode={DECODE_TOKENS} tok (丢弃预热 {WARMUP})")
+    if extra:
+        print(f"[bench] 额外参数: {' '.join(extra)}")
 
     # 跑 runs 遍，收集每遍的稳态统计；headline 取"中位数的中位数"，更稳。
     medians, p95s, last_stats = [], [], None
     for r in range(runs):
-        profile = run_once(args.binary, args.model)
+        profile = run_once(args.binary, args.model, extra)
         stats = summarize(profile)
         medians.append(stats["decode_median_ms"])
         p95s.append(stats["decode_p95_ms"])
@@ -150,6 +162,8 @@ def main() -> None:
     headline["per_run_median_ms"] = [round(m, 2) for m in medians]
 
     result = {"label": args.label, **headline, "env": env}
+    if extra:
+        result["extra_args"] = extra  # 可复现性：记录本次测量启用了什么开关
 
     # ---- 人类可读汇总 ----
     print(f"\n  decode 延迟/token：median={headline['decode_median_ms']:.2f}ms  "

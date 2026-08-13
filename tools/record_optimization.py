@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import shlex
 import statistics
 import sys
 from pathlib import Path
@@ -27,10 +28,11 @@ TABLE_MARKER = "<!-- 新的优化按时间顺序往上表追加行"
 DETAIL_MARKER = "<!-- 模板：复制下面这段"
 
 
-def measure(binary: str, model: str, runs: int) -> tuple[float, float, dict]:
+def measure(binary: str, model: str, runs: int,
+            extra_args: list[str] | None = None) -> tuple[float, float, dict]:
     medians, p95s, last = [], [], None
     for r in range(runs):
-        prof = bench.run_once(binary, model)
+        prof = bench.run_once(binary, model, extra_args)
         st = bench.summarize(prof)
         medians.append(st["decode_median_ms"])
         p95s.append(st["decode_p95_ms"])
@@ -45,7 +47,8 @@ def build_table_row(label, commit, med, p95, vs_base_str, note) -> str:
             f"{vs_base_str} | — | {note} |")
 
 
-def build_detail(label, commit, med, p95, runs, last, vs_prev_str, base_note) -> str:
+def build_detail(label, commit, med, p95, runs, last, vs_prev_str, base_note,
+                 extra_suffix="") -> str:
     today = datetime.date.today().isoformat()
     top_ops = "、".join(f"`{o['op']}`" for o in last["top_ops"][:3])
     return f"""### {label}（{today}）
@@ -59,7 +62,7 @@ def build_detail(label, commit, med, p95, runs, last, vs_prev_str, base_note) ->
 - **验证**：scripts/verify.sh（31 单测 + golden token 对照）
 - **瓶颈转移**：top op = {top_ops}，下一刀砍哪：<填>
 - **意外 / 教训**：<填——往往最值钱>
-- **复现**：`./scripts/bench.sh {label}`
+- **复现**：`./scripts/bench.sh {label}{extra_suffix}`
 
 ---
 
@@ -81,10 +84,17 @@ def main() -> None:
     ap.add_argument("--model", default="model.tqwen")
     ap.add_argument("--baseline", default="benchmarks/baseline.json")
     ap.add_argument("--log", default="docs/optimization_log.md")
+    ap.add_argument("--extra-args", default="",
+                    help="原样传给 runtime 的额外 CLI 参数（引号括起），"
+                         "如 '--matvec-impl double_2_float'")
     args = ap.parse_args()
 
-    print(f"[record] label={args.label} runs={args.runs}")
-    med, p95, last = measure(args.binary, args.model, args.runs)
+    extra = shlex.split(args.extra_args)
+    extra_suffix = (" " + args.extra_args.strip()) if extra else ""
+
+    print(f"[record] label={args.label} runs={args.runs}"
+          + (f"  额外参数: {' '.join(extra)}" if extra else ""))
+    med, p95, last = measure(args.binary, args.model, args.runs, extra)
     env = bench.env_info()
     commit = env["git_commit"]
 
@@ -108,7 +118,7 @@ def main() -> None:
     row = build_table_row(args.label, commit, med, p95, vs_base_str,
                           "<填：一句话归因>") + "\n"
     detail = build_detail(args.label, commit, med, p95, args.runs, last,
-                          vs_prev_str, base_note)
+                          vs_prev_str, base_note, extra_suffix)
     text = insert_before(text, TABLE_MARKER, row)
     text = insert_before(text, DETAIL_MARKER, detail)
     log_path.write_text(text)
