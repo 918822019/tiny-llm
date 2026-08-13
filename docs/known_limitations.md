@@ -3,8 +3,8 @@
 刻意且公开的限制，避免误用。
 
 > **当前性能基线**：Qwen2.5-0.5B，Apple Silicon 单线程 fp32，
-> decode ≈ **230 ms/token**（commit `5f679ea`，tag `v0.1-fp32-baseline`）。
-> 优化进展见 `optimization_log.md`。
+> decode ≈ **220 ms/token**（已落地变体 `double_2_float`；
+> 精确数字与优化进展以 `optimization_log.md` 为准）。
 
 ## 运行时
 
@@ -40,3 +40,8 @@
 - 多 LoRA adapter 调度；
 - KV cache 的 speculative rollback / truncate；
 - mmap 加载、Android App。
+
+---
+
+相关文档：优化进展与当前数字见 `optimization_log.md`；
+优化方法与纪律见 `optimization.md`。

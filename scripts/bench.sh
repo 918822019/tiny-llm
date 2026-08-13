@@ -9,6 +9,7 @@
 # label 是这次测量的名字，会出现在输出和 optimization_log.md 的记录里。
 # 额外参数原样透传给 runtime——测"需要开关才生效"的优化变体时用。
 # 约定：每做完一个优化、提交代码后，就用那个优化命名跑一次，记进日志。
+# 测量方法论与纪律：docs/optimization.md §6。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

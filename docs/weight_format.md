@@ -98,3 +98,9 @@ o_proj 与 MLP 无 bias。bias 必须在 RoPE 之前加到 q/k/v 上。
 
 约 0.5B 参数（tied，embedding 计一次）→ 约 2 GB。这是 v1 的已知代价，
 INT8/INT4 阶段会显著缩小；runtime 侧 KV cache 与权重内存独立核算。
+
+---
+
+相关文档：格式的 C/Python 共同契约在 `runtime/tiny_format.h`（修改格式必须
+同时 bump 版本并改 exporter）；对齐/字节序概念见 `infra_primer.md` §4–5；
+导出端 `tools/export_qwen_to_tiny.py`、加载端 `runtime/model_loader.cpp`。

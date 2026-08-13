@@ -11,6 +11,7 @@
 # 流程：
 #   1. scripts/verify.sh           正确性门禁（不过就中止，不测速）
 #   2. tools/record_optimization.py 跑 3 遍取中位 + 算 vs 基线 + 写日志
+# 方法论与纪律：docs/optimization.md §6/§8。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

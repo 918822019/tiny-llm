@@ -51,3 +51,8 @@
 - `enter/leave` 必须配对（ScopedTimer 保证），不配对会打 warning；
 - profiler 关闭时所有调用接近零开销；
 - Android 上使用 `steady_clock`，不受墙钟跳变影响。
+
+---
+
+相关文档：测量方法与 top op 归因见 `optimization.md` §6；真机拉回 profile
+见 `android.md` §4。

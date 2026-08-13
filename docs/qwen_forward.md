@@ -84,3 +84,8 @@ attention 读取 `seq_len = p + 1`（含当前 token，先 append 再 attend）�
 | attention | SDPA/eager | 手写 decode kernel（online softmax）     |
 | 累加精度      | fp32       | matvec/rmsnorm 用 double 累加，输出 fp32   |
 | tokenizer | 内置         | 外部 Python 提供 token ids               |
+
+---
+
+相关文档：实现见 `runtime/qwen_model.cpp`（op 顺序与本文一一对应）；
+数值验收见 `pytorch_alignment.md`；概念背景见 `infra_primer.md`。

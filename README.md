@@ -6,8 +6,8 @@
 
 > **当前状态**
 > - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，16 个生成 token 与 HuggingFace 逐位一致；
-> - 性能基线：单线程 fp32 **decode ≈ 230 ms/token**（tag `v0.1-fp32-baseline`）；
->   已落地变体 `double_2_float`（同场 A/B ~1.09–1.12×，见优化日志）；
+> - 性能：单线程 fp32 **decode ≈ 220 ms/token**（已落地变体 `double_2_float`，
+>   同场 A/B ~1.09–1.12×；当前数字以 `docs/optimization_log.md` 为准）；
 > - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、kernel 分发层
 >   （变体自注册）、key=value 配置；
 > - 下一步：NEON matvec。
@@ -20,13 +20,16 @@
 tinyqwen/
 ├── CMakeLists.txt        # 顶层构建
 ├── runtime/              # loader / tensor view / kv cache / qwen forward / profiler / CLI
-├── kernels/              # 朴素标量 reference kernels（正确性优先）
-├── tools/                # Python 侧：exporter / tokenize / reference dump / 数值对齐验证
+├── kernels/              # reference kernels + 优化变体（每算子一个文件夹，变体自注册）
+├── tools/                # Python 侧：exporter / tokenize / reference dump / bench
 ├── tests/                # 单元测试（无第三方测试框架）
-├── scripts/              # Android NDK 编译 / adb 运行脚本
+├── scripts/              # 优化 pipeline（verify/bench/record/commit_opt）+ Android 编译运行
 ├── experiments/          # 预留：run_decode / run_layer_bench 等实验入口
-└── docs/                 # 格式规范、forward 推导、对齐流程、Android runbook
+└── docs/                 # 手册与规范（见下方「文档」）
 ```
+
+详细目录职责、依赖方向见 `docs/project_structure.md`；
+kernels/ 与 runtime/ 各有自己的 README 导读。
 
 ## 本地编译（Linux / macOS）
 
@@ -96,19 +99,15 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 
 ## 性能基准与优化记录
 
-优化前先测基线、优化后再测、把结果记进日志——这是本项目的纪律
-（详见 `docs/optimization.md`）：
+纪律：优化前先测基线、优化后再测、结果记进日志。正式记录一条命令：
 
 ```bash
-./scripts/bench.sh fp32-baseline      # 跑标准负载，输出 decode ms/token 等统计
+./scripts/record.sh <label>                        # 门禁 + 稳定测速 + 自动写日志
+./scripts/record.sh <label> --extra-args "--matvec-impl <名>"   # 测变体：自动同场 A/B
 ```
 
-每个优化单独一个 commit，测完把一行记录追加到 `docs/optimization_log.md`。
-当前基线：**fp32 单线程 decode ≈ 230 ms/token**（commit `5f679ea`）。
-
-优化会逐步叠加（NEON、多线程、量化……）。叠加时加速比**不能简单相乘**，
-要同时记"vs 原始基线"和"vs 上一配置"两个数——组合评测方法见
-`docs/optimization.md` 第 7 节。
+方法论、测量纪律、工具细节全部在 `docs/optimization.md`；
+所有历史数字与当前基线在 `docs/optimization_log.md`（唯一权威）。
 
 ## CLI 参考
 
@@ -171,6 +170,15 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | `docs/android.md`             | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
 | `docs/project_structure.md`   | 目录职责说明                                         |
 | `docs/known_limitations.md`   | v1 已知限制                                        |
+| `kernels/README.md`           | kernels/ 导读：文件约定、已注册实现、_ref 的意义                |
+| `runtime/README.md`           | runtime/ 角色地图、数据流、阅读顺序                         |
+
+按角色的阅读路线：
+
+- **入门**：`infra_primer` → `project_structure` → `runtime/README` → `qwen_forward`
+- **做优化**：`optimization`（手册）→ `optimization_log`（历史与数字）→ `kernels/README`
+- **上端侧**：`android` → `profiling_schema`
+- **改格式/对齐**：`weight_format` → `pytorch_alignment`
 
 ## 边界声明
 

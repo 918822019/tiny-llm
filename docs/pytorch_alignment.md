@@ -74,3 +74,9 @@ SwiGLU / tied lm_head。当前基线：worst max_abs_err ≈ 4e-7。
 - C++ 逐 op dump 可以用一个 debug 环境变量开关（后续补），
   dump 命名必须与 `ref.npz` 的 key 一致；
 - 不要让分析脚本替代逐 tensor 比对：先看 max_abs_err，再看分布。
+
+---
+
+相关文档：数学定义与 shape 约定见 `qwen_forward.md`；
+参考值 dump 工具 `tools/dump_qwen_reference.py`、无真模型链路
+`tools/make_fake_model.py` + `tools/align_fake_model.py`。
