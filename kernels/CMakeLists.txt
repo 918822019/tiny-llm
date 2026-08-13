@@ -13,8 +13,12 @@ add_library(tinyqwen_kernels OBJECT
         rope/rope_ref.cpp
         matvec/matvec_f32_ref.cpp
         matvec/matvec_f32_double_2_float.cpp
-        # aarch64 NEON 版；NEON 是 aarch64 基线指令集，无需额外编译 flag，
-        # 其他平台由文件内 #if 编译为空。
+        # 归因阶梯变体（每层只加一个技术，便于 A/B 归因）：
+        # acc4 = 标量 4 链累加（隔离"累加结构"，所有平台）；
+        # neon_nofma = NEON 向量化但乘加分开（隔离"SIMD 宽度"，仅 aarch64）；
+        # neon = 完整版（再加 FMA 融合，仅 aarch64）。后两者其他平台编译为空。
+        matvec/matvec_f32_acc4.cpp
+        matvec/matvec_f32_neon_nofma.cpp
         matvec/matvec_f32_neon.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp

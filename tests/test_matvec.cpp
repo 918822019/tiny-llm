@@ -83,6 +83,49 @@ TEST (matvec_double_2_float_matches_ref) {
     for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
 }
 
+TEST (matvec_acc4_matches_ref) {
+    // 归因阶梯之"累加结构"层：纯标量，任何平台都应存在。
+    // in_dim = 4103（= 4*1025 + 3）：主循环 4 链 + 3 个标量尾段全覆盖。
+    EXPECT_TRUE(set_matvec_impl_by_name("acc4"));
+    const int out_dim = 16, in_dim = 4103;
+    std::vector<float> w(out_dim * in_dim), x(in_dim);
+    for (int i = 0; i < out_dim * in_dim; ++i) {
+        w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+    }
+    for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+    std::vector<float> y_ref(out_dim), y_var(out_dim);
+    matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+    matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+    EXPECT_TRUE(set_matvec_impl_by_name("ref"));
+
+    // 4 链合并顺序与 ref 串行不同，舍入差异由容差处理。
+    for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+}
+
+TEST (matvec_neon_nofma_matches_ref) {
+    // 归因阶梯之"SIMD 宽度"层：仅 aarch64 构建注册；其他平台 skip。
+    if (!set_matvec_impl_by_name("neon_nofma")) {
+        std::printf("[skip] current build has no 'neon_nofma' matvec (not aarch64)\n");
+        return;
+    }
+    // in_dim = 4103：16 主循环 / 4 向量尾段 / 3 标量尾段三段全覆盖。
+    const int out_dim = 16, in_dim = 4103;
+    std::vector<float> w(out_dim * in_dim), x(in_dim);
+    for (int i = 0; i < out_dim * in_dim; ++i) {
+        w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+    }
+    for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+    std::vector<float> y_ref(out_dim), y_var(out_dim);
+    matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+    matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+    EXPECT_TRUE(set_matvec_impl_by_name("ref"));
+
+    // vmul+vadd 两次舍入，误差比 neon（FMA 一次舍入）略大，5e-3 仍宽裕。
+    for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+}
+
 TEST (matvec_neon_matches_ref) {
     // 正确性门禁：与 double_2_float 同款。neon 只在 aarch64 构建注册；
     // 其他平台 set 失败 -> 打印 skip 并返回，不算失败（不是静默兜底假通过，

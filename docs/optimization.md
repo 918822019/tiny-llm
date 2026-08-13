@@ -219,8 +219,11 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()     
 
 ## 9. 当前状态
 
-- 已接入 dispatch 的算子：**matvec**（唯一热点，优化主攻方向），
-  已注册实现：`ref`（默认）、`double_2_float`。
+- 已接入 dispatch 的算子：**matvec**（唯一热点，优化主攻方向）。
+  已注册实现构成一条**归因阶梯**（每层只加一个技术，便于 A/B 归因）：
+  `ref`（默认）→ `double_2_float`（+float 累加）→ `acc4`（+4 链并行累加，
+  标量）→ `neon_nofma`（+NEON 向量化，仅 aarch64）→ `neon`（+FMA，仅 aarch64）。
+  各层贡献见 `optimization_log.md` 的 neon_nofma 条目（阶梯账本）。
 - 其余算子（rmsnorm/rope/attention/...）目前直接调 `_ref`；将来要优化哪个，
   照第 4 节给它也加一个通用入口即可。
 - 优化记录与数字：`optimization_log.md`。
