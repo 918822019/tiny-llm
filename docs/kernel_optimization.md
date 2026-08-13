@@ -9,14 +9,17 @@
 
 ```text
 kernels/
-├── ref_ops.h                     # 所有 kernel 的签名契约
-├── <op>_<dtype>_ref.cpp          # 参考实现（base）：永不删、永不覆盖
-├── <op>_<dtype>_<variant>.cpp    # 优化版（改进位）：只增不删
-└── dispatch.h / dispatch.cpp     # 分发层：model 只调通用入口，由它选实现
+├── ref_ops.h                     # 所有 kernel 的签名契约（共用）
+├── dispatch.h / dispatch.cpp     # 分发层：model 只调通用入口，由它选实现（共用）
+└── <op>/                         # 每个算子一个文件夹
+    ├── <op>_<dtype>_ref.cpp      # 参考实现（base）：永不删、永不覆盖
+    └── <op>_<dtype>_<variant>.cpp  # 优化版（改进位）：只增不删
 ```
 
-两条铁律：
+三条铁律：
 
+- **每个算子一个文件夹**，参考实现和所有优化版都放里面——加新 kernel
+  不做结构决策，放进对应文件夹即可。
 - **`_ref` 是标准答案**。任何优化版都要先和它对齐（误差在容差内）才算"算对了"，
   然后才谈"快不快"。它也是出问题时的一键兜底。
 - **优化版永远是新文件**，命名 `<op>_<dtype>_<variant>`，绝不覆盖 `_ref`。
@@ -60,7 +63,7 @@ micro-benchmark 时也能在同一个程序里同时调 ref 和优化版做对�
 
 以"给 matvec 加 NEON 版"为例：
 
-1. **写实现**：新建 `kernels/matvec_f32_neon.cpp`，声明
+1. **写实现**：新建 `kernels/matvec/matvec_f32_neon.cpp`，声明
    `void matvec_f32_neon(const float*, const float*, float*, int, int);`
    （签名和 `_ref` 完全一致）。
 2. **接进分发**：

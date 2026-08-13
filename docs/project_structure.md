@@ -16,10 +16,11 @@ tinyqwen/
 │   └── main.cpp            # CLI 入口（prefill + decode 循环）
 │
 ├── kernels/                # kernel 库（静态库 tinyqwen_kernels）
-│   ├── ref_ops.h           # 所有 reference kernel 的签名约定
-│   ├── *_ref.cpp           # 参考实现（base）：rmsnorm/rope/matvec/softmax/attention/silu/argmax
-│   ├── dispatch.h/.cpp     # 分发层：model 调通用入口 matvec_f32()，由它选实现
-│   └── <op>_<dtype>_<variant>.cpp  # 【改进位】优化版 kernel，只增不删（见 kernel_optimization.md）
+│   ├── ref_ops.h           # 所有 reference kernel 的签名约定（共用）
+│   ├── dispatch.h/.cpp     # 分发层：model 调通用入口 matvec_f32()，由它选实现（共用）
+│   └── <op>/               # 每个算子一个文件夹：rmsnorm/rope/matvec/softmax/attention/silu/argmax
+│       ├── <op>_<dtype>_ref.cpp          # 参考实现（base）
+│       └── <op>_<dtype>_<variant>.cpp    # 【改进位】优化版 kernel，只增不删（见 kernel_optimization.md）
 │
 ├── tools/                  # Python 工具（不进 CMake）
 │   ├── export_qwen_to_tiny.py   # HF safetensors/bf16 -> .tqwen（fp32）
