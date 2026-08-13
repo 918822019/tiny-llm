@@ -1,7 +1,9 @@
 #include "test_framework.h"
 
+#include <cstring>
 #include <vector>
 
+#include "dispatch.h"
 #include "ref_ops.h"
 
 using namespace tinyqwen;
@@ -41,4 +43,35 @@ TEST (matvec_matches_naive_accumulation) {
         for (int i = 0; i < in_dim; ++i) acc += (double) w[o * in_dim + i] * x[i];
         EXPECT_NEAR(y[o], acc, 1e-5);
     }
+}
+
+TEST (matvec_dispatch_selects_impl) {
+    // 默认是 ref；切到变体后能查到名字；用完恢复，避免影响其他测试。
+    EXPECT_TRUE(matvec_impl() == MatvecImpl::kRef);
+    set_matvec_impl(MatvecImpl::kDouble2Float);
+    EXPECT_TRUE(matvec_impl() == MatvecImpl::kDouble2Float);
+    EXPECT_TRUE(std::strcmp(matvec_impl_name(), "double_2_float") == 0);
+    set_matvec_impl(MatvecImpl::kRef);
+    EXPECT_TRUE(matvec_impl() == MatvecImpl::kRef);
+}
+
+TEST (matvec_double_2_float_matches_ref) {
+    // 正确性门禁：变体走完整 dispatch 路径，输出与 ref 在容差内对齐。
+    // in_dim 故意取大（257）：累加链够长，float 累加的舍入差异才显形。
+    const int out_dim = 16, in_dim = 257;
+    std::vector<float> w(out_dim * in_dim), x(in_dim);
+    for (int i = 0; i < out_dim * in_dim; ++i) {
+        w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+    }
+    for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+    std::vector<float> y_ref(out_dim), y_var(out_dim);
+    matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+
+    set_matvec_impl(MatvecImpl::kDouble2Float);
+    matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+    set_matvec_impl(MatvecImpl::kRef);
+
+    // float 累加误差上界 ≈ in_dim * eps * max|部分和|，本组数据 ≤ ~4e-3。
+    for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
 }

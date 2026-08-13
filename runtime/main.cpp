@@ -186,8 +186,11 @@ int main(int argc, char **argv) {
     tinyqwen::MatvecImpl impl;
     if (impl_name == "ref") {
         impl = tinyqwen::MatvecImpl::kRef;
+    } else if (impl_name == "double_2_float") {
+        impl = tinyqwen::MatvecImpl::kDouble2Float;
     } else {
-        std::fprintf(stderr, "error: unknown matvec_impl '%s' (available: ref)\n",
+        std::fprintf(stderr,
+                     "error: unknown matvec_impl '%s' (available: ref, double_2_float)\n",
                      impl_name.c_str());
         return 2;
     }

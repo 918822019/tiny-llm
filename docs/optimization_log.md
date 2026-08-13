@@ -19,6 +19,7 @@
 | fp32-float（基线 + matvec float 累加，**已回退**） | 40b8e26 |           204.12 | 269.79 |   1.13× |   1.09× | matvec 内层累加 double→float（Apple Silicon fp64 慢），计算类优化 |
 
 | restore-double（回退 fp32-float） | e1523c7 | 239.64 | 269.20 | 0.93× | 0.85× | 纪律性回退：_ref 恢复 double 累加，回到基线配置；float 累加将来以变体形式重做 |
+| double_2_float（fp32-baseline + matvec float 累加变体） | 9d1a572 | 219.84 | 245.48 | 1.01×（被机器波动掩盖） | 1.12× | matvec 内层累加 double→float，首次以**变体**形式合规落地；同场 A/B 才是真贡献 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -90,6 +91,37 @@
   更大的教训就是本次回退本身：**优化必须走变体，不许碰 `_ref`**——
   否则"标准答案"自己变了，后面所有对齐都失去锚点。
 - **复现**：`./scripts/bench.sh restore-double`
+
+---
+
+### double_2_float（2026-08-13）
+
+- **优化栈**：fp32-baseline + matvec double_2_float 变体。
+- **是什么**：被回退的 fp32-float 以**合规形式重做**：数值改动相同（内层累加
+  double→float），但不再修改 `_ref`，而是新增 `kernels/matvec/matvec_f32_double_2_float.cpp`
+  变体（kernel 函数体由用户手写、逐轮 review 补全），经 dispatch `kDouble2Float`
+  可插拔选用，默认仍是 ref。配套：`--matvec-impl double_2_float` / 配置文件可选、
+  bench/record 支持透传额外参数（9d1a572）。
+- **假设**：计算类。Apple Silicon fp64 吞吐远低于 fp32，matvec 内层是绝对热点，
+  去掉 double 累加的慢指令应提速 ~9%（fp32-float 已验证过方向）。
+- **结果**：decode 中位 **219.84 ms/token**（3 遍取中位，每遍 27 样本），p95 245.48。
+- **vs 上一配置**：**1.12×**——同场 A/B：同 commit（9d1a572）同场先测 ref 对照
+  246.02 ms/token，再测变体 219.84。（vs 历史基线仅 1.01×，见教训 1。）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 1.01×
+- **验证**：scripts/verify.sh（33 单测：新增 dispatch 切换测试 + 变体 vs ref
+  对齐测试，in_dim=257、容差 5e-3；golden token 对照）；变体模式跑真模型，
+  canonical prompt 16 个生成 token 与 ref **逐位一致**（float 舍入未翻转 greedy）。
+- **瓶颈转移**：top op = `lm_head`、`layer_23.down_proj`、`layer_22.down_proj`，
+  仍是 matvec；下一刀 = NEON 向量化（NEON float32x4 天然 fp32 累加，本变体是它的标量前奏）。
+- **意外 / 教训**：
+  1. **vs 历史基线只有 1.01×，差点误判"优化无效"**——当天机器整体偏慢
+     （ref 同场对照 246.02 vs 历史 222.59），把真实收益淹没了。同场 A/B 才看出 1.12×。
+     benchmarking.md 的纪律再次应验：小幅优化只认同 commit 对照，不认历史数字。
+  2. **纪律不吃亏**：同一个数值改动，直接改 `_ref` 时违反铁律被回退；以变体
+     重做后收益相同（1.09× → 1.12×），还额外得到可切换、可 A/B、可兜底。
+  3. 变体优化暴露了基建缺口（bench 传不进开关），先补基建再测——工具链也是
+     优化 pipeline 的一部分。
+- **复现**：`./scripts/bench.sh double_2_float --extra-args "--matvec-impl double_2_float"`
 
 ---
 

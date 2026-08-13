@@ -7,6 +7,7 @@ add_library(tinyqwen_kernels STATIC
         rmsnorm/rmsnorm_ref.cpp
         rope/rope_ref.cpp
         matvec/matvec_f32_ref.cpp
+        matvec/matvec_f32_double_2_float.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp
         silu/silu_ref.cpp

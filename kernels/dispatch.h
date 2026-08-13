@@ -15,6 +15,7 @@ namespace tinyqwen {
     // 新建一个 <op>_<dtype>_<variant>.cpp 实现文件。
     enum class MatvecImpl {
         kRef = 0, // 标量参考实现（默认，行为与 v1 完全一致）
+        kDouble2Float, // matvec/matvec_f32_double_2_float.cpp：内层累加 double→float
         // kNeon,        // 预留：NEON SIMD
         // kNeonMt,      // 预留：NEON + 多线程
     };
