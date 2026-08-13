@@ -12,6 +12,7 @@
 //
 // 注意：这里不加 bias；attention 的 q/k/v bias 由调用方在 RoPE 之前加。
 
+#include "dispatch.h" // TINYQWEN_MATVEC_VARIANT 自注册宏
 #include "ref_ops.h"
 
 #include <cstddef>
@@ -35,4 +36,8 @@ namespace tinyqwen {
       y[o] = static_cast<float>(acc);
     }
   }
+
+  // 自注册进 dispatch：--matvec-impl ref / 配置文件 matvec_impl = ref 即可选用。
+  // ref 是默认实现 + 兜底，这一行永远不删。
+  TINYQWEN_MATVEC_VARIANT(matvec_f32_ref, "ref");
 } // namespace tinyqwen

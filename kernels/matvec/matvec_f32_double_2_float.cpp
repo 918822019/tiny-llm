@@ -12,6 +12,7 @@
 //
 // 注意：这里不加 bias；attention 的 q/k/v bias 由调用方在 RoPE 之前加。
 
+#include "dispatch.h" // TINYQWEN_MATVEC_VARIANT 自注册宏
 #include "ref_ops.h"
 
 #include <cstddef>
@@ -31,4 +32,7 @@ namespace tinyqwen {
       y[o] = acc;
     }
   }
+
+  // 自注册进 dispatch：--matvec-impl double_2_float / 配置文件可选。
+  TINYQWEN_MATVEC_VARIANT(matvec_f32_double_2_float, "double_2_float");
 } // namespace tinyqwen

@@ -1,46 +1,68 @@
 #include "dispatch.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace tinyqwen {
     namespace {
-        // 全局当前选择。默认参考实现——保证任何时候行为都和 v1 一致、可兜底。
-        MatvecImpl g_matvec_impl = MatvecImpl::kRef;
+        // 名字 -> 实现。Meyers singleton：首次调用时构造，C++11 起线程安全，
+        // 保证它一定先于任何 register_matvec_impl 调用存在（无静态初始化顺序坑）。
+        std::unordered_map<std::string, MatvecFn> &registry() {
+            static std::unordered_map<std::string, MatvecFn> r;
+            return r;
+        }
+
+        // 当前选择。nullptr = 未显式选择，matvec_f32 会兜底到 "ref"。
+        MatvecFn g_current = nullptr;
+        std::string g_current_name; // 空 = 未显式选择
     } // namespace
 
-    // 优化版变体声明。变体只由分发层调用（model 和测试不直接碰），
-    // 所以声明放这里而不是 ref_ops.h（那是 reference kernel 的契约）。
-    void matvec_f32_double_2_float(const float *w, const float *x, float *y, int out_dim,
-                                   int in_dim);
+    void register_matvec_impl(const char *name, MatvecFn fn) { registry()[name] = fn; }
 
-    void set_matvec_impl(MatvecImpl impl) { g_matvec_impl = impl; }
-    MatvecImpl matvec_impl() { return g_matvec_impl; }
-
-    const char *matvec_impl_name() {
-        switch (g_matvec_impl) {
-            case MatvecImpl::kRef: return "ref";
-            case MatvecImpl::kDouble2Float: return "double_2_float";
-                // case MatvecImpl::kNeon: return "neon";
-        }
-        return "unknown";
+    bool set_matvec_impl_by_name(const char *name) {
+        const auto &r = registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false; // 未知名字：不改变当前选择，由调用方报错
+        g_current = it->second;
+        g_current_name = name;
+        return true;
     }
 
-    // 分发：根据当前选择调用对应实现。任何未覆盖的分支都回退到 ref，
-    // 保证永远有正确结果（fail-safe）。
-    void matvec_f32(const float *w, const float *x, float *y, int out_dim, int in_dim) {
-        switch (g_matvec_impl) {
-            case MatvecImpl::kRef:
-                matvec_f32_ref(w, x, y, out_dim, in_dim);
-                return;
-            case MatvecImpl::kDouble2Float:
-                matvec_f32_double_2_float(w, x, y, out_dim, in_dim);
-                return;
-                // case MatvecImpl::kNeon:
-                //   matvec_f32_neon(w, x, y, out_dim, in_dim);
-                //   return;
+    const char *matvec_impl_name() {
+        return g_current_name.empty() ? "ref" : g_current_name.c_str();
+    }
+
+    const char *available_matvec_impls() {
+        // 注册都发生在 main 之前且之后不变，拼一次缓存起来。排序保证输出稳定。
+        static std::string joined;
+        if (joined.empty()) {
+            std::vector<std::string> names;
+            for (const auto &kv : registry()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i) joined += ", ";
+                joined += names[i];
+            }
         }
-        // 兜底：未知实现一律用参考实现。
-        matvec_f32_ref(w, x, y, out_dim, in_dim);
+        return joined.c_str();
+    }
+
+    void matvec_f32(const float *w, const float *x, float *y, int out_dim, int in_dim) {
+        MatvecFn fn = g_current;
+        if (!fn) {
+            // 兜底到 ref：只要 ref 实现被链接进来，行为就和 v1 完全一致。
+            auto it = registry().find("ref");
+            if (it == registry().end()) {
+                std::fprintf(stderr,
+                             "tinyqwen: matvec 'ref' 未注册——检查 kernels 是否被整体链接\n");
+                std::abort();
+            }
+            fn = it->second;
+        }
+        fn(w, x, y, out_dim, in_dim);
     }
 } // namespace tinyqwen

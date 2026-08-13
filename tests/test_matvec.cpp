@@ -46,13 +46,19 @@ TEST (matvec_matches_naive_accumulation) {
 }
 
 TEST (matvec_dispatch_selects_impl) {
-    // 默认是 ref；切到变体后能查到名字；用完恢复，避免影响其他测试。
-    EXPECT_TRUE(matvec_impl() == MatvecImpl::kRef);
-    set_matvec_impl(MatvecImpl::kDouble2Float);
-    EXPECT_TRUE(matvec_impl() == MatvecImpl::kDouble2Float);
+    // 按名字选择；未知名报错且不改变当前选择；用完恢复，避免影响其他测试。
+    EXPECT_TRUE(set_matvec_impl_by_name("double_2_float"));
     EXPECT_TRUE(std::strcmp(matvec_impl_name(), "double_2_float") == 0);
-    set_matvec_impl(MatvecImpl::kRef);
-    EXPECT_TRUE(matvec_impl() == MatvecImpl::kRef);
+    EXPECT_TRUE(set_matvec_impl_by_name("ref"));
+    EXPECT_TRUE(std::strcmp(matvec_impl_name(), "ref") == 0);
+
+    EXPECT_TRUE(!set_matvec_impl_by_name("no_such_impl"));
+    EXPECT_TRUE(std::strcmp(matvec_impl_name(), "ref") == 0); // 失败不改变现状
+
+    // 已注册列表包含两个实现（报错信息的数据源）。
+    const char *avail = available_matvec_impls();
+    EXPECT_TRUE(std::strstr(avail, "ref") != nullptr);
+    EXPECT_TRUE(std::strstr(avail, "double_2_float") != nullptr);
 }
 
 TEST (matvec_double_2_float_matches_ref) {
@@ -68,9 +74,10 @@ TEST (matvec_double_2_float_matches_ref) {
     std::vector<float> y_ref(out_dim), y_var(out_dim);
     matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
 
-    set_matvec_impl(MatvecImpl::kDouble2Float);
+    // set 必须成功——否则 matvec_f32 会静默兜底到 ref，测试变成假通过。
+    EXPECT_TRUE(set_matvec_impl_by_name("double_2_float"));
     matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
-    set_matvec_impl(MatvecImpl::kRef);
+    EXPECT_TRUE(set_matvec_impl_by_name("ref"));
 
     // float 累加误差上界 ≈ in_dim * eps * max|部分和|，本组数据 ≤ ~4e-3。
     for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);

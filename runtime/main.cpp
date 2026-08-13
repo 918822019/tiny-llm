@@ -180,21 +180,16 @@ int main(int argc, char **argv) {
                      config.size());
     }
 
-    // ---- 解析 matvec 实现：CLI > 配置文件 > 默认 ref（未知值报错，可兜底）----
+    // ---- 解析 matvec 实现：CLI > 配置文件 > 默认 ref ----
+    // 实现名由各 kernel 文件自注册（dispatch.h），这里只按名字查表——
+    // 新增变体不需要改这段代码。
     std::string impl_name = args.matvec_impl; // 非空 = CLI 显式指定
     if (impl_name.empty()) impl_name = config.get("matvec_impl", "ref");
-    tinyqwen::MatvecImpl impl;
-    if (impl_name == "ref") {
-        impl = tinyqwen::MatvecImpl::kRef;
-    } else if (impl_name == "double_2_float") {
-        impl = tinyqwen::MatvecImpl::kDouble2Float;
-    } else {
-        std::fprintf(stderr,
-                     "error: unknown matvec_impl '%s' (available: ref, double_2_float)\n",
-                     impl_name.c_str());
+    if (!tinyqwen::set_matvec_impl_by_name(impl_name.c_str())) {
+        std::fprintf(stderr, "error: unknown matvec_impl '%s' (available: %s)\n",
+                     impl_name.c_str(), tinyqwen::available_matvec_impls());
         return 2;
     }
-    tinyqwen::set_matvec_impl(impl);
     std::fprintf(stderr, "[init] matvec impl: %s\n", tinyqwen::matvec_impl_name());
 
     // ---- 加载权重文件并校验 ----
