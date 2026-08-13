@@ -22,18 +22,17 @@ namespace tinyqwen {
     for (int o = 0; o < out_dim; ++o) {
       // 定位第 o 行的起点：跳过前面 o 行（每行 in_dim 个元素）。
       const float *row = w + static_cast<size_t>(o) * in_dim;
-
       // 第 o 行与 x 做点积。
-      // 用 float 累加：与 PyTorch/SIMD(NEON float32x4) 的 float 累加方式一致，
-      // 且 Apple Silicon 上 float 远快于 double。代价是累积舍入误差略大。
-      float acc = 0.0f;
+      // 用 double 累加：in_dim 可能上千，float 连加会累积舍入误差，
+      // double 能让结果更贴近 PyTorch fp32 参考实现（数值对齐很重要）。
+      double acc = 0.0;
       for (int i = 0; i < in_dim; ++i) {
-        const float term = row[i] * x[i]; // 权重乘输入
+        const double weight = static_cast<double>(row[i]); // 权重提升为 double
+        const double term = weight * x[i]; // 乘上对应输入
         acc += term; // 累加进点积
       }
-
-      // 点积结果写入输出的第 o 个分量。
-      y[o] = acc;
+      // 转回 float，写入输出的第 o 个分量。
+      y[o] = static_cast<float>(acc);
     }
   }
 } // namespace tinyqwen
