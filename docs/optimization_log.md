@@ -20,6 +20,7 @@
 
 | restore-double（回退 fp32-float） | e1523c7 | 239.64 | 269.20 | 0.93× | 0.85× | 纪律性回退：_ref 恢复 double 累加，回到基线配置；float 累加将来以变体形式重做 |
 | double_2_float（fp32-baseline + matvec float 累加变体） | 9d1a572 | 219.84 | 245.48 | 1.01×（被机器波动掩盖） | 1.12× | matvec 内层累加 double→float，首次以**变体**形式合规落地；同场 A/B 才是真贡献 |
+| neon | fd430db | 28.25 | 30.14 | 7.88× | 8.05×（同场） | matvec NEON 向量化（4 路 FMA + 4 累加器展开）；decode 纯权重带宽瓶颈，有效带宽 8.7→72 GB/s，kernel 加速比几乎全额传导到端到端 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -122,6 +123,48 @@
   3. 变体优化暴露了基建缺口（bench 传不进开关），先补基建再测——工具链也是
      优化 pipeline 的一部分。
 - **复现**：`./scripts/bench.sh double_2_float --extra-args "--matvec-impl double_2_float"`
+
+---
+
+### neon（2026-08-13）
+
+- **优化栈**：fp32-baseline + matvec neon 变体（与 double_2_float 互斥——dispatch
+  单选，本变体替代它成为当前优化选择，默认仍是 ref）
+- **是什么**：新增 `kernels/matvec/matvec_f32_neon.cpp`：NEON float32x4 四路 SIMD，
+  `vfmaq_f32` 乘加融合，4 路展开 + 4 个独立累加器隐藏 FMA 延迟（每迭代 16 元素在飞），
+  `vaddvq_f32` 横向归约，标量尾段补齐；自注册进 dispatch，`--matvec-impl neon` 选用。
+  配套门禁单测 `matvec_neon_matches_ref`（in_dim=4103 全覆盖三级尾段，容差 5e-3）。
+- **假设**：指令类 + 带宽类。decode 的 matvec 是纯权重流式读取的带宽瓶颈型负载
+  （每 token 读约 2GB 权重），ref 标量只有 ~8.7 GB/s（double 累加 + 串行依赖，
+  计算端也没喂饱带宽）；SIMD + FMA + 多累加器去掉计算瓶颈后，带宽利用率应大幅
+  上升，且收益会几乎不打折地传导到端到端（matvec 占算子时间 98%）。
+- **结果**：decode 中位 **28.25 ms/token**（3 遍取中位，每遍 27 样本），p95 30.14
+- **vs 上一配置**：**8.05×（同场 A/B）**——对照（无额外参数，当前即 ref）中位 227.28（p95 236.63）→ 变体 28.25，同 binary 同场交错测量。（vs 基线 7.88×）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 7.88×
+- **验证**：scripts/verify.sh（34 单测全过，含新增 `matvec_neon_matches_ref`：
+  in_dim=4103 = 256×16+7，主循环/向量/标量三级尾段全覆盖，vs ref 容差 5e-3，
+  micro-bench 实测 max_err 3.3e-9；golden token 16 个与 ref 逐位一致——
+  float 舍入未翻转 greedy）。
+- **瓶颈转移**：top op = `lm_head`、`layer_17.up_proj`、`layer_22.down_proj`，
+  但 profile 里 matvec 仍占算子时间 **98%**——没有新瓶颈冒头，只是同一个瓶颈
+  从 227ms/tok 缩到 ~27.5ms/tok。lm_head 单算子 ~10.5ms/tok（545MB，~52 GB/s），
+  全模型端到端有效带宽 ~72 GB/s（ref 只有 ~8.7 GB/s）。下一刀仍在 matvec：
+  ① INT4 量化——带宽瓶颈型负载，权重流量直接砍到 1/8，理论还能再快数倍；
+  ② 多线程——单核 ~72 GB/s 未吃满内存带宽，并行摊开读权重。
+  其余算子（attention/rmsnorm/rope/swiglu 合计 <2%）不值得单独 NEON 化。
+- **意外 / 教训**：
+  1. **端到端 8.05× ≈ kernel micro-bench 7–10×，几乎零 Amdahl 稀释**——因为
+     decode 是纯 matvec 带宽瓶颈（算子时间 98%），kernel 快多少端到端就快多少。
+     对照 double_2_float 只有 1.12×：瓶颈在带宽时，标量计算微优化天花板很低，
+     改变"读内存的方式"（向量化提高利用率、量化减少流量）才是量级收益。
+  2. **micro-bench 惊现 2.8e9 误差，罪魁是 bench 自己不是 kernel**：数据生成
+     里 `size_t` 减法下溢回绕，权重变成 ~1.8e16 的假大数，float/double 累加
+     在该量级本来就会差出部分和的 ulp（~1e9）。教训：误差异常先看数据生成，
+     再看误差量级——和 partial sum 的 ulp 同阶多半是精度现象而非逻辑错。
+     换成合法数据后同一 kernel 以 3.3e-9 通过 4103 维门禁。
+  3. 本次同场对照 227.28 与历史基线 222.59 接近，机器状态稳定，vs 基线 7.88×
+     与同场 8.05× 罕见地都可信；但流程上仍然只以同场 A/B 为准。
+- **复现**：`./scripts/bench.sh neon --extra-args "--matvec-impl neon"`
 
 ---
 

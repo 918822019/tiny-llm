@@ -13,6 +13,9 @@ add_library(tinyqwen_kernels OBJECT
         rope/rope_ref.cpp
         matvec/matvec_f32_ref.cpp
         matvec/matvec_f32_double_2_float.cpp
+        # aarch64 NEON 版；NEON 是 aarch64 基线指令集，无需额外编译 flag，
+        # 其他平台由文件内 #if 编译为空。
+        matvec/matvec_f32_neon.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp
         silu/silu_ref.cpp

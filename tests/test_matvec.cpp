@@ -55,7 +55,7 @@ TEST (matvec_dispatch_selects_impl) {
     EXPECT_TRUE(!set_matvec_impl_by_name("no_such_impl"));
     EXPECT_TRUE(std::strcmp(matvec_impl_name(), "ref") == 0); // 失败不改变现状
 
-    // 已注册列表包含两个实现（报错信息的数据源）。
+    // 已注册列表包含这些实现（报错信息的数据源）。
     const char *avail = available_matvec_impls();
     EXPECT_TRUE(std::strstr(avail, "ref") != nullptr);
     EXPECT_TRUE(std::strstr(avail, "double_2_float") != nullptr);
@@ -80,5 +80,34 @@ TEST (matvec_double_2_float_matches_ref) {
     EXPECT_TRUE(set_matvec_impl_by_name("ref"));
 
     // float 累加误差上界 ≈ in_dim * eps * max|部分和|，本组数据 ≤ ~4e-3。
+    for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+}
+
+TEST (matvec_neon_matches_ref) {
+    // 正确性门禁：与 double_2_float 同款。neon 只在 aarch64 构建注册；
+    // 其他平台 set 失败 -> 打印 skip 并返回，不算失败（不是静默兜底假通过，
+    // 因为这里先确认了实现真的存在才往下比）。
+    if (!set_matvec_impl_by_name("neon")) {
+        std::printf("[skip] current build has no 'neon' matvec (not aarch64)\n");
+        return;
+    }
+    // in_dim 故意取 4103 = 256*16 + 7：既不是 16 也不是 4 的倍数，
+    // 主循环尾段、向量尾段、标量尾段一次全覆盖；累加链也够长，
+    // float 舍入差异能显形。
+    const int out_dim = 16, in_dim = 4103;
+    std::vector<float> w(out_dim * in_dim), x(in_dim);
+    for (int i = 0; i < out_dim * in_dim; ++i) {
+        w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+    }
+    for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+    std::vector<float> y_ref(out_dim), y_var(out_dim);
+    matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+
+    // neon 已在上面 set 成功，这里走完整 dispatch 路径。
+    matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+
+    // NEON 版 4 链并行累加，每条链仅 in_dim/16 项，误差上界同数量级，5e-3 充分宽裕。
     for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
 }
