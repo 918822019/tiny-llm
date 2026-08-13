@@ -61,23 +61,40 @@
 想找到原因，看 `bench.py` 输出的 **top op**：时间花在哪个算子，优化就该针对哪。
 比如 fp32 基线里 `lm_head` 和 `down_proj` 是大头，说明 matvec 是主攻方向。
 
-## 6. 标准操作流程
+## 6. 标准操作流程（已固化为脚本）
+
+优化 pipeline 的每一步都有脚本，不靠记性。**改完代码后照顺序跑**：
 
 ```bash
-# 0. 改代码前，先测基线（如果还没有）
-./scripts/bench.sh fp32-baseline
+# ①（一次性）确立基线：稳定跑 3 遍写进 benchmarks/baseline.json
+./scripts/set_baseline.sh fp32-baseline
 
-# 1. 实现你的优化（一个 commit）
-git commit -m "perf: <改了什么> —— <为什么预期会快>"
+# —— 每次优化，从这儿开始 ——
+# 改完代码后：
 
-# 2. 重新编译 + 测量，用优化命名
-cmake --build build -j
-./scripts/bench.sh <你的优化名>
+# ②③④ 一条龙：正确性门禁 → 稳定测速（3 遍取中位）→ 自动写优化日志
+./scripts/record.sh <你的优化名>
+#   内部会先跑 scripts/verify.sh（build + 31 单测 + golden token 对照），
+#   不过就中止；过了才测速，并把数字 + vs 基线加速比自动填进 optimization_log.md
 
-# 3. 把输出里那行 Markdown 填上"提升多少/为什么"，追加到 docs/optimization_log.md
-# 4. 一起提交，必要时打 tag
-git add docs/optimization_log.md && git commit -m "bench: 记录 <优化名> 结果"
+# 手动补全日志里的 <填...>（优化栈/是什么/假设/归因/教训——最需要人判断的部分）
+
+# ⑤ 规范化提交（代码 + 日志一起）
+./scripts/commit_opt.sh <你的优化名> "一句话总结"
 ```
+
+各脚本职责：
+
+| 脚本 | 阶段 | 做什么 |
+|---|---|---|
+| `scripts/verify.sh` | ②正确 | build + 单测 + golden token 对照，失败即中止 |
+| `scripts/bench.sh <label>` | ③速度 | 快速单遍测速（开发迭代用） |
+| `scripts/record.sh <label>` | ②③④ | verify + 3 遍稳定测速 + 自动写日志 |
+| `scripts/set_baseline.sh <label>` | 前置 | 确立/更新基线 benchmarks/baseline.json |
+| `scripts/commit_opt.sh <label> "总结"` | ⑤提交 | 规范化 commit（代码+日志一起） |
+
+> 底层测速都是 `tools/bench.py`（固定负载、丢预热、`--runs` 多跑取中位、
+> 自动记 git commit）。想快速迭代用 `bench.sh`，正式记录用 `record.sh`。
 
 ---
 

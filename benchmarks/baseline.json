@@ -1,0 +1,7 @@
+{
+  "label": "fp32-baseline",
+  "decode_median_ms": 222.59,
+  "decode_p95_ms": 241.87,
+  "commit": "40b8e26",
+  "note": "fp32 标量参考基线（double 累加，未优化）。record.sh 用它算 vs 基线加速比。重新确立基线时跑 scripts/set_baseline.sh <label>。"
+}

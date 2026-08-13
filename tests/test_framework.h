@@ -63,9 +63,9 @@ namespace tinytest {
 } // namespace tinytest
 
 #define TEST(name)                                                     \
-  static void test_fn_##name();                                        \
-  static tinytest::Registrar test_reg_##name(#name, test_fn_##name);   \
-  static void test_fn_##name()
+  static void test_fn_## name();                                        \
+  static tinytest::Registrar test_reg_## name(#name, test_fn_## name);   \
+  static void test_fn_## name()
 
 #define TQ_FAIL(msg) throw tinytest::Failure{std::string(__FILE__) + ":" + \
                                              std::to_string(__LINE__) + ": " + (msg)}

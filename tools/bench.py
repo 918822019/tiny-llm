@@ -121,32 +121,52 @@ def main() -> None:
     p.add_argument("--model", default="model.tqwen")
     p.add_argument("--label", default="unlabeled",
                    help="本次测量的名字，如 fp32-baseline / int8-w8a8")
+    p.add_argument("--runs", type=int, default=1,
+                   help="把标准负载跑几遍，取各遍中位数的中位数（抗单次波动）")
     p.add_argument("--json", default=None, help="可选：把结果也写成 JSON 文件")
     args = p.parse_args()
 
-    print(f"[bench] label={args.label}  负载: prompt={len(CANONICAL_PROMPT)} tok, "
+    runs = max(1, args.runs)
+    print(f"[bench] label={args.label} runs={runs}  负载: prompt={len(CANONICAL_PROMPT)} tok, "
           f"decode={DECODE_TOKENS} tok (丢弃预热 {WARMUP})")
-    profile = run_once(args.binary, args.model)
-    stats = summarize(profile)
-    env = env_info()
 
-    result = {"label": args.label, **stats, "env": env}
+    # 跑 runs 遍，收集每遍的稳态统计；headline 取"中位数的中位数"，更稳。
+    medians, p95s, last_stats = [], [], None
+    for r in range(runs):
+        profile = run_once(args.binary, args.model)
+        stats = summarize(profile)
+        medians.append(stats["decode_median_ms"])
+        p95s.append(stats["decode_p95_ms"])
+        last_stats = stats
+        if runs > 1:
+            print(f"  run {r + 1}/{runs}: median={stats['decode_median_ms']:.2f}ms "
+                  f"p95={stats['decode_p95_ms']:.2f}ms")
+
+    env = env_info()
+    headline = dict(last_stats)  # top_ops / prefill 等沿用最后一遍
+    headline["decode_median_ms"] = statistics.median(medians)
+    headline["decode_p95_ms"] = statistics.median(p95s)
+    headline["runs"] = runs
+    headline["per_run_median_ms"] = [round(m, 2) for m in medians]
+
+    result = {"label": args.label, **headline, "env": env}
 
     # ---- 人类可读汇总 ----
-    print(f"\n  decode 延迟/token：median={stats['decode_median_ms']:.2f}ms  "
-          f"mean={stats['decode_mean_ms']:.2f}ms  "
-          f"min={stats['decode_min_ms']:.2f}ms  p95={stats['decode_p95_ms']:.2f}ms")
-    print(f"  样本量：{stats['decode_samples']} 个稳态 decode token")
-    print(f"  prefill：{stats['prefill_tokens']} token 共 {stats['prefill_total_ms']:.2f}ms")
+    print(f"\n  decode 延迟/token：median={headline['decode_median_ms']:.2f}ms  "
+          f"p95={headline['decode_p95_ms']:.2f}ms")
+    if runs > 1:
+        print(f"  各遍中位数：{headline['per_run_median_ms']}（取中位 {headline['decode_median_ms']:.2f}）")
+    print(f"  样本量：每遍 {last_stats['decode_samples']} 个稳态 decode token")
+    print(f"  prefill：{last_stats['prefill_tokens']} token 共 {last_stats['prefill_total_ms']:.2f}ms")
     print(f"  环境：{env['processor']} @ {env['git_commit']}")
     print("  耗时 top op：")
-    for op in stats["top_ops"]:
+    for op in last_stats["top_ops"]:
         print(f"    {op['op']:<28} {op['total_ms']:>9.2f} ms")
 
     # ---- 可粘进 optimization_log.md 的 Markdown 行 ----
     print("\n  [复制下面这行到 docs/optimization_log.md 的表格里]")
     print(f"  | {args.label} | {env['git_commit']} | "
-          f"{stats['decode_median_ms']:.2f} | {stats['decode_p95_ms']:.2f} | "
+          f"{headline['decode_median_ms']:.2f} | {headline['decode_p95_ms']:.2f} | "
           f"<填写：相比基线的提升> | <填写：原因> |")
 
     if args.json:
