@@ -9,7 +9,7 @@
 ## 运行时
 
 - 仅 FP32 reference 路径，无 SIMD、无多线程、无量化 kernel
-  （但可插拔的 dispatch 接缝 + 配置开关已就位，见 `kernel_optimization.md`）；
+  （但可插拔的 dispatch 接缝 + 配置开关已就位，见 `optimization.md`）；
 - prefill 也是 token-by-token（O(n²) attention 总量与 batched 相同，
   但没有矩阵并行，长 prompt 会明显慢）；
 - 单 batch，无 continuous batching；

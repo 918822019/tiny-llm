@@ -21,7 +21,7 @@ tinyqwen/
 │   │                       # 变体用 TINYQWEN_MATVEC_VARIANT 宏自注册（共用）
 │   └── <op>/               # 每个算子一个文件夹：rmsnorm/rope/matvec/softmax/attention/silu/argmax
 │       ├── <op>_<dtype>_ref.cpp          # 参考实现（base）
-│       └── <op>_<dtype>_<variant>.cpp    # 【改进位】优化版 kernel，只增不删（见 kernel_optimization.md）
+│       └── <op>_<dtype>_<variant>.cpp    # 【改进位】优化版 kernel，只增不删（见 optimization.md）
 │
 ├── tools/                  # Python 工具（不进 CMake）
 │   ├── export_qwen_to_tiny.py   # HF safetensors/bf16 -> .tqwen（fp32）
@@ -42,9 +42,8 @@ tinyqwen/
 | 文档                                        | 内容                                 |
 |-------------------------------------------|------------------------------------|
 | `infra_primer.md`                         | infra 新手导读：内存/对齐/字节序/KV cache/RAII |
-| `benchmarking.md`                         | 测量方法论 + 多优化组合评测                    |
+| `optimization.md`                         | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律） |
 | `optimization_log.md`                     | 优化日志：每次改了什么/提升多少/为什么               |
-| `kernel_optimization.md`                  | 算子优化指南：保留 base、改进版往哪加              |
 | `weight_format.md`                        | .tqwen 二进制格式规范                     |
 | `qwen_forward.md`                         | Qwen forward 数学定义与 shape 约定        |
 | `profiling_schema.md`                     | profiler JSON 输出 schema            |

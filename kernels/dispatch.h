@@ -7,7 +7,7 @@
 //
 // 实现采用**自注册**：每个变体在自己的 .cpp 末尾用 TINYQWEN_MATVEC_VARIANT
 // 一行宏登记，加变体不需要改 dispatch/main/conf。
-// 详见 docs/kernel_optimization.md。
+// 详见 docs/optimization.md。
 
 #include "ref_ops.h"
 

@@ -97,7 +97,7 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 ## 性能基准与优化记录
 
 优化前先测基线、优化后再测、把结果记进日志——这是本项目的纪律
-（详见 `docs/benchmarking.md`）：
+（详见 `docs/optimization.md`）：
 
 ```bash
 ./scripts/bench.sh fp32-baseline      # 跑标准负载，输出 decode ms/token 等统计
@@ -108,7 +108,7 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 
 优化会逐步叠加（NEON、多线程、量化……）。叠加时加速比**不能简单相乘**，
 要同时记"vs 原始基线"和"vs 上一配置"两个数——组合评测方法见
-`docs/benchmarking.md` 第 7–9 节。
+`docs/optimization.md` 第 7 节。
 
 ## CLI 参考
 
@@ -162,9 +162,8 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | 文档                            | 内容                                             |
 |-------------------------------|------------------------------------------------|
 | `docs/infra_primer.md`        | **infra 新手导读**：内存布局/对齐/字节序/KV cache/RAII 等概念   |
-| `docs/benchmarking.md`        | **测量方法论**：怎么科学测性能、怎么归因                         |
+| `docs/optimization.md`        | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律）        |
 | `docs/optimization_log.md`    | **优化日志**：每次优化改了什么/提升多少/为什么                     |
-| `docs/kernel_optimization.md` | **算子优化指南**：保留 base、改进版往哪加                      |
 | `docs/weight_format.md`       | tiny binary format（header / tensor table / 对齐） |
 | `docs/qwen_forward.md`        | Qwen forward 数学定义与 shape 约定                    |
 | `docs/profiling_schema.md`    | profiler JSON 输出 schema                        |

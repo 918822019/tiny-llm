@@ -32,8 +32,7 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
 - 已有参考实现：rmsnorm / rope / matvec / softmax / attention / silu / argmax。
 - 已接入分发层的算子：**matvec**（热点，优化主攻方向），已注册实现：
   `ref`（默认）、`double_2_float`。其余算子仍直接调 `_ref`。
-- 优化版往哪加、怎么接：见 `../docs/kernel_optimization.md`。
-- 怎么测提速：见 `../docs/benchmarking.md`。
+- 优化版往哪加、怎么接、怎么测提速：见 `../docs/optimization.md`（优化手册）。
 
 ## 为什么 `_ref` 很重要
 
