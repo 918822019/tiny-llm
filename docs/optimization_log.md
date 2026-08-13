@@ -17,7 +17,6 @@
 | fp32-baseline（标量，无优化） | 5f679ea |           230.36 | 252.35 |   1.00× |       — | fp32 标量、单线程、未量化，只求正确 |
 | fp32-double（对照：同配置复测） | 40b8e26 |           222.59 | 241.87 | ≈1.0×（波动） |       — | 与基线同配置、换 commit 复测；当 float 的对照，顺带暴露 ~4% 运行波动 |
 | fp32-float（基线 + matvec float 累加，**已回退**） | 40b8e26 |           204.12 | 269.79 |   1.13× |   1.09× | matvec 内层累加 double→float（Apple Silicon fp64 慢），计算类优化 |
-
 | restore-double（回退 fp32-float） | e1523c7 | 239.64 | 269.20 | 0.93× | 0.85× | 纪律性回退：_ref 恢复 double 累加，回到基线配置；float 累加将来以变体形式重做 |
 | double_2_float（fp32-baseline + matvec float 累加变体） | 9d1a572 | 219.84 | 245.48 | 1.01×（被机器波动掩盖） | 1.12× | matvec 内层累加 double→float，首次以**变体**形式合规落地；同场 A/B 才是真贡献 |
 | neon | fd430db | 28.25 | 30.14 | 7.88× | 8.05×（同场） | matvec NEON 向量化（4 路 FMA + 4 累加器展开）；decode 纯权重带宽瓶颈，有效带宽 8.7→72 GB/s，kernel 加速比几乎全额传导到端到端 |

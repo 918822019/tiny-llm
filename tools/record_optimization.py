@@ -105,6 +105,20 @@ def insert_before(text: str, marker: str, block: str) -> str:
     return text[:idx] + block + text[idx:]
 
 
+def insert_table_row(text: str, marker: str, row: str) -> str:
+    """表格行专用插入：倒退掉标记前的空行，让新行紧贴表格末行。
+
+    Markdown 表格中间出现空行就会断表（后半截渲染成无表头文本）——
+    模板里标记注释前恰好带空行，普通 insert_before 会把行插到空行后面，
+    第一次插入就把表劈成两半（实际踩过）。
+    """
+    idx = text.find(marker)
+    if idx == -1:
+        raise RuntimeError(f"log 里找不到标记：{marker!r}，无法定位插入点")
+    prefix = text[:idx].rstrip("\n")
+    return prefix + "\n" + row + "\n" + text[idx:]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True, help="本次优化的名字")
@@ -173,10 +187,10 @@ def main() -> None:
     log_path = Path(args.log)
     text = log_path.read_text()
     row = build_table_row(args.label, commit, med, p95, vs_base_str,
-                          "<填：一句话归因>", vs_prev_col) + "\n"
+                          "<填：一句话归因>", vs_prev_col)
     detail = build_detail(args.label, commit, med, p95, args.runs, last,
                           vs_prev_str, base_note, extra_suffix)
-    text = insert_before(text, TABLE_MARKER, row)
+    text = insert_table_row(text, TABLE_MARKER, row)  # 表格行：防断表
     text = insert_before(text, DETAIL_MARKER, detail)
     log_path.write_text(text)
 
