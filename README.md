@@ -5,12 +5,14 @@
 不追求通用推理框架，不做 graph executor。
 
 > **当前状态**
-> - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，16 个生成 token 与 HuggingFace 逐位一致；
-> - 性能：单线程 fp32 **decode ≈ 220 ms/token**（已落地变体 `double_2_float`，
->   同场 A/B ~1.09–1.12×；当前数字以 `docs/optimization_log.md` 为准）；
-> - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、kernel 分发层
->   （变体自注册）、key=value 配置；
-> - 下一步：NEON matvec。
+> - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，生成 token 与 HuggingFace 逐位一致；
+> - 性能：fp32 标量基线 230 ms/token → **fp16 满栈 + 全融合 ≈ 6.3 ms/token（36×）**。
+>   已抵达带宽墙，fp16 路线正式关闭（结论与账本见 `docs/optimization_log.md`）；
+> - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、两套 kernel 分发层
+>   （matvec / 非 matvec ops，变体自注册 + 未注册兜底 ref）、key=value 配置、
+>   归因阶梯方法论；
+> - 下一步（要打破假设才有空间）：int4 量化（流量÷4）/ batched prefill /
+>   speculative decoding——均超出 v1"不降 bit、batch=1"的边界，见日志关闭小节。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
 
