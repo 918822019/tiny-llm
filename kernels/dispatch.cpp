@@ -65,4 +65,30 @@ namespace tinyqwen {
         }
         fn(w, x, y, out_dim, in_dim);
     }
+
+    namespace {
+        // pair 实现注册表：key 与 matvec 实现同名。注册同样发生在 main 之前。
+        std::unordered_map<std::string, MatvecPairFn> &pair_registry() {
+            static std::unordered_map<std::string, MatvecPairFn> r;
+            return r;
+        }
+    } // namespace
+
+    void register_matvec_pair_impl(const char *name, MatvecPairFn fn) {
+        pair_registry()[name] = fn;
+    }
+
+    void matvec_pair_f32(const float *w1, const float *w2, const float *x,
+                         float *y1, float *y2, int out_dim, int in_dim) {
+        // 当前 impl 注册了 pair 实现就用它（key = impl 名，未显式选择时为 "ref"）。
+        const auto &pr = pair_registry();
+        auto it = pr.find(matvec_impl_name());
+        if (it != pr.end()) {
+            it->second(w1, w2, x, y1, y2, out_dim, in_dim);
+            return;
+        }
+        // 兜底：等价于调用方分开调两次 matvec_f32（数值一致，行为不变）。
+        matvec_f32(w1, x, y1, out_dim, in_dim);
+        matvec_f32(w2, x, y2, out_dim, in_dim);
+    }
 } // namespace tinyqwen

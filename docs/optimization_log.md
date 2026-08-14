@@ -24,6 +24,7 @@
 | neon_nofma（阶梯 L3：隔离 SIMD 宽度） | 2dfb2c8 | 28.62 | 29.03 | 7.78× | 7.97×（同场） | NEON 向量化但故意不用 FMA；SIMD 是最大单项（vs acc4 = 3.02×），并撞带宽墙 |
 | neon_mt | 56f51ba | 10.50 | 11.26 | 21.19× | 2.69×（vs neon） | NEON + 常驻线程池行切分（默认 6 线程）：单核带宽 72 GB/s 打满后，多核接力整机带宽 ~199 GB/s；同场 vs ref 21.42× |
 | neon_mt_bal | a323eb7 | 10.07 | 14.42 | 22.11× | ≈1.0×（vs neon_mt，同场） | 自校准加权分块——带宽墙下无 E 核尾巴可消，证伪归档 |
+| neon_mt_kv | d17bc57 | 11.19 | 12.19 | 19.89× | 1.02–1.05×（vs neon_mt，同场 4 块 24 样本） | k/v 成对融合：48 次内联小 matvec 合并成 24 次 fork-join，摊薄+并行 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -314,6 +315,46 @@
   3. 变体按纪律保留在树中（可切换、可复测），但不进优化栈；下一步从
      neon_mt 继续。
 - **复现**：`./scripts/bench.sh neon_mt_bal --extra-args "--matvec-impl neon_mt_bal"`
+
+---
+
+### neon_mt_kv（2026-08-14）
+
+- **优化栈**：fp32-baseline + neon_mt_kv（= neon_mt + k/v 成对融合；与
+  neon_mt/neon_mt_bal 互斥。真上一配置是 neon_mt，record 的对照是 ref）
+- **是什么**：dispatch 新增成对入口 `matvec_pair_f32`（y1=W1@x、y2=W2@x 共享
+  输入；未注册 pair 的 impl 兜底为调两次 matvec_f32，数值不变），runtime 的
+  k/v_proj 合并为一次调用；新变体 `kernels/matvec/matvec_f32_neon_mt_kv.cpp`
+  注册 pair 实现：两个 128×896 矩阵的行拼成 256 行的单个 fork-join job。
+  行内点积与 neon_mt 逐位一致，改的是调用粒度。
+- **假设**：并行/调度类。k/v_proj 各 0.45MB 够不着 1MB 并行阈值，每 token
+  48 次 ~6µs 内联单线程 matvec 合计 ~0.3ms；合并后 0.9MB 过 pair 阈值
+  （0.5MB），24 次 fork-join 摊薄同步开销且 6 线程并行，预期省一半左右。
+- **结果**：decode 中位 **11.19 ms/token**（3 遍取中位，每遍 27 样本），p95 12.19
+- **vs 上一配置**：**1.02–1.05×（vs neon_mt，同场）**。record 机制对照是 ref：
+  231.52 → 11.19 = 20.69×（含 neon_mt 全部机制，不是本步贡献）。本步真贡献：
+  4 个 runs=3 块状对照（AC 块 mt 先测、BD 块 kv 先测，抗顺序红利与慢漂移），
+  逐块比值 1.17× / 1.00× / 1.04× / 1.02×，kv 无一败绩；合并 24 个 per-run
+  样本中位数 mt 11.49 vs kv 11.27，差 0.22ms，与"0.3ms 内联时间砍半"的
+  假设量级吻合。（vs 基线 19.89×）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 19.89×
+- **验证**：scripts/verify.sh（40 单测：新增 pair 兜底中性门禁——ref/
+  double_2_float 下 pair 入口与分开调逐位一致；neon_mt_kv 的 4 组 shape——
+  单矩阵并行、pair 并行行映射、pair 内联、总行数 6 < 线程数的空块极端形；
+  golden token 16 个与 ref 逐位一致——runtime 改调用方式未改变数值）
+- **瓶颈转移**：top op = `lm_head`、`topk_argmax`、`layer_4.down_proj`，
+  结构未变（k/v 本就不在 top）。下一刀：流式加载提示（neon_mt_kv_nt，
+  实验性，预期≈0）；fp32 路线扫完后转量化（权重流量 ÷N）。
+- **意外 / 教训**：
+  1. **收益小但方向稳**：单看任一块都在噪声边缘（1.00–1.17×），靠 4 块
+     双向换序 + 合并样本才把"从不输"立住。2% 级优化的判据不是单次比值，
+     是多块一致性——这是对 bal 条目"顺序红利假阳性"教训的正向应用。
+  2. **兜底设计让基建零风险**：pair 入口对未注册的 impl 等价于原调用，
+     所以 runtime 可以无条件切换调用方式，golden token 在全部 impl 下
+     保持逐位一致——基建改动与优化收益解耦，这是 dispatch 模式的又一例。
+  3. 今日机器整体偏慢偏噪（变体中位 11.2 vs 历史 neon_mt 10.5），
+     vs 基线比值参考性弱，一切以同场对照为准。
+- **复现**：`./scripts/bench.sh neon_mt_kv --extra-args "--matvec-impl neon_mt_kv"`
 
 ---
 

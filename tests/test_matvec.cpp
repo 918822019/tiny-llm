@@ -213,6 +213,133 @@ TEST (matvec_neon_mt_matches_ref) {
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
 
+TEST (matvec_neon_mt_kv_matches_ref) {
+    // 正确性门禁：neon_mt_kv 只在 aarch64 构建注册；其他平台 skip。
+    // 覆盖：单矩阵并行/内联路径（与 neon_mt 同款）+ pair 并行/内联/极端形。
+    if (!set_matvec_impl_by_name("neon_mt_kv")) {
+        std::printf("[skip] current build has no 'neon_mt_kv' matvec (not aarch64)\n");
+        return;
+    }
+    auto fill = [](std::vector<float> &v, float scale) {
+        for (size_t i = 0; i < v.size(); ++i) {
+            v[i] = static_cast<float>((i * 37 % 29) - 14) * scale;
+        }
+    };
+
+    // 1) 单矩阵并行路径：301×4103 不整除线程数，连压 8 遍。
+    {
+        const int out_dim = 301, in_dim = 4103;
+        std::vector<float> w(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w, 0.125f);
+        fill(x, 0.125f);
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 8; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 2) pair 并行路径：两矩阵各 301×4103（总量远超 0.5MB 阈值），
+    //    行映射（前 out_dim 行属 w1、后半属 w2）必须切对。连压 8 遍。
+    {
+        const int out_dim = 301, in_dim = 4103;
+        std::vector<float> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w1, 0.125f);
+        fill(w2, 0.0625f);
+        fill(x, 0.125f);
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f32_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f32_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 8; ++rep) {
+            matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                            out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) {
+                EXPECT_NEAR(y1[o], r1[o], 5e-3);
+                EXPECT_NEAR(y2[o], r2[o], 5e-3);
+            }
+        }
+    }
+
+    // 3) pair 内联路径：各 16×2053，总量 0.25MB < 0.5MB 阈值，走两段内联。
+    {
+        const int out_dim = 16, in_dim = 2053;
+        std::vector<float> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w1, 0.125f);
+        fill(w2, 0.0625f);
+        fill(x, 0.125f);
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f32_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f32_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                        out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) {
+            EXPECT_NEAR(y1[o], r1[o], 5e-3);
+            EXPECT_NEAR(y2[o], r2[o], 5e-3);
+        }
+    }
+
+    // 4) 极端：pair 总行数 6（各 3 行）< 线程数，多数线程空块——in_dim
+    //    取大让总量过 pair 并行阈值，行映射与空块归位都要对。
+    {
+        const int out_dim = 3, in_dim = 100003;
+        std::vector<float> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w1, 0.0625f);
+        fill(w2, 0.0625f);
+        fill(x, 0.0625f);
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f32_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f32_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 4; ++rep) {
+            matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                            out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) {
+                EXPECT_NEAR(y1[o], r1[o], 5e-3);
+                EXPECT_NEAR(y2[o], r2[o], 5e-3);
+            }
+        }
+    }
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}
+
+TEST (matvec_pair_fallback_matches_ref) {
+    // 中性门禁：未注册 pair 的 impl，matvec_pair_f32 必须等价于分开调两次
+    // matvec_f32——runtime 改成 pair 调用后，ref 等 impl 的数值行为不变。
+    const int out_dim = 19, in_dim = 137;
+    std::vector<float> w1(out_dim * in_dim), w2(out_dim * in_dim), x(in_dim);
+    for (int i = 0; i < out_dim * in_dim; ++i) {
+        w1[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        w2[i] = static_cast<float>((i * 23 % 31) - 15) * 0.125f;
+    }
+    for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+    // ref：兜底路径（ref 不注册 pair）。
+    EXPECT_TRUE(set_matvec_impl_by_name("ref"));
+    std::vector<float> y1(out_dim), y2(out_dim), r1(out_dim), r2(out_dim);
+    matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(), out_dim, in_dim);
+    matvec_f32_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+    matvec_f32_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+    for (int o = 0; o < out_dim; ++o) {
+        EXPECT_NEAR(y1[o], r1[o], 1e-6); // 同一条代码路径，要求逐位级一致
+        EXPECT_NEAR(y2[o], r2[o], 1e-6);
+    }
+
+    // double_2_float：同样未注册 pair，兜底后数值应与"分开调该 impl"一致。
+    EXPECT_TRUE(set_matvec_impl_by_name("double_2_float"));
+    matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(), out_dim, in_dim);
+    matvec_f32(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+    matvec_f32(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+    for (int o = 0; o < out_dim; ++o) {
+        EXPECT_NEAR(y1[o], r1[o], 1e-6);
+        EXPECT_NEAR(y2[o], r2[o], 1e-6);
+    }
+    EXPECT_TRUE(set_matvec_impl_by_name("ref"));
+}
+
 TEST (matvec_neon_mt_bal_matches_ref) {
     // 正确性门禁：neon_mt_bal 只在 aarch64 构建注册；其他平台 skip。
     // 加权分块改变的是"行归谁算"，行内算法与 neon_mt 逐位一致，所以

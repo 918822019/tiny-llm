@@ -255,13 +255,14 @@ namespace tinyqwen {
                 for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
             }
             {
-                ScopedTimer t(prof, scope("layer_%d.k_proj", i));
-                matvec_f32(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden);
+                // k/v 投影合并成一次成对 matvec：两个小矩阵共享同一个输入
+                // normed_。dispatch 兜底语义 = 分开调两次（未注册 pair 的
+                // impl 行为不变）；注册了 pair 的 impl（neon_mt 系）可以把
+                // 两次 0.45MB 的内联小调用合成一次更大的调用去摊薄/并行。
+                ScopedTimer t(prof, scope("layer_%d.kv_proj", i));
+                matvec_pair_f32(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
+                                kv_dim_, hidden);
                 for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
-            }
-            {
-                ScopedTimer t(prof, scope("layer_%d.v_proj", i));
-                matvec_f32(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden);
                 for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
             }
             // 2c. RoPE 旋转位置编码：把"位置 pos"的信息编进 q/k（v 不需要）。
