@@ -12,6 +12,11 @@ add_library(tinyqwen_kernels OBJECT
         rmsnorm/rmsnorm_ref.cpp
         rope/rope_ref.cpp
         matvec/matvec_f32_ref.cpp
+        # f16 权重族：参考实现（所有平台，f16 模型的正确性基准 + 兜底）。
+        matvec/matvec_f16_ref.cpp
+        # f16 满栈变体：NEON(fp32 累加) + 线程池 + k/v 融合 + LDNP，与 f32
+        # 阶梯顶层同名注册，按模型 dtype 解析（仅 aarch64；其他平台编译为空）。
+        matvec/matvec_f16_neon_mt_kv_nt.cpp
         matvec/matvec_f32_double_2_float.cpp
         # 归因阶梯变体（每层只加一个技术，便于 A/B 归因）：
         # acc4 = 标量 4 链累加（隔离"累加结构"，所有平台）；

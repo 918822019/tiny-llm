@@ -405,6 +405,167 @@ TEST (matvec_neon_mt_kv_nt_matches_ref) {
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
 
+TEST (half_conversion_roundtrip) {
+    // half_to_float / float_to_half 的穷举门禁：全部 65536 个 half 位形
+    // （除 NaN）经 float 往返后必须逐位还原——这是 exporter 量化与 C++
+    // 端一致性的地基（numpy astype("float16") 同为 RNE）。
+    int checked = 0;
+    for (uint32_t bits = 0; bits < 65536; ++bits) {
+        const uint16_t h = static_cast<uint16_t>(bits);
+        if ((bits & 0x7C00) == 0x7C00 && (bits & 0x3FF) != 0) continue; // NaN 不往返
+        const float v = half_to_float(h);
+        const uint16_t r = float_to_half(v);
+        EXPECT_TRUE(half_to_float(r) == v);
+        ++checked;
+    }
+    EXPECT_EQ(checked, 65536 - 2046); // 全部非 NaN 位形（NaN = 2 符号 × 1023 尾数）
+    // 几个已知编码（手工核对过的锚点）。
+    EXPECT_TRUE(float_to_half(1.0f) == 0x3C00);
+    EXPECT_TRUE(float_to_half(-2.0f) == 0xC000);
+    EXPECT_TRUE(float_to_half(0.5f) == 0x3800);
+    EXPECT_TRUE(float_to_half(65504.0f) == 0x7BFF); // 最大正规数
+    EXPECT_TRUE(float_to_half(65536.0f) == 0x7C00); // 溢出 -> inf
+    EXPECT_NEAR(half_to_float(0x0400), 6.103515625e-05, 1e-12); // 最小正规数 2^-14
+    EXPECT_NEAR(half_to_float(0x0001), 5.960464477539063e-08, 1e-15); // 最小非规格化
+}
+
+TEST (matvec_f16_dispatch_selects_impl) {
+    // f16 注册表独立选择：set 失败不改变现状；未知实现名不兜底。
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("ref"));
+    EXPECT_TRUE(std::strcmp(matvec_f16_impl_name(), "ref") == 0);
+    EXPECT_TRUE(!set_matvec_f16_impl_by_name("no_such_f16_impl"));
+    EXPECT_TRUE(std::strcmp(matvec_f16_impl_name(), "ref") == 0);
+    const char *avail = available_matvec_f16_impls();
+    EXPECT_TRUE(std::strstr(avail, "ref") != nullptr);
+}
+
+TEST (matvec_f16_ref_matches_naive) {
+    // f16 族参考实现的门禁：与独立的"量化后 double 累加"逐位级一致。
+    const int out_dim = 7, in_dim = 11;
+    std::vector<uint16_t> w(out_dim * in_dim);
+    std::vector<float> x(in_dim);
+    for (int i = 0; i < out_dim * in_dim; ++i) {
+        w[i] = float_to_half(static_cast<float>((i * 37 % 29) - 14) * 0.125f);
+    }
+    for (int i = 0; i < in_dim; ++i) {
+        x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.5f;
+    }
+
+    std::vector<float> y(out_dim);
+    matvec_f16_ref(w.data(), x.data(), y.data(), out_dim, in_dim);
+
+    for (int o = 0; o < out_dim; ++o) {
+        double acc = 0.0;
+        for (int i = 0; i < in_dim; ++i) {
+            acc += (double) half_to_float(w[o * in_dim + i]) * x[i];
+        }
+        EXPECT_NEAR(y[o], acc, 1e-6);
+    }
+}
+
+TEST (matvec_f16_neon_mt_kv_nt_matches_ref) {
+    // 正确性门禁：f16 满栈变体只在 aarch64 构建注册；其他平台 skip。
+    // 覆盖与 f32 版同款：对齐 LDNP 主路径 / 非对齐兜底 / pair 行映射 /
+    // 内联 / 空块极端形。权重取 0.125 的整数倍（half 可精确表示），
+    // 变体与 f16_ref 的差只来自 float 累加顺序，容差沿用 5e-3。
+    if (!set_matvec_f16_impl_by_name("neon_mt_kv_nt")) {
+        std::printf("[skip] current build has no f16 'neon_mt_kv_nt' matvec\n");
+        return;
+    }
+    auto fill = [](std::vector<uint16_t> &v, float scale) {
+        for (size_t i = 0; i < v.size(); ++i) {
+            v[i] = float_to_half(static_cast<float>((i * 37 % 29) - 14) * scale);
+        }
+    };
+
+    // 1) 对齐 + 并行（in_dim=4104：行步长 4104×2 % 16 == 0）。
+    {
+        const int out_dim = 301, in_dim = 4104;
+        std::vector<uint16_t> w(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        fill(w, 0.125f);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f16_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 8; ++rep) {
+            matvec_f16(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 2) 非对齐（in_dim=4103：第 1 行起行起点 %16 != 0，走兜底路径）。
+    {
+        const int out_dim = 301, in_dim = 4103;
+        std::vector<uint16_t> w(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        fill(w, 0.125f);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f16_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 2; ++rep) {
+            matvec_f16(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 3) 对齐 pair 并行：行映射 + 融合 fork-join 一起压。
+    {
+        const int out_dim = 301, in_dim = 4104;
+        std::vector<uint16_t> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        fill(w1, 0.125f);
+        fill(w2, 0.0625f);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f16_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f16_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 4; ++rep) {
+            matvec_pair_f16(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                            out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) {
+                EXPECT_NEAR(y1[o], r1[o], 5e-3);
+                EXPECT_NEAR(y2[o], r2[o], 5e-3);
+            }
+        }
+    }
+
+    // 4) 内联路径：16×4104 远低于单矩阵阈值。
+    {
+        const int out_dim = 16, in_dim = 4104;
+        std::vector<uint16_t> w(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        fill(w, 0.125f);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f16_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f16(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    // 5) 极端：pair 总行数 6 < 线程数；in_dim=100000（对齐、尾段 32）。
+    {
+        const int out_dim = 3, in_dim = 100000;
+        std::vector<uint16_t> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        fill(w1, 0.0625f);
+        fill(w2, 0.0625f);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.0625f;
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f16_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f16_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        matvec_pair_f16(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                        out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) {
+            EXPECT_NEAR(y1[o], r1[o], 5e-3);
+            EXPECT_NEAR(y2[o], r2[o], 5e-3);
+        }
+    }
+
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}
+
 TEST (matvec_pair_fallback_matches_ref) {
     // 中性门禁：未注册 pair 的 impl，matvec_pair_f32 必须等价于分开调两次
     // matvec_f32——runtime 改成 pair 调用后，ref 等 impl 的数值行为不变。

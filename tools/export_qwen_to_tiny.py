@@ -10,7 +10,8 @@
         --out model.tqwen
 
 说明:
-    - v1 只导出 float32。
+    - v1 支持导出 float32（默认）或 float16（weight-only 半精度，文件减半，
+      配 runtime 的 f16 matvec 实现使用；数值容差见 docs/optimization.md §5）。
     - linear 权重保持 HF 的 [out_dim, in_dim] 行主序，不转置。
     - 不处理 tokenizer，见 tools/tokenize_prompt.py。
 """
@@ -29,7 +30,14 @@ MAGIC = b"TINYQWEN"
 FORMAT_VERSION = 1
 ALIGN = 64
 DTYPE_F32 = 0
+DTYPE_F16 = 1  # 与 runtime/tiny_format.h 的 Dtype 枚举保持一致
 MAX_NAME = 64
+
+# dtype -> (编号, 每元素字节数, numpy 类型名)
+DTYPES = {
+    "f32": (DTYPE_F32, 4, "float32"),
+    "f16": (DTYPE_F16, 2, "float16"),
+}
 
 HEADER_FMT = "<8s12Iff4Q96s"  # 192 字节
 ENTRY_FMT = "<64sII4QQQ"  # 120 字节
@@ -45,15 +53,18 @@ def align_up(x: int, align: int = ALIGN) -> int:
     return (x + align - 1) // align * align
 
 
-def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -> int:
+def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]",
+                dtype: str = "f32") -> int:
     """写一个 .tqwen 文件，返回文件总字节数。
 
     cfg 必需的键：
         n_layers, hidden_size, intermediate_size, n_heads, n_kv_heads,
         head_dim, vocab_size, max_seq_len, tied (0/1), rms_norm_eps, rope_theta
     tensors: 有序映射 name -> 数组对象，要求有 .shape 属性以及
-        .astype("float32").tobytes() 方法（numpy 数组可直接使用）。
+        .astype(<dtype>).tobytes() 方法（numpy 数组可直接使用）。
+    dtype: "f32"（默认）或 "f16"；决定 header/tensor 表的 dtype 字段与元素大小。
     """
+    dtype_code, elem_size, np_dtype = DTYPES[dtype]
     names = list(tensors.keys())
 
     table_end = struct.calcsize(HEADER_FMT) + len(names) * struct.calcsize(ENTRY_FMT)
@@ -71,7 +82,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
         numel = 1
         for d in shape:
             numel *= d
-        nbytes = numel * 4
+        nbytes = numel * elem_size
         entries.append((name, shape, offset, nbytes))
         offset = align_up(offset + nbytes)
     total_bytes = offset
@@ -80,7 +91,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
         HEADER_FMT,
         MAGIC,
         FORMAT_VERSION,
-        DTYPE_F32,
+        dtype_code,
         int(cfg["n_layers"]),
         int(cfg["hidden_size"]),
         int(cfg["intermediate_size"]),
@@ -110,7 +121,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
             out.write(struct.pack(
                 ENTRY_FMT,
                 name.encode("ascii"),
-                DTYPE_F32,
+                dtype_code,
                 len(shape),
                 *shape,
                 *[0] * (4 - len(shape)),
@@ -122,7 +133,7 @@ def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]") -
 
         for name, shape, off, nbytes in entries:
             assert out.tell() == off, f"alignment bug at {name}"
-            data = tensors[name].astype("float32", copy=False).tobytes()
+            data = tensors[name].astype(np_dtype, copy=False).tobytes()
             assert len(data) == nbytes, f"size bug at {name}"
             out.write(data)
             # 每个 payload 之后补零到下一个 64B 边界。
@@ -141,7 +152,8 @@ def print_table_summary(out_path: str | Path) -> None:
         header = f.read(struct.calcsize(HEADER_FMT))
         fields = struct.unpack(HEADER_FMT, header)
         magic, version, dtype = fields[0], fields[1], fields[2]
-        assert magic == MAGIC and version == FORMAT_VERSION and dtype == DTYPE_F32
+        assert magic == MAGIC and version == FORMAT_VERSION and dtype in (DTYPE_F32, DTYPE_F16)
+        dtype_label = "f32" if dtype == DTYPE_F32 else "f16"
         # fields 下标: 0 magic, 1 version, 2 dtype, 3..12 十个 u32,
         #   13 eps, 14 theta, 15 tensor_count, 16 tensor_table_offset,
         #   17 data_offset, 18 total
@@ -154,7 +166,7 @@ def print_table_summary(out_path: str | Path) -> None:
                 ENTRY_FMT, f.read(struct.calcsize(ENTRY_FMT)))
             name = name_b.rstrip(b"\x00").decode("ascii")
             shape = [s0, s1, s2, s3][:ndim]
-            print(f"{name:<56} {str(shape):<22} {'f32':<6} {off:>12} {nbytes:>14}")
+            print(f"{name:<56} {str(shape):<22} {dtype_label:<6} {off:>12} {nbytes:>14}")
 
 
 # ---- HF 模型收集 ------------------------------------------------------
@@ -167,6 +179,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="output .tqwen path")
     p.add_argument("--max-seq-len", type=int, default=0,
                    help="override max_seq_len in header (0 = use config)")
+    p.add_argument("--dtype", choices=sorted(DTYPES), default="f32",
+                   help="权重存储精度：f32（默认）或 f16（文件减半，配 f16 matvec 用）")
     return p.parse_args()
 
 
@@ -276,14 +290,19 @@ def main() -> None:
     # 所以这里传给它一个惰性 dict，访问时才从对应分片加载 tensor。
     # 注意每个 tensor 会被读两次（shape 一遍 + payload 一遍）——
     # 相比把 2GB fp32 模型整个放进内存，这是可接受的代价。
+    np_dtype = DTYPES[args.dtype][2]
+
     class LazyTensors(dict):
         def __getitem__(self, key):
             tensor = get_shard(shard_map[key]).get_tensor(key)
-            return tensor.float().numpy()  # bf16/fp16 -> fp32 numpy
+            # bf16/fp16 -> fp32 numpy；f16 导出时再降到 float16
+            # （round-to-nearest-even，numpy astype 的默认舍入）。
+            return tensor.float().numpy().astype(np_dtype, copy=False)
 
-    total = write_tqwen(args.out, header_cfg, LazyTensors.fromkeys(names))
+    total = write_tqwen(args.out, header_cfg, LazyTensors.fromkeys(names), args.dtype)
 
     print(f"model dir  : {model_dir}")
+    print(f"dtype      : {args.dtype}")
     print(f"config     : layers={header_cfg['n_layers']} hidden={header_cfg['hidden_size']} "
           f"inter={header_cfg['intermediate_size']} heads={header_cfg['n_heads']} "
           f"kv_heads={header_cfg['n_kv_heads']} head_dim={header_cfg['head_dim']} "

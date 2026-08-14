@@ -96,8 +96,11 @@ namespace tinyqwen {
             fail(err, "unsupported format version: " + std::to_string(header_.version));
             return false;
         }
-        if (header_.dtype != static_cast<uint32_t>(Dtype::kF32)) {
-            fail(err, "v1 loader only supports dtype=f32, got " + std::to_string(header_.dtype));
+        // v1 支持 f32 与 f16（weight-only 半精度：权重 f16、计算 f32）。
+        // i8/i4 仍预留拒绝（亚字节布局需要专门处理，见 known_limitations）。
+        if (header_.dtype != static_cast<uint32_t>(Dtype::kF32) &&
+            header_.dtype != static_cast<uint32_t>(Dtype::kF16)) {
+            fail(err, "v1 loader supports dtype f32/f16, got " + std::to_string(header_.dtype));
             return false;
         }
         // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了。
@@ -153,8 +156,11 @@ namespace tinyqwen {
                 fail(err, "tensor #" + std::to_string(i) + ": bad ndim " + std::to_string(e.ndim));
                 return false;
             }
-            if (e.dtype != static_cast<uint32_t>(Dtype::kF32)) {
-                fail(err, "tensor #" + std::to_string(i) + ": v1 supports f32 payloads only");
+            // v1 约定全文件单一 dtype：每个 tensor 必须与 header 声明一致。
+            if (e.dtype != header_.dtype) {
+                fail(err, "tensor #" + std::to_string(i) + ": dtype " +
+                              std::to_string(e.dtype) + " != header dtype " +
+                              std::to_string(header_.dtype) + " (v1 is uniform-dtype)");
                 return false;
             }
             // 元素个数 = 各维相乘；任何一维为 0 都是非法的。
@@ -173,8 +179,8 @@ namespace tinyqwen {
                     return false;
                 }
             }
-            // 声明的字节数必须等于 元素个数 * 4（f32 每个 4 字节）。
-            if (e.nbytes != numel * dtype_size(Dtype::kF32)) {
+            // 声明的字节数必须等于 元素个数 * 每元素字节数（f32=4 / f16=2）。
+            if (e.nbytes != numel * dtype_size(static_cast<Dtype>(header_.dtype))) {
                 fail(err, "tensor #" + std::to_string(i) + ": nbytes mismatch");
                 return false;
             }

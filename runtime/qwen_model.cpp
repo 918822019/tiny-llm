@@ -55,18 +55,22 @@ namespace tinyqwen {
         }
     } // namespace
 
-    // 按 HF 名字取 tensor，并校验 dtype/ndim/shape 是否与 forward 预期一致。
+    // 按 HF 名字取 tensor，并校验 ndim/shape/dtype 是否与 forward 预期一致。
     // shape 不对（比如导出了非 Qwen 的 checkpoint）在这里就变成明确报错，
     // 而不是后面悄悄算错（fail fast，见 primer 第 9 节）。
-    const float *QwenModel::require(const ModelFile &file, const std::string &name,
-                                    const std::vector<uint64_t> &shape, std::string *err) {
+    // dtype 必须等于文件级 dtype（v1 单一 dtype，loader 已保证；这里双保险）。
+    const TensorView *QwenModel::require_view(const ModelFile &file, const std::string &name,
+                                              const std::vector<uint64_t> &shape,
+                                              std::string *err) {
         const TensorView *t = file.get(name);
         if (!t) {
             if (err) *err = "missing tensor: " + name;
             return nullptr;
         }
-        if (t->dtype != Dtype::kF32) {
-            if (err) *err = "tensor " + name + " is not f32";
+        if (t->dtype != dtype_) {
+            if (err)
+                *err = "tensor " + name + " dtype mismatch: got " + dtype_name(t->dtype) +
+                       " expected " + dtype_name(dtype_);
             return nullptr;
         }
         if (static_cast<size_t>(t->ndim) != shape.size()) {
@@ -85,7 +89,43 @@ namespace tinyqwen {
                 return nullptr;
             }
         }
-        return t->f32();
+        return t;
+    }
+
+    // norm/bias 这类小向量恒按 fp32 使用：f32 模型零拷贝直指文件内存；
+    // f16 模型在 create 期一次性转成 fp32 副本（总量 ~400KB 级，换算耗时
+    // 可忽略），换来 rmsnorm/bias 的每 token 路径不需要感知 dtype。
+    const float *QwenModel::bind_f32_vector(const TensorView *t) {
+        if (dtype_ == Dtype::kF32) return t->f32();
+        std::vector<float> buf(t->numel());
+        const uint8_t *src = t->data;
+        for (size_t i = 0; i < buf.size(); ++i) {
+            uint16_t h;
+            std::memcpy(&h, src + i * 2, sizeof(h));
+            buf[i] = half_to_float(h);
+        }
+        owned_f32_.push_back(std::move(buf));
+        return owned_f32_.back().data();
+    }
+
+    // matvec 分派薄封装：kernel 侧的通用入口由 dispatch 继续分发到具体变体。
+    void QwenModel::mv(const void *w, const float *x, float *y, int out_dim, int in_dim) const {
+        if (dtype_ == Dtype::kF16) {
+            matvec_f16(static_cast<const uint16_t *>(w), x, y, out_dim, in_dim);
+        } else {
+            matvec_f32(static_cast<const float *>(w), x, y, out_dim, in_dim);
+        }
+    }
+
+    void QwenModel::mv_pair(const void *w1, const void *w2, const float *x, float *y1,
+                            float *y2, int out_dim, int in_dim) const {
+        if (dtype_ == Dtype::kF16) {
+            matvec_pair_f16(static_cast<const uint16_t *>(w1),
+                            static_cast<const uint16_t *>(w2), x, y1, y2, out_dim, in_dim);
+        } else {
+            matvec_pair_f32(static_cast<const float *>(w1), static_cast<const float *>(w2), x,
+                            y1, y2, out_dim, in_dim);
+        }
     }
 
     // 工厂：绑定权重视图、校验每个 tensor、初始化 KV cache 和 workspace。
@@ -110,6 +150,7 @@ namespace tinyqwen {
 
         std::unique_ptr<QwenModel> m(new QwenModel());
         m->cfg_ = cfg;
+        m->dtype_ = static_cast<Dtype>(file.header().dtype); // f32 / f16，决定 matvec 入口
         m->profiler_ = &profiler;
         m->max_seq_len_ = max_seq_len;
         m->q_dim_ = static_cast<int>(cfg.n_heads * cfg.head_dim);
@@ -121,17 +162,30 @@ namespace tinyqwen {
         const uint64_t qd = static_cast<uint64_t>(m->q_dim_);
         const uint64_t kvd = static_cast<uint64_t>(m->kv_dim_);
 
+        // 绑定辅助：大矩阵取裸字节指针（dtype 随模型），小向量恒绑 fp32。
+        const auto bind_mat = [&](const char *name, std::vector<uint64_t> shape,
+                                  const void **out) -> bool {
+            const TensorView *t = m->require_view(file, name, shape, err);
+            if (!t) return false;
+            *out = t->data;
+            return true;
+        };
+        const auto bind_vec = [&](const char *name, std::vector<uint64_t> shape,
+                                  const float **out) -> bool {
+            const TensorView *t = m->require_view(file, name, shape, err);
+            if (!t) return false;
+            *out = m->bind_f32_vector(t);
+            return true;
+        };
+
         // 全局权重：词嵌入、最后 norm、lm_head。
-        m->embed_ = m->require(file, "model.embed_tokens.weight", {vocab, hidden}, err);
-        if (!m->embed_) return false;
-        m->final_norm_ = m->require(file, "model.norm.weight", {hidden}, err);
-        if (!m->final_norm_) return false;
+        if (!bind_mat("model.embed_tokens.weight", {vocab, hidden}, &m->embed_)) return false;
+        if (!bind_vec("model.norm.weight", {hidden}, &m->final_norm_)) return false;
         if (cfg.tied_embeddings) {
             // tied：lm_head 和词嵌入共享同一份权重（0.5B 模型如此），省一份内存。
             m->lm_head_ = m->embed_;
         } else {
-            m->lm_head_ = m->require(file, "lm_head.weight", {vocab, hidden}, err);
-            if (!m->lm_head_) return false;
+            if (!bind_mat("lm_head.weight", {vocab, hidden}, &m->lm_head_)) return false;
         }
 
         // 每层权重。tensor 名字完全沿用 HuggingFace 约定，缺哪个名字
@@ -140,30 +194,27 @@ namespace tinyqwen {
         for (uint32_t i = 0; i < cfg.n_layers; ++i) {
             const std::string p = "model.layers." + std::to_string(i) + ".";
             LayerWeights &w = m->layers_[i];
-            w.input_ln = m->require(file, p + "input_layernorm.weight", {hidden}, err);
-            if (!w.input_ln) return false;
-            w.q_proj = m->require(file, p + "self_attn.q_proj.weight", {qd, hidden}, err);
-            if (!w.q_proj) return false;
-            w.k_proj = m->require(file, p + "self_attn.k_proj.weight", {kvd, hidden}, err);
-            if (!w.k_proj) return false;
-            w.v_proj = m->require(file, p + "self_attn.v_proj.weight", {kvd, hidden}, err);
-            if (!w.v_proj) return false;
-            w.q_bias = m->require(file, p + "self_attn.q_proj.bias", {qd}, err);
-            if (!w.q_bias) return false;
-            w.k_bias = m->require(file, p + "self_attn.k_proj.bias", {kvd}, err);
-            if (!w.k_bias) return false;
-            w.v_bias = m->require(file, p + "self_attn.v_proj.bias", {kvd}, err);
-            if (!w.v_bias) return false;
-            w.o_proj = m->require(file, p + "self_attn.o_proj.weight", {hidden, qd}, err);
-            if (!w.o_proj) return false;
-            w.post_ln = m->require(file, p + "post_attention_layernorm.weight", {hidden}, err);
-            if (!w.post_ln) return false;
-            w.gate = m->require(file, p + "mlp.gate_proj.weight", {inter, hidden}, err);
-            if (!w.gate) return false;
-            w.up = m->require(file, p + "mlp.up_proj.weight", {inter, hidden}, err);
-            if (!w.up) return false;
-            w.down = m->require(file, p + "mlp.down_proj.weight", {hidden, inter}, err);
-            if (!w.down) return false;
+            if (!bind_vec((p + "input_layernorm.weight").c_str(), {hidden}, &w.input_ln))
+                return false;
+            if (!bind_mat((p + "self_attn.q_proj.weight").c_str(), {qd, hidden}, &w.q_proj))
+                return false;
+            if (!bind_mat((p + "self_attn.k_proj.weight").c_str(), {kvd, hidden}, &w.k_proj))
+                return false;
+            if (!bind_mat((p + "self_attn.v_proj.weight").c_str(), {kvd, hidden}, &w.v_proj))
+                return false;
+            if (!bind_vec((p + "self_attn.q_proj.bias").c_str(), {qd}, &w.q_bias)) return false;
+            if (!bind_vec((p + "self_attn.k_proj.bias").c_str(), {kvd}, &w.k_bias)) return false;
+            if (!bind_vec((p + "self_attn.v_proj.bias").c_str(), {kvd}, &w.v_bias)) return false;
+            if (!bind_mat((p + "self_attn.o_proj.weight").c_str(), {hidden, qd}, &w.o_proj))
+                return false;
+            if (!bind_vec((p + "post_attention_layernorm.weight").c_str(), {hidden}, &w.post_ln))
+                return false;
+            if (!bind_mat((p + "mlp.gate_proj.weight").c_str(), {inter, hidden}, &w.gate))
+                return false;
+            if (!bind_mat((p + "mlp.up_proj.weight").c_str(), {inter, hidden}, &w.up))
+                return false;
+            if (!bind_mat((p + "mlp.down_proj.weight").c_str(), {hidden, inter}, &w.down))
+                return false;
         }
 
         m->kv_.init(static_cast<int>(cfg.n_layers), static_cast<int>(cfg.n_kv_heads), max_seq_len,
@@ -229,8 +280,18 @@ namespace tinyqwen {
         // embed 布局 [vocab, hidden]，第 token_id 行起点 = embed_ + token_id*hidden。
         {
             ScopedTimer t(prof, "embed");
-            std::memcpy(hidden_.data(), embed_ + static_cast<size_t>(token_id) * hidden,
-                        hidden * sizeof(float));
+            if (dtype_ == Dtype::kF32) {
+                std::memcpy(hidden_.data(),
+                            static_cast<const float *>(embed_) +
+                                    static_cast<size_t>(token_id) * hidden,
+                            hidden * sizeof(float));
+            } else {
+                // f16：嵌入行转回 fp32 进残差流（hidden 流全程保持 fp32，
+                // 只有权重是半精度）。每 token 只转一行（896 元素），开销可忽略。
+                const uint16_t *row = static_cast<const uint16_t *>(embed_) +
+                                      static_cast<size_t>(token_id) * hidden;
+                for (int j = 0; j < hidden; ++j) hidden_[j] = half_to_float(row[j]);
+            }
         }
 
         // attention 的缩放系数 1/sqrt(head_dim)。注意是 head_dim，不是 hidden——常见易错点。
@@ -251,7 +312,7 @@ namespace tinyqwen {
             // matvec = 矩阵乘向量：normed_ 过投影矩阵得到 q_/k_/v_。
             {
                 ScopedTimer t(prof, scope("layer_%d.q_proj", i));
-                matvec_f32(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
+                mv(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
                 for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
             }
             {
@@ -260,8 +321,8 @@ namespace tinyqwen {
                 // impl 行为不变）；注册了 pair 的 impl（neon_mt 系）可以把
                 // 两次 0.45MB 的内联小调用合成一次更大的调用去摊薄/并行。
                 ScopedTimer t(prof, scope("layer_%d.kv_proj", i));
-                matvec_pair_f32(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
-                                kv_dim_, hidden);
+                mv_pair(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
+                        kv_dim_, hidden);
                 for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
                 for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
             }
@@ -295,7 +356,7 @@ namespace tinyqwen {
             // 2f. 输出投影 o_proj。
             {
                 ScopedTimer t(prof, scope("layer_%d.o_proj", i));
-                matvec_f32(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
+                mv(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
             }
             // 2g. 第一次残差连接：x = x + attention(x)。残差让梯度/信息能直通。
             {
@@ -313,11 +374,11 @@ namespace tinyqwen {
             // 2i. gate 和 up 两个投影并行（SwiGLU 需要两条支路）。
             {
                 ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
-                matvec_f32(w.gate, normed_.data(), gate_.data(), inter, hidden);
+                mv(w.gate, normed_.data(), gate_.data(), inter, hidden);
             }
             {
                 ScopedTimer t(prof, scope("layer_%d.up_proj", i));
-                matvec_f32(w.up, normed_.data(), up_.data(), inter, hidden);
+                mv(w.up, normed_.data(), up_.data(), inter, hidden);
             }
             // 2j. SwiGLU 融合：SiLU 只作用在 gate 支路，再和 up 逐元素相乘。
             // gate_ 就地复用为融合结果，直接喂给 down_proj。
@@ -329,7 +390,7 @@ namespace tinyqwen {
             // 2k. down 投影，把维度从 inter 压回 hidden。
             {
                 ScopedTimer t(prof, scope("layer_%d.down_proj", i));
-                matvec_f32(w.down, gate_.data(), ffn_.data(), hidden, inter);
+                mv(w.down, gate_.data(), ffn_.data(), hidden, inter);
             }
             // 2l. 第二次残差连接：x = x + ffn(x)。
             {
@@ -347,7 +408,7 @@ namespace tinyqwen {
             // lm_head：把 hidden 向量投成 vocab 维的 logits（每个词一个分数）。
             // tied 时 lm_head_ 就是 embed_（见 create）。
             ScopedTimer t(prof, "lm_head");
-            matvec_f32(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+            mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
         }
 
         // ==== 第 4 步：greedy 取 argmax ====

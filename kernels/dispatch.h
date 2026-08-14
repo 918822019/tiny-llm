@@ -46,6 +46,34 @@ namespace tinyqwen {
 
     void matvec_pair_f32(const float *w1, const float *w2, const float *x,
                          float *y1, float *y2, int out_dim, int in_dim);
+
+    // ---- f16 权重路径（weight-only 半精度：权重 f16，激活/计算 f32）----
+    //
+    // f16 实现有**独立注册表**，实现名与 f32 注册表共享同一命名空间
+    // （"ref" / "neon_mt_kv_nt" / ...）：选哪个实现由"模型文件的 dtype +
+    // 实现名"共同决定（main 按模型 dtype 查对应注册表，未知即报错），
+    // forward 按 dtype 调对应入口。两表独立保证"f32 模型配 f16 实现名"
+    // 会 fail fast，而不是静默兜底。
+    using MatvecF16Fn = void (*)(const uint16_t *w, const float *x, float *y, int out_dim,
+                                 int in_dim);
+
+    void register_matvec_f16_impl(const char *name, MatvecF16Fn fn);
+    bool set_matvec_f16_impl_by_name(const char *name);
+    const char *matvec_f16_impl_name();
+    const char *available_matvec_f16_impls();
+
+    // 通用入口：未显式选择时兜底到 f16 注册表里的 "ref"。
+    void matvec_f16(const uint16_t *w, const float *x, float *y, int out_dim, int in_dim);
+
+    // f16 成对入口：语义与 matvec_pair_f32 相同；未注册 pair 的 impl 兜底为
+    // 调两次 matvec_f16（数值不变）。
+    using MatvecPairF16Fn = void (*)(const uint16_t *w1, const uint16_t *w2, const float *x,
+                                     float *y1, float *y2, int out_dim, int in_dim);
+
+    void register_matvec_f16_pair_impl(const char *name, MatvecPairF16Fn fn);
+
+    void matvec_pair_f16(const uint16_t *w1, const uint16_t *w2, const float *x,
+                         float *y1, float *y2, int out_dim, int in_dim);
 } // namespace tinyqwen
 
 // 变体自注册宏：写在实现文件末尾、namespace tinyqwen 内部（fn 要用非限定名）。
@@ -61,3 +89,12 @@ namespace tinyqwen {
 #define TINYQWEN_MATVEC_PAIR_VARIANT(fn, name)                                       \
     [[maybe_unused]] static const bool tqwen_reg_pair_##fn =                         \
             (tinyqwen::register_matvec_pair_impl(name, fn), true)
+
+// f16 路径的同款自注册宏（登记进 f16 / f16-pair 注册表）。
+#define TINYQWEN_MATVEC_F16_VARIANT(fn, name)                                        \
+    [[maybe_unused]] static const bool tqwen_reg_f16_##fn =                          \
+            (tinyqwen::register_matvec_f16_impl(name, fn), true)
+
+#define TINYQWEN_MATVEC_F16_PAIR_VARIANT(fn, name)                                   \
+    [[maybe_unused]] static const bool tqwen_reg_f16_pair_##fn =                     \
+            (tinyqwen::register_matvec_f16_pair_impl(name, fn), true)

@@ -180,17 +180,11 @@ int main(int argc, char **argv) {
                      config.size());
     }
 
-    // ---- 解析 matvec 实现：CLI > 配置文件 > 默认 ref ----
+    // ---- 解析 matvec 实现名：CLI > 配置文件 > 默认 ref ----
     // 实现名由各 kernel 文件自注册（dispatch.h），这里只按名字查表——
     // 新增变体不需要改这段代码。
     std::string impl_name = args.matvec_impl; // 非空 = CLI 显式指定
     if (impl_name.empty()) impl_name = config.get("matvec_impl", "ref");
-    if (!tinyqwen::set_matvec_impl_by_name(impl_name.c_str())) {
-        std::fprintf(stderr, "error: unknown matvec_impl '%s' (available: %s)\n",
-                     impl_name.c_str(), tinyqwen::available_matvec_impls());
-        return 2;
-    }
-    std::fprintf(stderr, "[init] matvec impl: %s\n", tinyqwen::matvec_impl_name());
 
     // ---- 加载权重文件并校验 ----
     tinyqwen::ModelFile file;
@@ -201,9 +195,32 @@ int main(int argc, char **argv) {
     }
     if (args.verbose) file.print_summary();
 
+    // ---- 按模型 dtype 选择 matvec 实现（f32/f16 各有独立注册表）----
+    // 加载模型在前、选实现在后：同一个实现名（如 "ref"/"neon_mt_kv_nt"）
+    // 在两个注册表里各有一份，按文件 dtype 查对应的表——f32 模型配
+    // f16 专属实现（或反过来）会在这里 fail fast，而不是静默兜底。
+    const bool is_f16 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kF16);
+    if (is_f16) {
+        if (!tinyqwen::set_matvec_f16_impl_by_name(impl_name.c_str())) {
+            std::fprintf(stderr,
+                         "error: unknown f16 matvec_impl '%s' (available: %s)\n",
+                         impl_name.c_str(), tinyqwen::available_matvec_f16_impls());
+            return 2;
+        }
+        std::fprintf(stderr, "[init] matvec impl: %s (f16 weights)\n",
+                     tinyqwen::matvec_f16_impl_name());
+    } else {
+        if (!tinyqwen::set_matvec_impl_by_name(impl_name.c_str())) {
+            std::fprintf(stderr, "error: unknown matvec_impl '%s' (available: %s)\n",
+                         impl_name.c_str(), tinyqwen::available_matvec_impls());
+            return 2;
+        }
+        std::fprintf(stderr, "[init] matvec impl: %s\n", tinyqwen::matvec_impl_name());
+    }
+
     // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作。
     tinyqwen::Profiler profiler(!args.profile_out.empty());
-    profiler.set_meta("qwen2.5-0.5b-like", "cpu_ref", "fp32");
+    profiler.set_meta("qwen2.5-0.5b-like", "cpu_ref", is_f16 ? "f16w_fp32a" : "fp32");
 
     // ---- 建模：校验权重、分配 KV cache 和 workspace ----
     std::unique_ptr<tinyqwen::QwenModel> model;

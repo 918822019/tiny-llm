@@ -91,4 +91,81 @@ namespace tinyqwen {
         matvec_f32(w1, x, y1, out_dim, in_dim);
         matvec_f32(w2, x, y2, out_dim, in_dim);
     }
+
+    // ---- f16 路径：与 f32 完全对称的第二套注册表/选择器/入口 ----
+    namespace {
+        std::unordered_map<std::string, MatvecF16Fn> &f16_registry() {
+            static std::unordered_map<std::string, MatvecF16Fn> r;
+            return r;
+        }
+
+        std::unordered_map<std::string, MatvecPairF16Fn> &f16_pair_registry() {
+            static std::unordered_map<std::string, MatvecPairF16Fn> r;
+            return r;
+        }
+
+        MatvecF16Fn g_f16_current = nullptr;
+        std::string g_f16_current_name;
+    } // namespace
+
+    void register_matvec_f16_impl(const char *name, MatvecF16Fn fn) {
+        f16_registry()[name] = fn;
+    }
+
+    bool set_matvec_f16_impl_by_name(const char *name) {
+        const auto &r = f16_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_f16_current = it->second;
+        g_f16_current_name = name;
+        return true;
+    }
+
+    const char *matvec_f16_impl_name() {
+        return g_f16_current_name.empty() ? "ref" : g_f16_current_name.c_str();
+    }
+
+    const char *available_matvec_f16_impls() {
+        static std::string joined;
+        if (joined.empty()) {
+            std::vector<std::string> names;
+            for (const auto &kv : f16_registry()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i) joined += ", ";
+                joined += names[i];
+            }
+        }
+        return joined.c_str();
+    }
+
+    void matvec_f16(const uint16_t *w, const float *x, float *y, int out_dim, int in_dim) {
+        MatvecF16Fn fn = g_f16_current;
+        if (!fn) {
+            auto it = f16_registry().find("ref");
+            if (it == f16_registry().end()) {
+                std::fprintf(stderr,
+                             "tinyqwen: matvec_f16 'ref' 未注册——检查 kernels 是否被整体链接\n");
+                std::abort();
+            }
+            fn = it->second;
+        }
+        fn(w, x, y, out_dim, in_dim);
+    }
+
+    void register_matvec_f16_pair_impl(const char *name, MatvecPairF16Fn fn) {
+        f16_pair_registry()[name] = fn;
+    }
+
+    void matvec_pair_f16(const uint16_t *w1, const uint16_t *w2, const float *x,
+                         float *y1, float *y2, int out_dim, int in_dim) {
+        const auto &pr = f16_pair_registry();
+        auto it = pr.find(matvec_f16_impl_name());
+        if (it != pr.end()) {
+            it->second(w1, w2, x, y1, y2, out_dim, in_dim);
+            return;
+        }
+        matvec_f16(w1, x, y1, out_dim, in_dim);
+        matvec_f16(w2, x, y2, out_dim, in_dim);
+    }
 } // namespace tinyqwen

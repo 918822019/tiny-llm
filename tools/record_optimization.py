@@ -6,10 +6,11 @@
 
 做四件事：
     1. 把 canonical 负载跑 runs 遍，取"中位数的中位数"（复用 tools/bench.py）；
-       带 --extra-args 时自动升级为**同场 A/B**：每遍先测对照（同 binary、
-       无额外参数，当前即 ref）再测变体，交错进行抗慢漂移——
-       vs 历史基线会被机器漂移掩盖，同场 A/B 才是真贡献（见
-       docs/optimization_log.md 的 fp32-float / double_2_float 教训）；
+       带 --extra-args 时自动升级为**同场 A/B**：每遍先测对照再测变体，
+       交错进行抗慢漂移——vs 历史基线会被机器漂移掩盖，同场 A/B 才是真
+       贡献（见 docs/optimization_log.md 的 fp32-float / double_2_float 教训）。
+       对照默认 = 同模型文件、无额外参数（即 ref）；跨配置对照（如 f16
+       模型 vs fp32 最佳栈）用 --control-model / --control-args 显式指定；
     2. 读 benchmarks/baseline.json，自动算 vs 基线加速比（参考用）；
     3. 参照中位偏离基线 >5% 时打印基线漂移警告；
     4. 往 docs/optimization_log.md 追加：汇总表一行 + 详细小节
@@ -47,17 +48,22 @@ def measure(binary: str, model: str, runs: int,
     return statistics.median(medians), statistics.median(p95s), last
 
 
-def measure_ab(binary: str, model: str, runs: int,
-               variant_args: list[str]) -> tuple[float, float, float, float, dict]:
-    """同场 A/B：每遍先测对照（无额外参数）再测变体，交错进行抗慢漂移。
+def measure_ab(binary: str, model: str, runs: int, variant_args: list[str],
+               control_model: str | None = None,
+               control_args: list[str] | None = None) -> tuple[float, float, float, float, dict]:
+    """同场 A/B：每遍先测对照再测变体，交错进行抗慢漂移。
 
     返回 (对照中位, 对照p95, 变体中位, 变体p95, 最后一遍变体统计)。
-    对照语义 = "同 binary、无额外参数"，当前即默认 ref 实现。
+    对照语义 = "同 binary + control_model + control_args"；两者缺省时
+    退化为旧语义（同模型文件、无额外参数，即默认 ref 实现）。
+    跨配置对照（如 fp32 最佳栈 vs f16 模型）用显式参数指定。
     """
+    ctrl_model = control_model or model
+    ctrl_args = control_args or []
     ctrl_meds, ctrl_p95s, var_meds, var_p95s = [], [], [], []
     last_var = None
     for r in range(runs):
-        cs = bench.summarize(bench.run_once(binary, model))
+        cs = bench.summarize(bench.run_once(binary, ctrl_model, ctrl_args))
         vs = bench.summarize(bench.run_once(binary, model, variant_args))
         ctrl_meds.append(cs["decode_median_ms"])
         ctrl_p95s.append(cs["decode_p95_ms"])
@@ -77,7 +83,7 @@ def build_table_row(label, commit, med, p95, vs_base_str, note,
 
 
 def build_detail(label, commit, med, p95, runs, last, vs_prev_str, base_note,
-                 extra_suffix="") -> str:
+                 extra_suffix="", model_prefix="") -> str:
     today = datetime.date.today().isoformat()
     top_ops = "、".join(f"`{o['op']}`" for o in last["top_ops"][:3])
     return f"""### {label}（{today}）
@@ -91,7 +97,7 @@ def build_detail(label, commit, med, p95, runs, last, vs_prev_str, base_note,
 - **验证**：scripts/verify.sh（单测 + golden token 对照）
 - **瓶颈转移**：top op = {top_ops}，下一刀砍哪：<填>
 - **意外 / 教训**：<填——往往最值钱>
-- **复现**：`./scripts/bench.sh {label}{extra_suffix}`
+- **复现**：`{model_prefix}./scripts/bench.sh {label}{extra_suffix}`
 
 ---
 
@@ -130,22 +136,37 @@ def main() -> None:
     ap.add_argument("--extra-args", default="",
                     help="原样传给 runtime 的额外 CLI 参数（引号括起），"
                          "如 '--matvec-impl double_2_float'")
+    ap.add_argument("--control-model", default=None,
+                    help="A/B 对照的模型文件（缺省 = 与 --model 相同）。"
+                         "跨文件对照用，如 f16 变体 vs fp32 最佳栈")
+    ap.add_argument("--control-args", default="",
+                    help="A/B 对照的额外参数（引号括起；缺省 = 无，即默认 ref）")
     args = ap.parse_args()
 
     extra = shlex.split(args.extra_args)
-    # 日志"复现"行要能直接执行：额外参数走 bench.sh 的 --extra-args 通道。
+    control_extra = shlex.split(args.control_args)
+    control_model = args.control_model or args.model
+    # 日志"复现"行要能直接执行：额外参数走 bench.sh 的 --extra-args 通道；
+    # 非默认模型文件走 bench.sh 认的 MODEL 环境变量。
     extra_suffix = f' --extra-args "{args.extra_args.strip()}"' if extra else ""
+    model_prefix = "" if args.model == "model.tqwen" else f"MODEL={args.model} "
 
-    ab_mode = bool(extra)
+    # A/B 模式：变体带额外参数，或显式指定了对照配置（跨文件/跨参数）。
+    ab_mode = bool(extra) or bool(control_extra) or control_model != args.model
     print(f"[record] label={args.label} runs={args.runs}"
           + (f"  额外参数: {' '.join(extra)}（同场 A/B 模式）" if ab_mode else ""))
 
     if ab_mode:
-        # A/B：对照 = 同 binary 无额外参数（当前即 ref）。
         ctrl_med, ctrl_p95, med, p95, last = measure_ab(
-            args.binary, args.model, args.runs, extra)
+            args.binary, args.model, args.runs, extra, control_model, control_extra)
         ab_ratio = ctrl_med / med
-        vs_prev_str = (f"**{ab_ratio:.2f}×（同场 A/B）**——对照（无额外参数，当前即 ref）"
+        # 对照描述：默认对照（同文件无参数）即 ref；跨配置对照写明具体配置。
+        if control_model == args.model and not control_extra:
+            ctrl_desc = "无额外参数，当前即 ref"
+        else:
+            ctrl_desc = f"{control_model}" + (
+                f" + '{args.control_args.strip()}'" if control_extra else "")
+        vs_prev_str = (f"**{ab_ratio:.2f}×（同场 A/B）**——对照（{ctrl_desc}）"
                        f"中位 {ctrl_med:.2f}（p95 {ctrl_p95:.2f}）→ 变体 {med:.2f}，"
                        f"同 binary 同场交错测量")
         vs_prev_col = f"{ab_ratio:.2f}×（同场）"
@@ -171,12 +192,18 @@ def main() -> None:
             vs_prev_str += f"。（vs 基线 {vs_base:.2f}×）"
         # 基线漂移警告：用"参照中位"判断——A/B 模式用对照（它才是与基线
         # 同配置的量），否则用本次结果。>5% 说明机器状态或基线已过期。
-        reference_med = ctrl_med if ab_mode else med
-        drift = (reference_med - base["decode_median_ms"]) / base["decode_median_ms"]
-        if abs(drift) > 0.05:
-            print(f"  ⚠️ 基线漂移警告：参照中位 {reference_med:.2f} vs 基线 "
-                  f"{base['decode_median_ms']:.2f}（偏离 {drift * 100:+.1f}%，>5%）"
-                  f"——考虑重跑 scripts/set_baseline.sh 重建基线")
+        # 注意：仅当对照就是"默认配置"（同文件、无额外参数）时才有可比性；
+        # 跨配置对照（如对照是 fp32 最佳栈）与基线配置不同，跳过漂移检查。
+        default_control = control_model == args.model and not control_extra
+        if ab_mode and not default_control:
+            print("  [info] 跨配置对照，跳过基线漂移检查")
+        else:
+            reference_med = ctrl_med if ab_mode else med
+            drift = (reference_med - base["decode_median_ms"]) / base["decode_median_ms"]
+            if abs(drift) > 0.05:
+                print(f"  ⚠️ 基线漂移警告：参照中位 {reference_med:.2f} vs 基线 "
+                      f"{base['decode_median_ms']:.2f}（偏离 {drift * 100:+.1f}%，>5%）"
+                      f"——考虑重跑 scripts/set_baseline.sh 重建基线")
     else:
         vs_base_str = "基线"
         base_note = f"未找到 {args.baseline}，本次作为基线；请先跑 scripts/set_baseline.sh"
@@ -189,7 +216,7 @@ def main() -> None:
     row = build_table_row(args.label, commit, med, p95, vs_base_str,
                           "<填：一句话归因>", vs_prev_col)
     detail = build_detail(args.label, commit, med, p95, args.runs, last,
-                          vs_prev_str, base_note, extra_suffix)
+                          vs_prev_str, base_note, extra_suffix, model_prefix)
     text = insert_table_row(text, TABLE_MARKER, row)  # 表格行：防断表
     text = insert_before(text, DETAIL_MARKER, detail)
     log_path.write_text(text)

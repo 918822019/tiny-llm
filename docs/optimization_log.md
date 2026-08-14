@@ -26,6 +26,7 @@
 | neon_mt_bal | a323eb7 | 10.07 | 14.42 | 22.11× | ≈1.0×（vs neon_mt，同场） | 自校准加权分块——带宽墙下无 E 核尾巴可消，证伪归档 |
 | neon_mt_kv | d17bc57 | 11.19 | 12.19 | 19.89× | 1.02–1.05×（vs neon_mt，同场 4 块 24 样本） | k/v 成对融合：48 次内联小 matvec 合并成 24 次 fork-join，摊薄+并行 |
 | neon_mt_kv_nt | f4beeb7 | 10.06 | 11.13 | 22.12× | 1.03–1.04×（vs neon_mt_kv，同场） | 权重 LDNP 流式加载（内联汇编 + 对齐兜底）：预期≈0 被证伪，提示真有效且尾部更稳 |
+| f16_neon_mt_kv_nt | c8fba49 | 8.00 | 9.19 | 27.81× | 1.75×（同场 vs fp32 最佳栈） | 权重 f16 量化（流量减半）+ fp32 满栈移植 + 线程甜蜜点 6→8；非 matvec 固定开销 Amdahl 稀释，未到 2× |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -399,6 +400,60 @@
   3. **nt 的尾部明显更稳**：24 样本里 kv 最差 12.46、nt 最差 10.43，p95
      系统性更低——流式加载对后台 cache 抢占的抗干扰是额外赠品。
 - **复现**：`./scripts/bench.sh neon_mt_kv_nt --extra-args "--matvec-impl neon_mt_kv_nt"`
+
+---
+
+### f16_neon_mt_kv_nt（2026-08-14）
+
+- **优化栈**：fp32-baseline +（fp32 路线全部机制）+ **权重 f16 量化**——本步
+  切换赛道：不再优化"读得多快"，而是"少读一半"。实现名 neon_mt_kv_nt 在
+  f16 注册表里是满栈移植版（NEON fp32 累加 + 线程池 + kv 融合 + LDNP），
+  与 f32 同名实现按模型文件 dtype 解析（main 按 dtype 查表，选错 fail fast）。
+- **是什么**：一条完整的 weight-only f16 链路：① exporter `--dtype f16` 导出
+  model_f16.tqwen（942MB，原 1.98GB 的一半，RNE 量化与 C++ 端位操作转换
+  逐位同款）；② loader 接受 f16（单一 dtype 校验）；③ dispatch 新增 f16
+  注册表/入口/pair 兜底；④ runtime dtype 感知：大矩阵 f16 流式，norm/bias
+  小向量 create 期升 fp32（热点路径不改），embed 查表逐行转换；
+  ⑤ kernels：matvec_f16_ref（double 累加标准答案，全平台兜底）+
+  matvec_f16_neon_mt_kv_nt（满栈移植，vld1q_f16/cvt/fp32 FMA）；
+  ⑥ 默认线程数 6→8（P 核+3，见教训 2）。
+- **假设**：减少搬运类。decode 是纯权重带宽瓶颈（fp32 时每 token 读 1.97GB），
+  f16 流量减半，理论端到端 ~2×；且带宽墙后退，多线程空间重新打开。
+- **结果**：decode 中位 **8.00 ms/token**（3 遍取中位，每遍 27 样本），p95 9.19。
+  注：record 时窗机器噪声大（安静时窗同配置测过 6.29–6.99），绝对值参考性弱，
+  以同场比值为准。
+- **vs 上一配置**：**1.75×（同场 A/B）**——对照（model.tqwen fp32 + 最佳栈
+  neon_mt_kv_nt）中位 14.04（p95 15.06）→ 变体 8.00，同 binary 同场交错，
+  逐轮比值 1.64× / 1.76× / 1.76× 方向全一致。（vs 基线 27.81×）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 27.81×
+- **验证**：scripts/verify.sh（47 单测：half↔float 全 65536 位形往返穷举、
+  f16_ref vs 量化后精确值、满栈变体 5 组 shape vs f16_ref、loader f16/混
+  dtype 拒绝、f16 dispatch 选择；golden token 对照 fp32 路径不变）。
+  **量化数值验收**（optimization.md §5）：f16 真模型跑 canonical prompt，
+  标量参考与优化 kernel 下 16 个生成 token 均与 fp32 参考**逐位一致**——
+  量化未翻转任何 greedy 决策（且 top1-top2 logit 间距大）。注意仅覆盖该
+  prompt，长文本生成需另行抽检。
+- **瓶颈转移**：top op = `lm_head`、`topk_argmax`、`layer_10.up_proj`。
+  matvec 占比从 93.9% 降到 ~85%——流量减半后**非 matvec 固定开销显形**
+  （topk_argmax 标量扫 151936 维 ~0.26ms/tok 升到 3%+）。下一刀：
+  topk_argmax/swiglu/attention NEON 化（从零头里抠）；再下一刀 int4
+  （流量再减半，但 0.5B 小模型 int4 的 greedy 翻转风险需要专门验收）。
+- **意外 / 教训**：
+  1. **没到 2×，止于 1.75×——Amdahl 的量化版**：matvec 本体接近 2×，
+     但非 matvec 开销（argmax/attention/rmsnorm/同步）不随流量缩小，
+     占比被动放大。fp32 时代"matvec 占 98%"的舒适区结束了：从这一步起
+     每个非 matvec 算子都值得看一眼。
+  2. **线程甜蜜点右移 6→8**（预测兑现）：流量减半后单核更晚撞份额墙，
+     多 2 个 E 核还能挤带宽；10 线程互踩（8.98 vs 8 线程 6.99）。实测
+     扫描写进了变体代码注释；默认并行度从此是"按 dtype 分别标定"的量。
+  3. **数值验收比预期顺**：f16 的 ~5e-4 相对扰动没翻转任何 greedy 决策，
+     double_2_float 时代验证过的容差余量在这里继续有效。但别外推：
+     更长 prompt/更敏感的生成任务需要抽检，int4 更是要专门过这道门。
+  4. **基建缺口先补再测**（第三次应验）：record 的 A/B 原本只会"同文件
+     vs 无参数对照"，跨文件对照要扩展 --control-model/--control-args
+     （含漂移检查语义：跨配置对照跳过基线漂移检查）。工具链永远是
+     pipeline 的一部分。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_neon_mt_kv_nt --extra-args "--matvec-impl neon_mt_kv_nt"`
 
 ---
 

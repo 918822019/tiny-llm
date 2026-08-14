@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "model_loader.h"
+#include "ref_ops.h" // float_to_half（构造 f16 测试文件用，与 exporter 同款量化）
 
 using namespace tinyqwen;
 
@@ -19,15 +20,18 @@ namespace {
     uint64_t align_up(uint64_t x) { return (x + kAlignment - 1) / kAlignment * kAlignment; }
 
     // 按 exporter 同样的规则写一个合法的 .tqwen 文件，供 loader 测试使用。
+    // dtype：0=f32（T::data 按 float 原样写）；1=f16（T::data 的每个 float
+    // 先经 float_to_half 量化成 2 字节再写，模拟 export --dtype f16）。
     void write_file(const std::string &path, const std::vector<T> &tensors,
-                    bool corrupt_magic = false) {
+                    bool corrupt_magic = false, uint32_t dtype = 0) {
         const uint64_t table_end = sizeof(TinyHeader) + tensors.size() * sizeof(TensorEntry);
         const uint64_t data_offset = align_up(table_end);
+        const size_t elem = dtype == 0 ? 4 : 2;
         std::vector<uint64_t> offsets;
         uint64_t off = data_offset;
         for (const T &t: tensors) {
             offsets.push_back(off);
-            off = align_up(off + t.data.size() * 4);
+            off = align_up(off + t.data.size() * elem);
         }
         const uint64_t total = off;
 
@@ -38,7 +42,7 @@ namespace {
         std::memcpy(h.magic, kMagic, 8);
         if (corrupt_magic) h.magic[0] = 'X';
         h.version = kFormatVersion;
-        h.dtype = 0;
+        h.dtype = dtype;
         h.n_layers = 2;
         h.hidden_size = 4;
         h.intermediate_size = 8;
@@ -59,19 +63,28 @@ namespace {
         for (size_t i = 0; i < tensors.size(); ++i) {
             TensorEntry e{};
             std::snprintf(e.name, sizeof(e.name), "%s", tensors[i].name.c_str());
-            e.dtype = 0;
+            e.dtype = dtype;
             e.ndim = static_cast<uint32_t>(tensors[i].shape.size());
             for (int d = 0; d < 4; ++d) {
                 e.shape[d] = d < static_cast<int>(e.ndim) ? tensors[i].shape[d] : 0;
             }
             e.offset = offsets[i];
-            e.nbytes = tensors[i].data.size() * 4;
+            e.nbytes = tensors[i].data.size() * elem;
             std::fwrite(&e, 1, sizeof(e), f);
         }
 
         for (size_t i = 0; i < tensors.size(); ++i) {
             std::fseek(f, static_cast<long>(offsets[i]), SEEK_SET);
-            std::fwrite(tensors[i].data.data(), 4, tensors[i].data.size(), f);
+            if (dtype == 0) {
+                std::fwrite(tensors[i].data.data(), 4, tensors[i].data.size(), f);
+            } else {
+                // f16：与 exporter 相同的量化路径（float_to_half）。
+                std::vector<uint16_t> half(tensors[i].data.size());
+                for (size_t k = 0; k < half.size(); ++k) {
+                    half[k] = float_to_half(tensors[i].data[k]);
+                }
+                std::fwrite(half.data(), 2, half.size(), f);
+            }
         }
         // 保证文件长度恰为 total（中间的 padding 字节保持为 0）。
         std::fseek(f, static_cast<long>(total) - 1, SEEK_SET);
@@ -174,5 +187,58 @@ TEST (loader_rejects_duplicate_names) {
     std::string err;
     EXPECT_TRUE(!file.load(path, &err));
     EXPECT_TRUE(err.find("duplicate") != std::string::npos);
+    std::remove(path.c_str());
+}
+
+TEST (loader_accepts_f16) {
+    // f16 文件：header/tensor dtype=1、nbytes=元素×2，加载应成功；
+    // 视图按字节给出，量化值经 half_to_float 还原后与导出前一致（在
+    // half 可表示范围内逐位相等——sample 值 0/1/2/.../7、-1、0.5、2.25 全部可精确表示）。
+    const std::string path = "tinyqwen_test_f16.tqwen";
+    write_file(path, sample_tensors(), false, 1);
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(file.load(path, &err));
+    EXPECT_TRUE(err.empty());
+    EXPECT_EQ(file.header().dtype, static_cast<uint32_t>(Dtype::kF16));
+
+    const TensorView *a = file.get("a.weight");
+    EXPECT_TRUE(a != nullptr);
+    EXPECT_TRUE(a->dtype == Dtype::kF16);
+    EXPECT_EQ(a->nbytes, (uint64_t) 6 * 2); // 6 个 half
+    const uint8_t *raw = a->data;
+    for (int i = 0; i < 6; ++i) {
+        uint16_t h;
+        std::memcpy(&h, raw + i * 2, sizeof(h));
+        EXPECT_NEAR(half_to_float(h), (float) i, 0.0);
+    }
+
+    const TensorView *b = file.get("b");
+    EXPECT_TRUE(b != nullptr);
+    uint16_t h3;
+    std::memcpy(&h3, b->data + 3 * 2, sizeof(h3));
+    EXPECT_NEAR(half_to_float(h3), 7.0, 0.0);
+    std::remove(path.c_str());
+}
+
+TEST (loader_rejects_mixed_dtype) {
+    // v1 约定全文件单一 dtype：header 声明 f32 但 tensor 标 f16 必须拒绝。
+    const std::string path = "tinyqwen_test_mixdtype.tqwen";
+    write_file(path, sample_tensors()); // header dtype=0
+
+    // 手工把第一个 tensor 条目的 dtype 改成 1。
+    FILE *f = std::fopen(path.c_str(), "r+b");
+    EXPECT_TRUE(f != nullptr);
+    std::fseek(f, static_cast<long>(sizeof(TinyHeader) + offsetof(TensorEntry, dtype)),
+               SEEK_SET);
+    const uint32_t one = 1;
+    std::fwrite(&one, sizeof(one), 1, f);
+    std::fclose(f);
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(!file.load(path, &err));
+    EXPECT_TRUE(err.find("dtype") != std::string::npos);
     std::remove(path.c_str());
 }
