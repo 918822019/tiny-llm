@@ -207,6 +207,8 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()     
 
 ## 8. 工具速查
 
+### 本地（macOS / Linux）
+
 | 脚本 / 工具 | 职责 | 关键行为 |
 |---|---|---|
 | `scripts/verify.sh` | 正确性门禁 | build + 单测 + golden token 对照，失败即中止 |
@@ -216,6 +218,26 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()     
 | `scripts/commit_opt.sh <label> "总结"` | 规范化提交 | 代码+日志一个 commit；日志最新小节有 `<填...>` 占位会拒绝提交 |
 | `tools/bench.py` | 底层测速 | 固定负载、丢预热、`--runs` 多遍取中位、自动记 commit |
 | `tools/record_optimization.py` | 底层记录 | A/B、漂移警告、写 optimization_log.md |
+
+### Android 端侧
+
+| 脚本 / 工具 | 职责 | 关键行为 |
+|---|---|---|
+| `scripts/build_android.sh` | NDK 交叉编译 | arm64-v8a, android-28, Release |
+| `scripts/verify_android.sh` | 正确性门禁 | push + golden token 对照，与本地同一 GOLDEN |
+| `scripts/bench_android.sh <label> [--extra-args "..."]` | 快速设备测速 | 热门禁 + 绑核 + 标准负载 + 回归检测 |
+| `scripts/record_android.sh <label> [--skip-verify] [--extra-args "..."]` | 正式记录 | 门禁 + 3 遍测速 + 自动写日志；带 extra-args 自动同场 A/B |
+| `scripts/set_baseline_android.sh <label>` | 确立/更新 Android 基线 | 写 `benchmarks/baseline_android.json` |
+| `scripts/run_android.sh` | 手工运行 | push + 单次运行（调试用，非 pipeline） |
+| `tools/bench_android.py` | 底层设备测速 | 热门禁 + 绑核 + adb 执行 + 统计 + 回归检测 |
+| `tools/record_android.py` | 底层记录 | A/B、漂移警告、写 optimization_log.md（标注 Android） |
+
+### 通用工具
+
+| 工具 | 职责 | 关键行为 |
+|---|---|---|
+| `tools/profile_diff.py <before> <after>` | Profile 对比 | op 级 delta + 分类汇总 + top 改善/回退 |
+| `tools/visualize.py all <profile.json>` | 可视化 | 火焰图 + token 时序 + op 占比 + 优化历史趋势，独立 HTML 零依赖 |
 
 ## 9. 当前状态
 

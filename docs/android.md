@@ -96,7 +96,57 @@ vocab 个 fp32，行序 = 位置序；完整语义见 README「CLI 参考」）�
 | 输出乱码 token id            | 确认 prompt 用了 chat template，且 eos 设置正确（默认 151645）                    |
 | 时延抖动大                    | 手机热降频/大小核迁移；v1 不绑核，解读 profile 时看 p50/p95 而不是单次值                     |
 
-## 6. 性能解读注意
+## 6. 性能基准与优化 pipeline
+
+Android 侧有一套完整的优化 pipeline，与本地（macOS）对等：
+
+```bash
+# 正确性门禁（golden token 对照）
+./scripts/verify_android.sh
+
+# 快速单遍测速
+./scripts/bench_android.sh <label> [--extra-args "..."]
+
+# 正式记录：门禁 + 3 遍测速 + 自动写 optimization_log.md
+./scripts/record_android.sh <label> [--skip-verify] [--extra-args "..."]
+
+# 建立 Android 基线
+./scripts/set_baseline_android.sh <label>
+
+# 对比两次 profile（定位 op 级变化）
+python tools/profile_diff.py before.json after.json
+```
+
+### 热门禁（Thermal Gate）
+
+Android 设备热降频是测量抖动的最大来源。bench 默认在每次测量前检查设备温度：
+- 超过阈值（默认 45°C）时等待降温，每 10s 轮询一次
+- 超时 180s 后打印警告继续（不阻塞 pipeline）
+- `--no-thermal-gate` 跳过（快速迭代时用）
+- `--thermal-max 40000` 自定义阈值（单位 millidegree）
+
+### 绑核（Core Pinning）
+
+默认绑大核（`--pin-cores big`），自动检测频率最高的那组 CPU：
+- `--pin-cores all` 不绑核
+- `--pin-cores "4,5,6,7"` 手动指定 CPU 编号
+- 在 adb shell 里通过 `taskset <mask>` 实现
+
+### 回归检测
+
+bench 完成后自动对比 `benchmarks/baseline_android.json`：
+- 本次中位数比基线慢超过 5%（可调 `--regression-threshold`）时打印警告
+- `--fail-on-regression`：回归时非零退出（CI 集成用）
+- `--no-check-regression`：跳过
+
+### A/B 同场对照
+
+`--extra-args` 非空时自动启用——每遍先测对照（ref）再测变体，
+交错抗热降频漂移。方法论与本地一致，见 `optimization.md` §6.3。
+
+基线独立于本地：`benchmarks/baseline_android.json`（设备和 host 数字不可比）。
+
+## 7. 性能解读注意
 
 v1 是单线程 FP32 reference，真机上会很慢——这是预期行为。
 profiling 的目的是建立 op 级基线和占比结构，为后续 INT4/KronQ kernel、

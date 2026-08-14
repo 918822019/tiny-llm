@@ -111,6 +111,13 @@ python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e
 方法论、测量纪律、工具细节全部在 `docs/optimization.md`；
 所有历史数字与当前基线在 `docs/optimization_log.md`（唯一权威）。
 
+看一眼数据长什么样（火焰图 / token 时序 / op 占比 / 优化历史趋势，
+独立 HTML 零依赖）：
+
+```bash
+python tools/visualize.py all profile.json -o viz.html && open viz.html
+```
+
 ## CLI 参考
 
 ```bash

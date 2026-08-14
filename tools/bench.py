@@ -120,6 +120,34 @@ def summarize(profile: dict) -> dict:
     }
 
 
+def check_regression(measured_median: float, baseline_path: str,
+                     threshold_pct: float = 5.0, fail: bool = False) -> bool:
+    """对比 baseline，回退超过 threshold_pct% 时警告。
+
+    返回 True 表示检测到回归。fail=True 时回归会 sys.exit(1)。
+    baseline 不存在时静默跳过（返回 False）。
+    """
+    bp = Path(baseline_path)
+    if not bp.exists():
+        return False
+    try:
+        base = json.loads(bp.read_text())
+        base_med = base["decode_median_ms"]
+    except (json.JSONDecodeError, KeyError):
+        return False
+
+    regression_pct = (measured_median - base_med) / base_med * 100
+    if regression_pct > threshold_pct:
+        print(f"\n  ⚠️ 回归警告：本次 {measured_median:.2f} ms/tok vs 基线 {base_med:.2f} ms/tok"
+              f"（+{regression_pct:.1f}%，阈值 {threshold_pct}%）")
+        print(f"     基线来源：{baseline_path}（label={base.get('label', '?')}）")
+        if fail:
+            print("     --fail-on-regression 已启用，退出")
+            sys.exit(1)
+        return True
+    return False
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -133,6 +161,14 @@ def main() -> None:
     p.add_argument("--extra-args", default="",
                    help="原样传给 binary 的额外 CLI 参数（引号括起），"
                         "如 '--matvec-impl double_2_float'")
+    p.add_argument("--baseline", default="benchmarks/baseline.json",
+                   help="回归检测对比的基线文件")
+    p.add_argument("--no-check-regression", action="store_true",
+                   help="跳过回归检测")
+    p.add_argument("--regression-threshold", type=float, default=5.0,
+                   help="回归阈值百分比（默认 5）")
+    p.add_argument("--fail-on-regression", action="store_true",
+                   help="回归时非零退出（CI 用）")
     args = p.parse_args()
 
     extra = shlex.split(args.extra_args)
@@ -182,6 +218,11 @@ def main() -> None:
     print(f"  | {args.label} | {env['git_commit']} | "
           f"{headline['decode_median_ms']:.2f} | {headline['decode_p95_ms']:.2f} | "
           f"<填写：相比基线的提升> | <填写：原因> |")
+
+    # 回归检测
+    if not args.no_check_regression:
+        check_regression(headline["decode_median_ms"], args.baseline,
+                         args.regression_threshold, args.fail_on_regression)
 
     if args.json:
         Path(args.json).write_text(json.dumps(result, ensure_ascii=False, indent=2))

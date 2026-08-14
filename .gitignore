@@ -15,6 +15,9 @@ models/
 # 运行生成物
 profile*.json
 prompt_tokens.json
+viz.html
+*_viz.html
+benchmarks/.baseline*.json
 
 # Python / 编辑器 / 系统
 __pycache__/
