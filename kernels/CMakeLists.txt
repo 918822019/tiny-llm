@@ -22,6 +22,9 @@ add_library(tinyqwen_kernels OBJECT
         matvec/matvec_f32_neon.cpp
         # neon_mt = neon + 多线程行切分（常驻线程池，仅 aarch64；其他平台编译为空）。
         matvec/matvec_f32_neon_mt.cpp
+        # neon_mt_bal = neon_mt + 自校准加权分块（大小核异构下按实测吞吐分行，
+        # 消慢核尾巴；仅 aarch64）。
+        matvec/matvec_f32_neon_mt_bal.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp
         silu/silu_ref.cpp

@@ -212,3 +212,83 @@ TEST (matvec_neon_mt_matches_ref) {
 
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
+
+TEST (matvec_neon_mt_bal_matches_ref) {
+    // 正确性门禁：neon_mt_bal 只在 aarch64 构建注册；其他平台 skip。
+    // 加权分块改变的是"行归谁算"，行内算法与 neon_mt 逐位一致，所以
+    // 覆盖重点在：不均分（取整边界）、校准收敛过程（多 job 连跑）、
+    // 行数少于线程数（空块 + 首轮均分兜底）。
+    if (!set_matvec_impl_by_name("neon_mt_bal")) {
+        std::printf("[skip] current build has no 'neon_mt_bal' matvec (not aarch64)\n");
+        return;
+    }
+
+    // 1) 并行路径 + 多 job 连跑：out_dim=301 不整除常见线程数，加权
+    //    前缀和取整会有 ±1 行的段；连跑 12 遍压"校准 EMA 逐步收敛"的
+    //    全过程（首 job 均分 -> 测速 -> 加权），每一步都要数值正确。
+    {
+        const int out_dim = 301, in_dim = 4103;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 12; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 2) 不同 shape 交替（校准权重跨 shape 复用，边界计算要对每种
+    //    out_dim 都切得正确）：一个大 shape + 一个中等 shape 交错。
+    {
+        const int in_dim = 4103;
+        std::vector<float> x(in_dim);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        for (const int out_dim : {1000, 257, 1000, 257}) {
+            std::vector<float> w(static_cast<size_t>(out_dim) * in_dim);
+            for (size_t i = 0; i < w.size(); ++i) {
+                w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+            }
+            std::vector<float> y_ref(out_dim), y_var(out_dim);
+            matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 3) 内联路径：权重 0.25MB < 1MB 阈值，单线程直算。
+    {
+        const int out_dim = 16, in_dim = 4103;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    // 4) 极端：行数（3）少于线程数——多数线程空块、耗时 0，首轮校准的
+    //    "空块用最小测量兜底"分支与空块跳过更新分支都要经得起。
+    {
+        const int out_dim = 3, in_dim = 100003;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.0625f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.0625f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 4; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}
