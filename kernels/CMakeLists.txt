@@ -10,7 +10,11 @@
 # （见 runtime/CMakeLists.txt 注释），两者共同保证注册器必然生效。
 add_library(tinyqwen_kernels OBJECT
         rmsnorm/rmsnorm_ref.cpp
+        # rmsnorm NEON 变体（float 累加平方和 + 向量化缩放；仅 aarch64，其他平台编译为空）。
+        rmsnorm/rmsnorm_neon.cpp
         rope/rope_ref.cpp
+        # rope NEON 变体（cos/sin 表与 ref 逐字相同，旋转循环向量化；仅 aarch64）。
+        rope/rope_neon.cpp
         matvec/matvec_f32_ref.cpp
         # f16 权重族：参考实现（所有平台，f16 模型的正确性基准 + 兜底）。
         matvec/matvec_f16_ref.cpp
@@ -38,8 +42,15 @@ add_library(tinyqwen_kernels OBJECT
         matvec/matvec_f32_neon_mt_kv_nt.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp
+        # attention NEON 变体（online softmax 结构不变，点积 + oh 更新向量化；仅 aarch64）。
+        attention/attention_decode_neon.cpp
         silu/silu_ref.cpp
+        # swiglu 融合：ref（全平台，正确性锚点 + 兜底）+ NEON（向量化 exp；仅 aarch64）。
+        silu/swiglu_ref.cpp
+        silu/swiglu_neon.cpp
         argmax/argmax_ref.cpp
+        # argmax NEON 变体（两遍法：NEON 求 max + NEON 找首个相等下标，与 ref 逐位一致；仅 aarch64）。
+        argmax/argmax_neon.cpp
         dispatch.cpp
 )
 target_include_directories(tinyqwen_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

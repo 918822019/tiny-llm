@@ -215,4 +215,112 @@ namespace tinyqwen {
         matvec_f16(wq, x, yq, q_dim, in_dim);
         matvec_pair_f16(wk, wv, x, yk, yv, kv_dim, in_dim);
     }
+
+    // ---- 非 matvec 算子分发 ----
+    namespace {
+        std::unordered_map<std::string, RmsnormFn> &rmsnorm_registry() {
+            static std::unordered_map<std::string, RmsnormFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, RopeFn> &rope_registry() {
+            static std::unordered_map<std::string, RopeFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, AttentionDecodeFn> &attention_registry() {
+            static std::unordered_map<std::string, AttentionDecodeFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, SwigluFn> &swiglu_registry() {
+            static std::unordered_map<std::string, SwigluFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, ArgmaxFn> &argmax_registry() {
+            static std::unordered_map<std::string, ArgmaxFn> r;
+            return r;
+        }
+
+        // 五个算子共用的当前实现名。空 = 未显式选择，通用入口兜底到 _ref。
+        std::string g_ops_name;
+    } // namespace
+
+    void register_rmsnorm_impl(const char *name, RmsnormFn fn) { rmsnorm_registry()[name] = fn; }
+    void register_rope_impl(const char *name, RopeFn fn) { rope_registry()[name] = fn; }
+    void register_attention_decode_impl(const char *name, AttentionDecodeFn fn) {
+        attention_registry()[name] = fn;
+    }
+    void register_swiglu_impl(const char *name, SwigluFn fn) { swiglu_registry()[name] = fn; }
+    void register_argmax_impl(const char *name, ArgmaxFn fn) { argmax_registry()[name] = fn; }
+
+    bool set_ops_impl_by_name(const char *name) {
+        // "ref" = 兜底默认：清空当前名（通用入口自动落回各自 _ref），恒接受。
+        if (std::string(name) == "ref") {
+            g_ops_name.clear();
+            return true;
+        }
+        // 其余名字：只要任一算子注册了该名就接受（允许"部分算子有变体、
+        // 其余兜底 ref"）。
+        const std::string n = name;
+        const bool any = rmsnorm_registry().count(n) || rope_registry().count(n) ||
+                         attention_registry().count(n) || swiglu_registry().count(n) ||
+                         argmax_registry().count(n);
+        if (!any) return false;
+        g_ops_name = n;
+        return true;
+    }
+
+    const char *ops_impl_name() { return g_ops_name.empty() ? "ref" : g_ops_name.c_str(); }
+
+    void rmsnorm(const float *x, const float *weight, float *y, int n, float eps) {
+        const auto &r = rmsnorm_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(x, weight, y, n, eps);
+            return;
+        }
+        rmsnorm_ref(x, weight, y, n, eps); // 兜底：数值锚点
+    }
+
+    void rope(float *q, float *k, int n_heads, int n_kv_heads, int head_dim, int pos,
+              float theta) {
+        const auto &r = rope_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(q, k, n_heads, n_kv_heads, head_dim, pos, theta);
+            return;
+        }
+        rope_ref(q, k, n_heads, n_kv_heads, head_dim, pos, theta);
+    }
+
+    void attention_decode(const float *q, const float *k_cache, const float *v_cache,
+                          int seq_len, int max_seq_len, int n_heads, int n_kv_heads,
+                          int head_dim, float scale, float *out) {
+        const auto &r = attention_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(q, k_cache, v_cache, seq_len, max_seq_len, n_heads, n_kv_heads, head_dim,
+                       scale, out);
+            return;
+        }
+        attention_decode_ref(q, k_cache, v_cache, seq_len, max_seq_len, n_heads, n_kv_heads,
+                             head_dim, scale, out);
+    }
+
+    void swiglu(float *gate, const float *up, int n) {
+        const auto &r = swiglu_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(gate, up, n);
+            return;
+        }
+        swiglu_ref(gate, up, n);
+    }
+
+    int argmax(const float *logits, int n) {
+        const auto &r = argmax_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            return it->second(logits, n);
+        }
+        return argmax_ref(logits, n);
+    }
 } // namespace tinyqwen

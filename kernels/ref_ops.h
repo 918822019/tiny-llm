@@ -100,6 +100,11 @@ namespace tinyqwen {
     // SiLU：y = x * sigmoid(x)
     void silu_ref(const float *x, float *y, int n);
 
+    // SwiGLU 融合：gate[i] = silu(gate[i]) * up[i]（就地）。
+    // 等价于先 silu_ref(gate, gate, n) 再逐元素 gate[i] *= up[i]——逐位一致，
+    // 只是合成一个 kernel（它是 FFN 热点，融合后 NEON 变体可单遍完成）。
+    void swiglu_ref(float *gate, const float *up, int n);
+
     // 返回第一个最大值的下标（平局取靠前者）。
     int argmax_ref(const float *logits, int n);
 

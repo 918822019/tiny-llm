@@ -42,6 +42,7 @@ namespace {
         bool no_fuse_qkv = false;
         std::string config; // 配置文件路径（可选）
         std::string matvec_impl; // matvec 实现；空 = 未指定，交给配置/默认值
+        std::string ops_impl; // 非 matvec 算子实现；空 = 未指定，交给配置/默认值
     };
 
     void usage(const char *prog) {
@@ -58,6 +59,8 @@ namespace {
                      "  --eos ID                stop token, default 151645, -1 disables\n"
                      "  --config PATH           key=value config file (CLI flags override it)\n"
                      "  --matvec-impl NAME      matvec kernel: ref (default; neon later)\n"
+                     "  --ops-impl NAME         non-matvec ops (rmsnorm/rope/attention/swiglu/\n"
+                     "                          argmax): ref (default) / neon\n"
                      "  --verbose               model summary + per-token details\n",
                      prog);
     }
@@ -84,6 +87,7 @@ namespace {
             else if (a == "--eos") out->eos = std::atoi(value("--eos").c_str());
             else if (a == "--config") out->config = value("--config");
             else if (a == "--matvec-impl") out->matvec_impl = value("--matvec-impl");
+            else if (a == "--ops-impl") out->ops_impl = value("--ops-impl");
             else if (a == "--no-fuse-gate-up") out->no_fuse_gate_up = true;
             else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
             else if (a == "--verbose") out->verbose = true;
@@ -221,6 +225,21 @@ int main(int argc, char **argv) {
         }
         std::fprintf(stderr, "[init] matvec impl: %s\n", tinyqwen::matvec_impl_name());
     }
+
+    // ---- 选择非 matvec 算子实现（与 dtype 无关，五算子共用一个名）----
+    // 优先级 CLI > 配置 > 默认 ref。"ref" 是兜底行为（不注册、不 set），
+    // 其余名字（如 neon）查五个算子注册表，任一注册即接受、未注册的算子
+    // 自动兜底 ref。
+    std::string ops_name = args.ops_impl;
+    if (ops_name.empty()) ops_name = config.get("ops_impl", "ref");
+    if (ops_name != "ref") {
+        if (!tinyqwen::set_ops_impl_by_name(ops_name.c_str())) {
+            std::fprintf(stderr, "error: unknown ops_impl '%s' (expected: ref / neon)\n",
+                         ops_name.c_str());
+            return 2;
+        }
+    }
+    std::fprintf(stderr, "[init] ops impl: %s\n", tinyqwen::ops_impl_name());
 
     // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作。
     tinyqwen::Profiler profiler(!args.profile_out.empty());

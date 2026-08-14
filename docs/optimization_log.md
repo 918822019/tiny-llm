@@ -28,6 +28,7 @@
 | neon_mt_kv_nt | f4beeb7 | 10.06 | 11.13 | 22.12× | 1.03–1.04×（vs neon_mt_kv，同场） | 权重 LDNP 流式加载（内联汇编 + 对齐兜底）：预期≈0 被证伪，提示真有效且尾部更稳 |
 | f16_neon_mt_kv_nt | c8fba49 | 8.00 | 9.19 | 27.81× | 1.75×（同场 vs fp32 最佳栈） | 权重 f16 量化（流量减半）+ fp32 满栈移植 + 线程甜蜜点 6→8；非 matvec 固定开销 Amdahl 稀释，未到 2× |
 | f16 + qkv/gate_up 融合（**fp16 路线终点**） | 本次 | 6.37 | 6.77 | 36.2× | ≈1.1×（同场 A/B 乘积；跨窗绝对值受噪声污染） | qkv 三路融合 + gate/up 成对融合：fork-join 96→48 次/token。此后 fp16 路线正式关闭（见文末关闭小节） |
+| ops_neon | 2cdbdd0 | 6.35 | 6.87 | 35.08× | 1.05×（同场） | 非 matvec 五算子 NEON 化 + ops dispatch：argmax 10×/attention 2.3×/swiglu 3.1×/rmsnorm 2.5×，profile 合计省 ~0.48ms；非 matvec 开销 694→200µs |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -531,6 +532,49 @@
      跨窗差 40%——**任何调参结论都必须在同窗块状对照里得出**，这次扫描
      整体作废，默认值不动。
 - **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_full_stack --extra-args "--matvec-impl neon_mt_kv_nt"`
+
+---
+
+### ops_neon（2026-08-14）
+
+- **优化栈**：fp32-baseline +（fp32 全部机制）+ 权重 f16 + qkv/gate_up 融合 +
+  **非 matvec 五算子 NEON 化**（fp16 路线关闭小节里列的"剩余小刀"一次性收完）
+- **是什么**：新建 ops dispatch 层（rmsnorm/rope/attention/swiglu/argmax 五个
+  小注册表共享一个实现名，未注册兜底各自 `_ref`，语义同 matvec_pair），新增
+  NEON 变体：argmax 两遍法（NEON 求 max + 找首个相等，**与 ref 逐位一致**）、
+  rmsnorm（4 路 float 累加平方和 + 向量化缩放）、rope（cos/sin 表与 ref 逐字
+  相同、旋转循环向量化）、attention（online softmax 结构不变、点积 + oh 更新
+  向量化）、swiglu（新融合 op：silu 与乘 up 合成单遍 + 多项式逼近 exp）。
+  A/B 开关 `--ops-impl ref|neon`（配置项 ops_impl）。
+- **假设**：指令类。这些算子全是逐元素/短归约的标量循环（argmax 串行 max 依赖、
+  silu 逐个 expf），是 f16 路线关闭账本里 ~15% 非 matvec 开销的主体，SIMD 化
+  应接近线性提速。
+- **结果**：decode 中位 **6.35 ms/token**（3 遍取中位，每遍 27 样本），p95 6.87。
+- **vs 上一配置**：**1.05×（同场 A/B）**——对照（同 binary + `--ops-impl ref`）
+  中位 6.65 → 变体 6.35。注：本时段机器噪声大（单轮散布 6.2-9.1），手工 6 轮
+  双向换序剔除 1 个异常轮后，neon 中位 ~6.42 vs ref ~6.83 ≈ **1.06×**，方向
+  全胜。**算子级归因**（profile 逐算子计时，比端到端干净）：argmax 235→23µs
+  （10.2×）、attention 215→94（2.3×）、swiglu 176→56（3.1×）、rmsnorm ×2
+  36→14（2.5×）、rope 10.6→8.4，目标算子合计省 **~0.48 ms/tok**。（vs 基线 35.08×）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 35.08×
+- **验证**：scripts/verify.sh（54 单测：新增 ops_neon 7 组门禁——argmax 下标
+  逐位相等、rmsnorm/rope/attention/swiglu 容差对齐、swiglu_ref vs 原两步逐位
+  一致）；golden token 在 ops ref/neon 两种配置下均与参考实现**逐位一致**。
+- **瓶颈转移**：top op = `lm_head`、各层 `gate_up_proj`/`down_proj`（全是 matvec，
+  带宽墙内）。非 matvec 开销从 ~694µs 压到 ~200µs。decode 进一步只剩 matvec
+  带宽墙本身 + ~0.2ms 残余非 matvec（attention 尾、kv_append、调度），已无
+  非量化大刀——与"fp16 路线关闭"结论闭环。
+- **意外 / 教训**：
+  1. **argmax 是隐藏大头**：bench 不传 --topk，走的是 greedy 的 argmax_ref
+     分支——一个"看起来 O(n) 很简单"的标量扫描因串行 max 依赖 + 600KB 低吞吐，
+     实测 235µs/tok，是非 matvec 最大单项。NEON 两遍法直接 10×。教训：别凭
+     复杂度猜成本，串行依赖 + 带宽利用率才决定真实耗时。
+  2. **跨窗 profile 对比会被 matvec 漂移污染**：首次对比 ops ref/neon 两份
+     profile 时 matvec 各算子也"变快"了 10-16%——那是两次运行的机器状态差，
+     不是本次改动。算子级归因要用同窗 A/B 或只看目标算子的相对变化。
+  3. 机器噪声大的时段，端到端 A/B 只能给出方向（neon 全胜）+ 量级（~1.05×），
+     精确值信算子级 profile。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh ops_neon --extra-args "--matvec-impl neon_mt_kv_nt --ops-impl neon"`（对照加 `--ops-impl ref`）
 
 ---
 

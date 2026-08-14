@@ -321,7 +321,7 @@ namespace tinyqwen {
             // 2a. attention 前的 RMSNorm。
             {
                 ScopedTimer t(prof, scope("layer_%d.input_layernorm", i));
-                rmsnorm_ref(hidden_.data(), w.input_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
+                rmsnorm(hidden_.data(), w.input_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
             }
             // 2b. q/k/v 投影 + bias。Qwen2/2.5 的 q/k/v 有 bias，且必须加在 RoPE 之前。
             if (fuse_qkv_) {
@@ -348,7 +348,7 @@ namespace tinyqwen {
             // 2c. RoPE 旋转位置编码：把"位置 pos"的信息编进 q/k（v 不需要）。
             {
                 ScopedTimer t(prof, scope("layer_%d.rope", i));
-                rope_ref(q_.data(), k_.data(), n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
+                rope(q_.data(), k_.data(), n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
             }
             // 2d. 把当前 token 的 k/v 追加进 cache。注意必须先 append 再 attend：
             // 当前 token 要能"看到"自己，所以下面 attention 读的 seq_len = pos+1。
@@ -368,9 +368,9 @@ namespace tinyqwen {
             // 2e. attention：当前 q 对 cache 里 [0..pos] 所有位置加权求和。
             {
                 ScopedTimer t(prof, scope("layer_%d.attention", i));
-                attention_decode_ref(q_.data(), kv_.k(static_cast<int>(i)),
-                                     kv_.v(static_cast<int>(i)), pos + 1, max_seq_len_, n_heads,
-                                     n_kv_heads, head_dim, attn_scale, attn_.data());
+                attention_decode(q_.data(), kv_.k(static_cast<int>(i)),
+                                 kv_.v(static_cast<int>(i)), pos + 1, max_seq_len_, n_heads,
+                                 n_kv_heads, head_dim, attn_scale, attn_.data());
             }
             // 2f. 输出投影 o_proj。
             {
@@ -388,7 +388,7 @@ namespace tinyqwen {
             // 2h. FFN 前的 RMSNorm。
             {
                 ScopedTimer t(prof, scope("layer_%d.post_attn_layernorm", i));
-                rmsnorm_ref(hidden_.data(), w.post_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
+                rmsnorm(hidden_.data(), w.post_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
             }
             // 2i. gate 和 up 两个投影（SwiGLU 需要两条支路）。
             if (fuse_gate_up_) {
@@ -405,11 +405,12 @@ namespace tinyqwen {
                 }
             }
             // 2j. SwiGLU 融合：SiLU 只作用在 gate 支路，再和 up 逐元素相乘。
-            // gate_ 就地复用为融合结果，直接喂给 down_proj。
+            // gate_ 就地复用为融合结果，直接喂给 down_proj。swiglu() 走 ops
+            // dispatch：默认兜底 swiglu_ref（= 原两步逐位一致），注册了 NEON
+            // 变体时单遍向量化。
             {
                 ScopedTimer t(prof, scope("layer_%d.swiglu", i));
-                silu_ref(gate_.data(), gate_.data(), inter);
-                for (int j = 0; j < inter; ++j) gate_[j] *= up_[j];
+                swiglu(gate_.data(), up_.data(), inter);
             }
             // 2k. down 投影，把维度从 inter 压回 hidden。
             {
@@ -426,7 +427,7 @@ namespace tinyqwen {
         // ==== 第 3 步：最后的 norm + 投影到词表 ====
         {
             ScopedTimer t(prof, "final_norm");
-            rmsnorm_ref(hidden_.data(), final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
+            rmsnorm(hidden_.data(), final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
         }
         {
             // lm_head：把 hidden 向量投成 vocab 维的 logits（每个词一个分数）。
@@ -444,7 +445,7 @@ namespace tinyqwen {
                 top_k_logits(logits_.data(), vocab, topk_k, topk);
                 next = topk->indices.empty() ? 0 : topk->indices[0];
             } else {
-                next = argmax_ref(logits_.data(), vocab);
+                next = argmax(logits_.data(), vocab);
             }
         }
 
