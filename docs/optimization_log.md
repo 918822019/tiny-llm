@@ -578,6 +578,38 @@
 
 ---
 
+### pipeline 工具链（2026-08-14，infra，非优化）
+
+- **是什么**：**这不是性能优化，是优化 pipeline 工具链本身的建设**。把
+  "怎么测、怎么记录、怎么验证"固化成工具，让后续每个优化（含 Android
+  端侧）都能低成本、可复现、可追溯地走完 verify→bench→record 全流程。
+  commit 7213f49。
+- **为什么是 infra 而非优化**：不改变任何 kernel 的数值行为或运行时性能，
+  decode 延迟不受影响——这也是它不进汇总表的原因（汇总表只记优化栈）。
+- **交付内容**（四块）：
+  1. **Android 端侧 pipeline**（与本地对等）：verify_android.sh（golden token
+     门禁，与本地同一 GOLDEN）/ bench_android.sh / record_android.sh /
+     set_baseline_android.sh；底层 bench_android.py + record_android.py
+     （A/B 同场对照 + 漂移警告 + 自动写日志）。基线独立
+     （benchmarks/baseline_android.json，设备与 host 数字不可比）。
+  2. **测量可靠性**：热门禁（测量前等设备降温，默认 45°C）+ 绑核（taskset
+     绑大核，减少大小核迁移抖动）+ 回归检测（bench 对比 baseline 超阈值
+     报警，--fail-on-regression 供 CI）。
+  3. **profile_diff.py**：两次 profile op 级 delta + 分类汇总 + top 改善/回退。
+  4. **visualize.py**：火焰图 + token 时序 + op 占比 + 优化历史趋势，
+     独立 HTML 零依赖（内嵌 SVG + 原生 JS）。
+- **与测量纪律的关系**：这些工具是 docs/optimization.md 各项纪律的代码化
+  落地——固定负载（复用 bench.py 常量）、同场 A/B（复用 record 逻辑）、
+  golden token 门禁（复用同一 GOLDEN）、数字可追溯（自动记 commit）。
+  Android 侧此前只有手工 adb 命令，现在有了与本地一致的纪律。
+- **验证**：visualize 用最小 DOM stub 冒烟测试四图全部渲染；profile_diff
+  对同一 profile 自比 delta=0；全部 Python 工具 import 通过。Android 侧脚本
+  待真机连接后跑 verify_android.sh 首测。
+- **下一步**：连真机跑 set_baseline_android.sh 建立 Android 基线，此后每个
+  kernel 优化可用 record_android.sh 一键记录端侧数字。
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）
