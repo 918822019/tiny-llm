@@ -168,4 +168,51 @@ namespace tinyqwen {
         matvec_f16(w1, x, y1, out_dim, in_dim);
         matvec_f16(w2, x, y2, out_dim, in_dim);
     }
+
+    // ---- qkv 三路融合 ----
+    namespace {
+        std::unordered_map<std::string, MatvecQkvFn> &qkv_registry() {
+            static std::unordered_map<std::string, MatvecQkvFn> r;
+            return r;
+        }
+
+        std::unordered_map<std::string, MatvecQkvF16Fn> &qkv_f16_registry() {
+            static std::unordered_map<std::string, MatvecQkvF16Fn> r;
+            return r;
+        }
+    } // namespace
+
+    void register_matvec_qkv_impl(const char *name, MatvecQkvFn fn) {
+        qkv_registry()[name] = fn;
+    }
+
+    void matvec_qkv_f32(const float *wq, const float *wk, const float *wv,
+                        const float *x, float *yq, float *yk, float *yv,
+                        int q_dim, int kv_dim, int in_dim) {
+        const auto &r = qkv_registry();
+        auto it = r.find(matvec_impl_name());
+        if (it != r.end()) {
+            it->second(wq, wk, wv, x, yq, yk, yv, q_dim, kv_dim, in_dim);
+            return;
+        }
+        matvec_f32(wq, x, yq, q_dim, in_dim);
+        matvec_pair_f32(wk, wv, x, yk, yv, kv_dim, in_dim);
+    }
+
+    void register_matvec_qkv_f16_impl(const char *name, MatvecQkvF16Fn fn) {
+        qkv_f16_registry()[name] = fn;
+    }
+
+    void matvec_qkv_f16(const uint16_t *wq, const uint16_t *wk, const uint16_t *wv,
+                        const float *x, float *yq, float *yk, float *yv,
+                        int q_dim, int kv_dim, int in_dim) {
+        const auto &r = qkv_f16_registry();
+        auto it = r.find(matvec_f16_impl_name());
+        if (it != r.end()) {
+            it->second(wq, wk, wv, x, yq, yk, yv, q_dim, kv_dim, in_dim);
+            return;
+        }
+        matvec_f16(wq, x, yq, q_dim, in_dim);
+        matvec_pair_f16(wk, wv, x, yk, yv, kv_dim, in_dim);
+    }
 } // namespace tinyqwen

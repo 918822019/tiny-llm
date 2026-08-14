@@ -38,6 +38,8 @@ namespace {
         int topk = 0;
         int eos = 151645; // Qwen2.5 的 im_end；传 -1 禁用
         bool verbose = false;
+        bool no_fuse_gate_up = false;
+        bool no_fuse_qkv = false;
         std::string config; // 配置文件路径（可选）
         std::string matvec_impl; // matvec 实现；空 = 未指定，交给配置/默认值
     };
@@ -82,6 +84,8 @@ namespace {
             else if (a == "--eos") out->eos = std::atoi(value("--eos").c_str());
             else if (a == "--config") out->config = value("--config");
             else if (a == "--matvec-impl") out->matvec_impl = value("--matvec-impl");
+            else if (a == "--no-fuse-gate-up") out->no_fuse_gate_up = true;
+            else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
                 usage(argv[0]);
@@ -239,6 +243,13 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "error: empty token list\n");
         return 2;
     }
+    // 融合开关：CLI > 配置文件 > 默认 true。
+    const bool fuse_gate_up = args.no_fuse_gate_up ? false
+                              : config.get("fuse_gate_up", "true") != "false";
+    const bool fuse_qkv = args.no_fuse_qkv ? false
+                           : config.get("fuse_qkv", "true") != "false";
+    model->set_fuse_gate_up(fuse_gate_up);
+    model->set_fuse_qkv(fuse_qkv);
     model->set_prompt_len(static_cast<int>(tokens.size()));
 
     FILE *logits_out = nullptr;

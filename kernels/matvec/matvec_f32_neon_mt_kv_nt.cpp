@@ -174,11 +174,16 @@ namespace tinyqwen {
     struct RowPool {
       const float *w = nullptr;
       const float *w2 = nullptr;
+      const float *w3 = nullptr;
       const float *x = nullptr;
       float *y = nullptr;
       float *y2 = nullptr;
+      float *y3 = nullptr;
       int out_dim = 0;
       int in_dim = 0;
+      int qkv_q_dim = 0;
+      int qkv_kv_dim = 0;
+      enum Mode { kSingle, kPair, kQkv } mode = kSingle;
       bool pair = false;
 
       std::atomic<std::uint64_t> job_gen{0};
@@ -217,15 +222,30 @@ namespace tinyqwen {
 
       void do_chunk(int idx) const {
         const int p = static_cast<int>(workers.size()) + 1;
-        const int total = pair ? 2 * out_dim : out_dim;
+        int total;
+        if (mode == kQkv) total = qkv_q_dim + 2 * qkv_kv_dim;
+        else total = pair ? 2 * out_dim : out_dim;
         const int base = total / p;
         const int rem = total % p;
         const int begin = idx * base + (idx < rem ? idx : rem);
         const int end = begin + base + (idx < rem ? 1 : 0);
         for (int r = begin; r < end; ++r) {
-          const int o = pair && r >= out_dim ? r - out_dim : r;
-          const float *wm = pair && r >= out_dim ? w2 : w;
-          float *ym = pair && r >= out_dim ? y2 : y;
+          const float *wm;
+          float *ym;
+          int o;
+          if (mode == kQkv) {
+            if (r < qkv_q_dim) {
+              o = r; wm = w; ym = y;
+            } else if (r < qkv_q_dim + qkv_kv_dim) {
+              o = r - qkv_q_dim; wm = w2; ym = y2;
+            } else {
+              o = r - qkv_q_dim - qkv_kv_dim; wm = w3; ym = y3;
+            }
+          } else if (pair && r >= out_dim) {
+            o = r - out_dim; wm = w2; ym = y2;
+          } else {
+            o = r; wm = w; ym = y;
+          }
           const float *row = wm + static_cast<size_t>(o) * in_dim;
           ym[o] = dot_row(row, x, in_dim);
         }
@@ -247,6 +267,7 @@ namespace tinyqwen {
         out_dim = out_dim_;
         in_dim = in_dim_;
         pair = false;
+        mode = kSingle;
         publish_and_run();
       }
 
@@ -260,6 +281,25 @@ namespace tinyqwen {
         out_dim = out_dim_;
         in_dim = in_dim_;
         pair = true;
+        mode = kPair;
+        publish_and_run();
+      }
+
+      void run_qkv(const float *wq_, const float *wk_, const float *wv_,
+                   const float *x_, float *yq_, float *yk_, float *yv_,
+                   int q_dim_, int kv_dim_, int in_dim_) {
+        w = wq_;
+        w2 = wk_;
+        w3 = wv_;
+        x = x_;
+        y = yq_;
+        y2 = yk_;
+        y3 = yv_;
+        qkv_q_dim = q_dim_;
+        qkv_kv_dim = kv_dim_;
+        in_dim = in_dim_;
+        pair = false;
+        mode = kQkv;
         publish_and_run();
       }
     };
@@ -304,9 +344,24 @@ namespace tinyqwen {
     p.run_pair(w1, w2, x, y1, y2, out_dim, in_dim);
   }
 
-  // 自注册：matvec 主入口 + pair 入口同名登记。仅 aarch64 构建存在。
+  void matvec_qkv_f32_neon_mt_kv_nt(const float *wq, const float *wk, const float *wv,
+                                    const float *x, float *yq, float *yk, float *yv,
+                                    int q_dim, int kv_dim, int in_dim) {
+    RowPool &p = pool();
+    const std::size_t total_rows = static_cast<size_t>(q_dim) + 2 * kv_dim;
+    if (total_rows * in_dim < kMinParallelElems || p.workers.empty()) {
+      matvec_inline(wq, x, yq, q_dim, in_dim);
+      matvec_inline(wk, x, yk, kv_dim, in_dim);
+      matvec_inline(wv, x, yv, kv_dim, in_dim);
+      return;
+    }
+    p.run_qkv(wq, wk, wv, x, yq, yk, yv, q_dim, kv_dim, in_dim);
+  }
+
+  // 自注册：matvec 主入口 + pair 入口 + qkv 入口同名登记。仅 aarch64 构建存在。
   TINYQWEN_MATVEC_VARIANT(matvec_f32_neon_mt_kv_nt, "neon_mt_kv_nt");
   TINYQWEN_MATVEC_PAIR_VARIANT(matvec_pair_f32_neon_mt_kv_nt, "neon_mt_kv_nt");
+  TINYQWEN_MATVEC_QKV_VARIANT(matvec_qkv_f32_neon_mt_kv_nt, "neon_mt_kv_nt");
 } // namespace tinyqwen
 
 #endif // defined(__aarch64__) || defined(_M_ARM64)

@@ -40,6 +40,8 @@ namespace tinyqwen {
 
         void reset(); // 清空 KV cache 和 token 计数（开始新的一段对话）
         void set_prompt_len(int n) { prompt_len_ = n; } // 让 profiler 知道哪些是 prefill
+        void set_fuse_gate_up(bool v) { fuse_gate_up_ = v; }
+        void set_fuse_qkv(bool v) { fuse_qkv_ = v; }
 
         const ModelConfig &config() const { return cfg_; }
         Dtype dtype() const { return dtype_; } // 权重精度（f32 / f16）
@@ -86,9 +88,13 @@ namespace tinyqwen {
         void mv(const void *w, const float *x, float *y, int out_dim, int in_dim) const;
         void mv_pair(const void *w1, const void *w2, const float *x, float *y1, float *y2,
                      int out_dim, int in_dim) const;
+        void mv_qkv(const void *wq, const void *wk, const void *wv, const float *x,
+                    float *yq, float *yk, float *yv, int q_dim, int kv_dim, int in_dim) const;
 
         ModelConfig cfg_{};
         Profiler *profiler_ = nullptr;
+        bool fuse_gate_up_ = true;
+        bool fuse_qkv_ = true;
         int prompt_len_ = 0;
         int token_count_ = 0;
         int q_dim_ = 0; // query 总维度 = n_heads * head_dim

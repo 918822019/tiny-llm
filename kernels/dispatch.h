@@ -74,6 +74,25 @@ namespace tinyqwen {
 
     void matvec_pair_f16(const uint16_t *w1, const uint16_t *w2, const float *x,
                          float *y1, float *y2, int out_dim, int in_dim);
+
+    // ---- qkv 三路融合：q + k + v 共享输入向量，一次 fork-join ----
+    // q_dim 和 kv_dim 可以不同（Qwen: 896 vs 128）。
+    // 兜底：matvec(q) + matvec_pair(k,v)。
+    using MatvecQkvFn = void (*)(const float *wq, const float *wk, const float *wv,
+                                 const float *x, float *yq, float *yk, float *yv,
+                                 int q_dim, int kv_dim, int in_dim);
+    void register_matvec_qkv_impl(const char *name, MatvecQkvFn fn);
+    void matvec_qkv_f32(const float *wq, const float *wk, const float *wv,
+                        const float *x, float *yq, float *yk, float *yv,
+                        int q_dim, int kv_dim, int in_dim);
+
+    using MatvecQkvF16Fn = void (*)(const uint16_t *wq, const uint16_t *wk, const uint16_t *wv,
+                                    const float *x, float *yq, float *yk, float *yv,
+                                    int q_dim, int kv_dim, int in_dim);
+    void register_matvec_qkv_f16_impl(const char *name, MatvecQkvF16Fn fn);
+    void matvec_qkv_f16(const uint16_t *wq, const uint16_t *wk, const uint16_t *wv,
+                        const float *x, float *yq, float *yk, float *yv,
+                        int q_dim, int kv_dim, int in_dim);
 } // namespace tinyqwen
 
 // 变体自注册宏：写在实现文件末尾、namespace tinyqwen 内部（fn 要用非限定名）。
@@ -98,3 +117,12 @@ namespace tinyqwen {
 #define TINYQWEN_MATVEC_F16_PAIR_VARIANT(fn, name)                                   \
     [[maybe_unused]] static const bool tqwen_reg_f16_pair_##fn =                     \
             (tinyqwen::register_matvec_f16_pair_impl(name, fn), true)
+
+// qkv 三路融合的自注册宏。
+#define TINYQWEN_MATVEC_QKV_VARIANT(fn, name)                                        \
+    [[maybe_unused]] static const bool tqwen_reg_qkv_##fn =                          \
+            (tinyqwen::register_matvec_qkv_impl(name, fn), true)
+
+#define TINYQWEN_MATVEC_QKV_F16_VARIANT(fn, name)                                    \
+    [[maybe_unused]] static const bool tqwen_reg_qkv_f16_##fn =                      \
+            (tinyqwen::register_matvec_qkv_f16_impl(name, fn), true)

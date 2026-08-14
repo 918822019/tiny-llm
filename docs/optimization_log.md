@@ -27,6 +27,7 @@
 | neon_mt_kv | d17bc57 | 11.19 | 12.19 | 19.89× | 1.02–1.05×（vs neon_mt，同场 4 块 24 样本） | k/v 成对融合：48 次内联小 matvec 合并成 24 次 fork-join，摊薄+并行 |
 | neon_mt_kv_nt | f4beeb7 | 10.06 | 11.13 | 22.12× | 1.03–1.04×（vs neon_mt_kv，同场） | 权重 LDNP 流式加载（内联汇编 + 对齐兜底）：预期≈0 被证伪，提示真有效且尾部更稳 |
 | f16_neon_mt_kv_nt | c8fba49 | 8.00 | 9.19 | 27.81× | 1.75×（同场 vs fp32 最佳栈） | 权重 f16 量化（流量减半）+ fp32 满栈移植 + 线程甜蜜点 6→8；非 matvec 固定开销 Amdahl 稀释，未到 2× |
+| f16 + qkv/gate_up 融合（**fp16 路线终点**） | 本次 | 6.37 | 6.77 | 36.2× | ≈1.1×（同场 A/B 乘积；跨窗绝对值受噪声污染） | qkv 三路融合 + gate/up 成对融合：fork-join 96→48 次/token。此后 fp16 路线正式关闭（见文末关闭小节） |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -454,6 +455,82 @@
      （含漂移检查语义：跨配置对照跳过基线漂移检查）。工具链永远是
      pipeline 的一部分。
 - **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_neon_mt_kv_nt --extra-args "--matvec-impl neon_mt_kv_nt"`
+
+---
+
+### f16_qkv_gateup_fusion（2026-08-14）
+
+- **优化栈**：fp32-baseline +（fp32 全部机制）+ 权重 f16 + **qkv 三路融合 + gate/up 成对融合**
+- **是什么**：两处调用粒度融合，把每 token 的 fork-join 次数从 96 降到 48：
+  ① **gate/up 成对融合**：FFN 的 gate_proj 和 up_proj 共享输入 normed_ 且维度
+  相同 [4864,896]，合并为一次 `mv_pair`——零新基建，直接复用现有 pair 机制；
+  ② **qkv 三路融合**：q_proj [896,896] 与 k/v [128,896] out_dim 不同，pair API
+  不适用，新增 dispatch qkv 入口（`matvec_qkv_f32/f16`，兜底 = mv(q) + pair(k,v)，
+  未注册的 impl 行为不变）；kernel 侧 RowPool 新增 kQkv 模式，总行数
+  q_dim+2×kv_dim=1152 一次 fork-join 均分给线程池。A/B 开关：
+  `--no-fuse-gate-up` / `--no-fuse-qkv`（配置项 fuse_gate_up / fuse_qkv）。
+- **假设**：调度类。fork-join 自旋唤醒延迟实测 ~15-20µs/次（远超此前 <1µs
+  的估计），每 token 省 48 次同步应省 ~0.7-1ms。
+- **结果**：decode 中位 **6.37 ms/token**（安静窗口 runs=3 取中位，p95 6.77）。
+- **vs 上一配置**：**≈1.1×（同场 A/B 乘积）**——两个融合各自做块状对照
+  （4 轮双向换序）：gate_up ON 赢 7/8 轮（可靠轮 1.04-1.07×），qkv ON 赢
+  5/8 轮（剔除漂移污染轮 1.05-1.06×）。注意：当天机器噪声大，跨窗绝对值
+  不可比（同一配置跨窗散布 5.6-8.9）；融合前的安静窗数字（6.29-6.99）与
+  融合后 6.37 有重叠，真实收益只认同场比值。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 36.2×
+- **验证**：47 单测全过；三种融合开关组合（全开 / qkv 关 / 全关）golden
+  token 16 个**逐位一致**——qkv 的行映射与 pair 的行内点积数学等价。
+- **瓶颈转移**：top op = `lm_head`（29%）、`topk_argmax`（4.2%）、
+  `gate_up_proj`（24%）。非 matvec 开销显形，见下方关闭小节。
+- **意外 / 教训**：
+  1. **同步开销比估计大一个量级**：原以为 fork-join <1µs、两个融合合计
+     只值 0.15%；实测各值 4-7%。自旋唤醒 + cache-line 乒乓在 170+ 次/token
+     的调用频率下是真实成本。教训：调用粒度类优化的预期要用实测同步成本
+     算，别用理论值。
+  2. **噪声窗的 A/B 只能靠多轮一致性立住**：单轮比值在 ±10% 里乱跳，
+     靠"ON 从不系统性输"的方向一致性下结论——与 neon_mt_kv 条目同款方法。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_fusion --extra-args "--matvec-impl neon_mt_kv_nt"`（对照加 `--no-fuse-gate-up --no-fuse-qkv`）
+
+---
+
+### fp16 路线关闭（2026-08-14，结论记录，非优化）
+
+- **是什么**：**这不是优化，是路线关闭结论**。fp16 满栈（NEON fp32 累加 +
+  线程池 + kv/qkv/gate_up 融合 + LDNP）实测 **6.37 ms/token**，判定已抵达
+  带宽墙，fp16（不降 bit）路线的 decode 优化正式关闭。
+- **带宽墙账本**：
+
+  | 项 | 数值 |
+  |---|---|
+  | f16 权重流量/token | 942 MB |
+  | 实测整机带宽（neon_mt 条目） | ~199 GB/s |
+  | 理论下限 | 942 ÷ 199 ≈ **4.7 ms/tok** |
+  | 当前实测 | 6.37 ms/tok |
+  | 剩余 gap | ~1.7 ms（非 matvec 固定开销） |
+
+  gap 构成（每 token）：topk_argmax 0.27ms（标量扫 151936 维）+
+  attention/rmsnorm/rope/swiglu/bias ~0.7ms + 剩余同步/调度 ~0.7ms。
+- **为什么没有大刀了**：decode 延迟 = 权重流量 ÷ 内存带宽。不降 bit 时
+  分子（模型×dtype 固定）和分母（硬件带宽上限）都是常数，可优化面只剩
+  常数旁边的 ~15% 开销。这是 batch=1 autoregressive decode 的物理形态
+  （计算强度 ≈ 1 FLOP/byte，永远带宽受限），不是实现不努力。
+- **剩余小刀与天花板**（列出来供将来决策，不建议现在做）：
+  ① topk_argmax NEON 化（省 ~0.15ms）；② attention/rmsnorm/swiglu NEON 化
+  （合计省 ~0.3-0.5ms）；③ 线程甜蜜点复扫（融合后未确认，当日扫描被
+  噪声污染作废，默认 8 保持）。全部做完最乐观 ~5.3-5.5 ms/tok，然后
+  撞死在 4.7 地板。
+- **要继续提速必须打破某个假设**：量化（流量÷N，int4 理论 ~1.5ms/tok，
+  需 greedy 翻转审计）、speculative decoding（少生成，v1 排除）、
+  batched prefill（prefill 是 matmul 计算受限形态，另一片空间）、
+  换硬件（GPU/ANE）。
+- **意外 / 教训**：
+  1. **能拿着数据说"到此为止"是测量纪律的产出**：归因阶梯把每层贡献
+     拆清（FMA≈0、均衡≈0、nt 3-4% 都是测出来的证伪/证实），带宽墙有
+     实测锚点，所以关闭结论是可辩护的，而不是"做不动了"。
+  2. 线程复扫的教训：跨窗扫描（7/8/9/10 线程）散布 5.6-8.9ms，同一配置
+     跨窗差 40%——**任何调参结论都必须在同窗块状对照里得出**，这次扫描
+     整体作废，默认值不动。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_full_stack --extra-args "--matvec-impl neon_mt_kv_nt"`
 
 ---
 

@@ -128,6 +128,21 @@ namespace tinyqwen {
         }
     }
 
+    void QwenModel::mv_qkv(const void *wq, const void *wk, const void *wv, const float *x,
+                           float *yq, float *yk, float *yv, int q_dim, int kv_dim,
+                           int in_dim) const {
+        if (dtype_ == Dtype::kF16) {
+            matvec_qkv_f16(static_cast<const uint16_t *>(wq),
+                           static_cast<const uint16_t *>(wk),
+                           static_cast<const uint16_t *>(wv), x, yq, yk, yv,
+                           q_dim, kv_dim, in_dim);
+        } else {
+            matvec_qkv_f32(static_cast<const float *>(wq), static_cast<const float *>(wk),
+                           static_cast<const float *>(wv), x, yq, yk, yv,
+                           q_dim, kv_dim, in_dim);
+        }
+    }
+
     // 工厂：绑定权重视图、校验每个 tensor、初始化 KV cache 和 workspace。
     // 所有失败经 *err 报告；成功后 *out 持有一个可直接运行的模型。
     bool QwenModel::create(const ModelFile &file, int max_seq_len, Profiler &profiler,
@@ -309,22 +324,26 @@ namespace tinyqwen {
                 rmsnorm_ref(hidden_.data(), w.input_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
             }
             // 2b. q/k/v 投影 + bias。Qwen2/2.5 的 q/k/v 有 bias，且必须加在 RoPE 之前。
-            // matvec = 矩阵乘向量：normed_ 过投影矩阵得到 q_/k_/v_。
-            {
-                ScopedTimer t(prof, scope("layer_%d.q_proj", i));
-                mv(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
+            if (fuse_qkv_) {
+                ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
+                mv_qkv(w.q_proj, w.k_proj, w.v_proj, normed_.data(),
+                        q_.data(), k_.data(), v_.data(), q_dim_, kv_dim_, hidden);
                 for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
-            }
-            {
-                // k/v 投影合并成一次成对 matvec：两个小矩阵共享同一个输入
-                // normed_。dispatch 兜底语义 = 分开调两次（未注册 pair 的
-                // impl 行为不变）；注册了 pair 的 impl（neon_mt 系）可以把
-                // 两次 0.45MB 的内联小调用合成一次更大的调用去摊薄/并行。
-                ScopedTimer t(prof, scope("layer_%d.kv_proj", i));
-                mv_pair(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
-                        kv_dim_, hidden);
                 for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
                 for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
+            } else {
+                {
+                    ScopedTimer t(prof, scope("layer_%d.q_proj", i));
+                    mv(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
+                    for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
+                }
+                {
+                    ScopedTimer t(prof, scope("layer_%d.kv_proj", i));
+                    mv_pair(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
+                            kv_dim_, hidden);
+                    for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
+                    for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
+                }
             }
             // 2c. RoPE 旋转位置编码：把"位置 pos"的信息编进 q/k（v 不需要）。
             {
@@ -371,14 +390,19 @@ namespace tinyqwen {
                 ScopedTimer t(prof, scope("layer_%d.post_attn_layernorm", i));
                 rmsnorm_ref(hidden_.data(), w.post_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
             }
-            // 2i. gate 和 up 两个投影并行（SwiGLU 需要两条支路）。
-            {
-                ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
-                mv(w.gate, normed_.data(), gate_.data(), inter, hidden);
-            }
-            {
-                ScopedTimer t(prof, scope("layer_%d.up_proj", i));
-                mv(w.up, normed_.data(), up_.data(), inter, hidden);
+            // 2i. gate 和 up 两个投影（SwiGLU 需要两条支路）。
+            if (fuse_gate_up_) {
+                ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
+                mv_pair(w.gate, w.up, normed_.data(), gate_.data(), up_.data(), inter, hidden);
+            } else {
+                {
+                    ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
+                    mv(w.gate, normed_.data(), gate_.data(), inter, hidden);
+                }
+                {
+                    ScopedTimer t(prof, scope("layer_%d.up_proj", i));
+                    mv(w.up, normed_.data(), up_.data(), inter, hidden);
+                }
             }
             // 2j. SwiGLU 融合：SiLU 只作用在 gate 支路，再和 up 逐元素相乘。
             // gate_ 就地复用为融合结果，直接喂给 down_proj。
