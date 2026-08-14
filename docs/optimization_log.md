@@ -25,6 +25,7 @@
 | neon_mt | 56f51ba | 10.50 | 11.26 | 21.19× | 2.69×（vs neon） | NEON + 常驻线程池行切分（默认 6 线程）：单核带宽 72 GB/s 打满后，多核接力整机带宽 ~199 GB/s；同场 vs ref 21.42× |
 | neon_mt_bal | a323eb7 | 10.07 | 14.42 | 22.11× | ≈1.0×（vs neon_mt，同场） | 自校准加权分块——带宽墙下无 E 核尾巴可消，证伪归档 |
 | neon_mt_kv | d17bc57 | 11.19 | 12.19 | 19.89× | 1.02–1.05×（vs neon_mt，同场 4 块 24 样本） | k/v 成对融合：48 次内联小 matvec 合并成 24 次 fork-join，摊薄+并行 |
+| neon_mt_kv_nt | f4beeb7 | 10.06 | 11.13 | 22.12× | 1.03–1.04×（vs neon_mt_kv，同场） | 权重 LDNP 流式加载（内联汇编 + 对齐兜底）：预期≈0 被证伪，提示真有效且尾部更稳 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -355,6 +356,49 @@
   3. 今日机器整体偏慢偏噪（变体中位 11.2 vs 历史 neon_mt 10.5），
      vs 基线比值参考性弱，一切以同场对照为准。
 - **复现**：`./scripts/bench.sh neon_mt_kv --extra-args "--matvec-impl neon_mt_kv"`
+
+---
+
+### neon_mt_kv_nt（2026-08-14）
+
+- **优化栈**：fp32-baseline + neon_mt_kv_nt（= neon_mt + k/v 融合 + 流式加载；
+  归因阶梯顶层：neon_mt →(kv)→ +nt。bal 已证伪不进栈；与 neon_mt_kv 互斥。
+  真上一配置是 neon_mt_kv，record 的对照是 ref）
+- **是什么**：新增 `kernels/matvec/matvec_f32_neon_mt_kv_nt.cpp`：权重加载从
+  vld1q 换成 **LDNP 内联汇编**（`ldnp q0, q1, [ptr]`，一条指令 32B 非时间
+  加载），x 向量保持普通加载（它是重用的热数据）；LDNP 要求 16B 对齐，
+  逐行检查、不对齐兜底普通路径。其余（4 链 FMA、线程池、pair 融合、阈值）
+  与 neon_mt_kv 一致。
+- **假设**：预期 **≈0，做的是排除法**——decode 权重是纯流式访问（每 token
+  全量读一遍），理论上非时间提示能少污染 cache，但 Apple 硬件预取器极强、
+  且已撞带宽墙（FMA≈0 的前科），加载侧微调大概率归零。测过才能把这块
+  石头从 fp32 路线上搬走。
+- **结果**：decode 中位 **10.06 ms/token**（3 遍取中位，每遍 27 样本），p95 11.13
+- **vs 上一配置**：**1.03–1.04×（vs neon_mt_kv，同场）**——≈0 预期被证伪。
+  4 个 runs=3 块状对照（AC 块 kv 先测、BD 块 nt 先测），逐块 1.08× / 1.01× /
+  1.03× / 1.04×，nt 全胜；合并 24 个 per-run 样本中位数 kv 10.35 vs nt 10.00。
+  record 机制对照是 ref：227.18 → 10.06 = 22.58×（含阶梯全部机制，不是本步
+  贡献）。（vs 基线 22.12×）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 22.12×
+- **验证**：scripts/verify.sh（41 单测：新增 5 组 shape——对齐 LDNP 主路径
+  （in_dim=4104）、非对齐兜底路径（4103）、对齐 pair、对齐内联、6 行空块
+  极端形；二进制 otool 确认 LDNP 真实发射（16 处）；golden token 16 个与
+  ref 逐位一致）
+- **瓶颈转移**：top op = `lm_head`、`topk_argmax`、`layer_20.gate_proj`，
+  结构未变。fp32 路线至此扫完（均衡/调用粒度/加载指令三块石头全部测过）：
+  下一刀 = **量化**（fp16 流量÷2 / int4 流量÷8，带宽瓶颈下唯一剩余的量级
+  空间），次选 topk_argmax/swiglu/attention NEON 化（合计 ~6% 的零头）。
+- **意外 / 教训**：
+  1. **预期≈0 的优化测出 3-4%**：流式提示在 M5 Pro 上真实有效——可能来自
+     L2 污染减少（x/激活的热区不再被 2GB 权重流冲刷）和加载 µop 减半的
+     叠加。本次测量分不开"提示"与"循环重构"两个因素，如实记录不硬归因。
+  2. **先验 codegen 再谈测量**：clang 的 `__builtin_nontemporal_load` 对本
+     工具链的 NEON 向量加载静默丢弃提示（仍发普通 ldp）——若没先查 codegen
+     就"测出≈0"，会把假 no-op 当成真结论归档。指令类优化的第一步永远是
+     反汇编确认指令真的发射了。
+  3. **nt 的尾部明显更稳**：24 样本里 kv 最差 12.46、nt 最差 10.43，p95
+     系统性更低——流式加载对后台 cache 抢占的抗干扰是额外赠品。
+- **复现**：`./scripts/bench.sh neon_mt_kv_nt --extra-args "--matvec-impl neon_mt_kv_nt"`
 
 ---
 

@@ -28,6 +28,9 @@ add_library(tinyqwen_kernels OBJECT
         # neon_mt_kv = neon_mt + k/v 成对融合（共享输入的两个小 matvec 合成一次
         # fork-join；pair 通用入口见 dispatch.h；仅 aarch64）。
         matvec/matvec_f32_neon_mt_kv.cpp
+        # neon_mt_kv_nt = neon_mt_kv + 流式加载（权重 LDNP 内联汇编 + 对齐兜底；
+        # 实验性：带宽墙下的加载侧微调，预期≈0；仅 aarch64）。
+        matvec/matvec_f32_neon_mt_kv_nt.cpp
         softmax/softmax_ref.cpp
         attention/attention_decode_ref.cpp
         silu/silu_ref.cpp

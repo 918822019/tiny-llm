@@ -306,6 +306,105 @@ TEST (matvec_neon_mt_kv_matches_ref) {
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
 
+TEST (matvec_neon_mt_kv_nt_matches_ref) {
+    // 正确性门禁：neon_mt_kv_nt 只在 aarch64 构建注册；其他平台 skip。
+    // LDNP 主路径要求行 16B 对齐——对齐 shape 走 ldnp，非对齐 shape 走
+    // 兜底普通加载，两条路径都要覆盖。
+    if (!set_matvec_impl_by_name("neon_mt_kv_nt")) {
+        std::printf("[skip] current build has no 'neon_mt_kv_nt' matvec (not aarch64)\n");
+        return;
+    }
+    auto fill = [](std::vector<float> &v, float scale) {
+        for (size_t i = 0; i < v.size(); ++i) {
+            v[i] = static_cast<float>((i * 37 % 29) - 14) * scale;
+        }
+    };
+
+    // 1) 对齐 + 并行（LDNP 主路径）：in_dim=4104 = 32×128+8，主循环 32 批
+    //    + 8 个向量尾段；行步长 4104×4 % 16 == 0，逐行对齐成立。
+    {
+        const int out_dim = 301, in_dim = 4104;
+        std::vector<float> w(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w, 0.125f);
+        fill(x, 0.125f);
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 8; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 2) 非对齐 + 并行（兜底路径）：in_dim=4103，第 1 行起行起点 %16 != 0。
+    {
+        const int out_dim = 301, in_dim = 4103;
+        std::vector<float> w(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w, 0.125f);
+        fill(x, 0.125f);
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 2; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 3) 对齐 pair 并行：行映射 + LDNP 同时压。
+    {
+        const int out_dim = 301, in_dim = 4104;
+        std::vector<float> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w1, 0.125f);
+        fill(w2, 0.0625f);
+        fill(x, 0.125f);
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f32_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f32_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 4; ++rep) {
+            matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                            out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) {
+                EXPECT_NEAR(y1[o], r1[o], 5e-3);
+                EXPECT_NEAR(y2[o], r2[o], 5e-3);
+            }
+        }
+    }
+
+    // 4) 对齐内联路径：16×4104 远低于单矩阵阈值。
+    {
+        const int out_dim = 16, in_dim = 4104;
+        std::vector<float> w(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w, 0.125f);
+        fill(x, 0.125f);
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    // 5) 极端：pair 总行数 6 < 线程数；in_dim=100000（对齐、n32 尾段 32），
+    //    数值调小压长链舍入。
+    {
+        const int out_dim = 3, in_dim = 100000;
+        std::vector<float> w1(static_cast<size_t>(out_dim) * in_dim),
+                w2(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        fill(w1, 0.0625f);
+        fill(w2, 0.0625f);
+        fill(x, 0.0625f);
+        std::vector<float> r1(out_dim), r2(out_dim), y1(out_dim), y2(out_dim);
+        matvec_f32_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f32_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        matvec_pair_f32(w1.data(), w2.data(), x.data(), y1.data(), y2.data(),
+                        out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) {
+            EXPECT_NEAR(y1[o], r1[o], 5e-3);
+            EXPECT_NEAR(y2[o], r2[o], 5e-3);
+        }
+    }
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}
+
 TEST (matvec_pair_fallback_matches_ref) {
     // 中性门禁：未注册 pair 的 impl，matvec_pair_f32 必须等价于分开调两次
     // matvec_f32——runtime 改成 pair 调用后，ref 等 impl 的数值行为不变。
