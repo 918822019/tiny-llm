@@ -35,6 +35,7 @@
 | cuda_resident_coal（x86_64 + A10） | 7356481 | 9.16 | 9.81 | N/A（跨机器，基线是 M 系芯片） | 5.17×（vs cuda_resident）；63.94×（同场 vs 本机 ref） | matvec kernel 改合并访存（block-per-row + warp 归约），warp 读权重从 32 条分散 cache line → 1 条满线；CUDA 路线首次逼近带宽地板 |
 | f16_cuda_resident_coal（x86_64 + A10） | 3408267 | 7.68 | 8.14 | N/A（跨机器，基线是 M 系芯片） | 1.18×（vs f32_cuda_coal，同场） | 权重 fp16（流量减半）：理论 2× 被 Amdahl 稀释成 1.18×——时间大头已是固定开销而非带宽，诊断价值大于提速价值 |
 | cuda_resident_coal_ws（x86_64 + A10） | 716d63c | 7.97 | 8.34 | N/A（跨机器，基线是 M 系芯片） | 1.15×（vs cuda_resident_coal，同场） | 砍每调用开销：x/y 常驻 workspace（删 680 次 alloc/free）+ 删冗余 cudaDeviceSynchronize（同步 D2H 已保证完成）；kernel 未动 |
+| f16_cuda_resident_coal_ws（x86_64 + A10） | cf5c805 | 6.54 | 7.01 | N/A（跨机器，基线是 M 系芯片） | 1.19×（vs f16_cuda_coal，同场） | f16 满栈 = f16_cuda_coal + x/y workspace + 删冗余 sync；A10 追平 Mac fp16 满栈量级（6.54 vs 6.35，跨机器仅参照） |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -894,6 +895,46 @@
      拷贝是"每调用必付"的底价，单靠优化单次调用无法再降——必须从"减少
      调用次数"或"批量提交"破局。这为 B（融合）定好了方向。
 - **复现**：`./scripts/bench.sh cuda_resident_coal_ws --extra-args "--matvec-impl cuda_resident_coal_ws"`
+
+---
+
+### f16_cuda_resident_coal_ws（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。跨机器的
+  "vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline + f16_cuda_resident_coal + 砍每调用开销
+  （x/y workspace + 删冗余 sync）= **f16 CUDA 满栈**
+- **是什么**：新增 `kernels/matvec/matvec_f16_cuda_resident_coal_ws.cu`——
+  f32 `cuda_resident_coal_ws` 的 f16 对应版。kernel 与 f16_cuda_resident_coal
+  逐字相同，只把 host 包装的两处开销（每调用 alloc/free、冗余 sync）砍掉。
+  与 f32 版同名注册（"cuda_resident_coal_ws"），按模型 dtype 解析。
+- **假设**：A（砍开销）在 f32 已证 1.15×；f16 配置才是要压过 Mac 的那条，
+  把同款手法移植过来，预期把 7.68 进一步压低。
+- **结果**：decode 中位 **6.54 ms/token**（3 遍取中位，每遍 27 样本），p95 7.01
+- **vs 上一配置**：**1.19×（同场 A/B，vs f16_cuda_coal）**——对照
+  （model_f16.tqwen + cuda_resident_coal）中位 7.76（p95 8.56）→ 变体 6.54，
+  同 binary 同场交错测量。
+- **与 Mac 对照（跨机器，仅参照）**：Mac fp16 满栈（f16+qkv/gate_up 融合+ops
+  NEON）≈ 6.35 ms/tok。A10 这条 CUDA f16 满栈 6.54，**已追平其量级**——
+  且 A10 还没上融合、非 matvec 算子还在 CPU，仍有明确空间。注意两机器不同，
+  此对比只做方向参照，不作结论。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 34.01× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（61 单测全过，含新增
+  `matvec_f16_cuda_resident_coal_ws_matches_ref`：对齐 matvec_f16_ref，
+  workspace 扩容/复用 + 删 sync 后多 shape 交替时序无竞态）；f16 golden
+  token 16 个逐位一致。
+- **瓶颈转移**：top op 不变（lm_head / qkv_proj / topk_argmax）。6.54 里
+  权重读（f16 ~0.99GB）≈1.7ms，剩 ~4.8ms 仍是**每调用三件套**（启动 + H2D +
+  D2H，各 ~170 次/token）——与 f32 版同一个天花板。下一刀 B：**CUDA 融合
+  qkv（三合一）+ gate_up（二合一）**，把 ~170 次 matvec 调用降到 ~100 次，
+  直接减少启动/拷贝次数，目标把 f16 压到 6.35 以下。
+- **意外 / 教训**：
+  1. **移植已验证的优化是高确定性收益**：A 在 f32 证过 1.15×，移植 f16 实测
+     1.19×，量级一致——好优化是可迁移的，不用每次重新怀疑。
+  2. **追平≠超越，跨机器对比要克制**：6.54 vs Mac 6.35 是不同机器的参照，
+     说明"方向对、量级到"，但真正的超越要靠下一步融合在本机实测兑现。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_cuda_resident_coal_ws --extra-args "--matvec-impl cuda_resident_coal_ws"`
 
 ---
 

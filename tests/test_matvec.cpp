@@ -923,3 +923,36 @@ TEST (matvec_cuda_resident_coal_ws_matches_ref) {
 
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认
 }
+
+TEST (matvec_f16_cuda_resident_coal_ws_matches_ref) {
+    // 正确性门禁：f16 cuda_resident_coal_ws 只在 CUDA 构建注册；其他平台 skip。
+    // kernel 与 f16_cuda_resident_coal 逐字相同（已被其测试覆盖），这里压
+    // host 包装改动：workspace 扩容/复用 + 删 sync 后的多 shape 交替时序。
+    // 对齐基准 = f16 族 matvec_f16_ref，权重取 0.125 倍数（half 精确表示）。
+    if (!set_matvec_f16_impl_by_name("cuda_resident_coal_ws")) {
+        std::printf("[skip] current build has no f16 'cuda_resident_coal_ws' matvec (no CUDA toolchain)\n");
+        return;
+    }
+
+    auto check = [](const int out_dim, const int in_dim, int reps) {
+        std::vector<uint16_t> w(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        for (int i = 0; i < static_cast<int>(w.size()); ++i) {
+            w[i] = float_to_half(static_cast<float>((i * 37 % 29) - 14) * 0.125f);
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f16_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < reps; ++rep) {
+            matvec_f16(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    };
+
+    check(16, 4103, 4);
+    check(2000, 4103, 2);  // 触发 d_y 扩容
+    check(8, 67, 4);       // in_dim<256 + 回小 shape
+    check(128, 896, 4);    // k/v_proj 形状，连跑压时序
+
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("ref")); // 恢复默认
+}
