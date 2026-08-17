@@ -24,6 +24,44 @@ namespace tinyqwen {
         float rms_norm_eps = 0.0f;
         float rope_theta = 0.0f;
         bool tied_embeddings = false;
+
+        // --- v2 扩展字段（v1 文件加载后保持默认值，行为与旧版完全一致）---
+        ModelType model_type = ModelType::kQwen2;
+        // Qwen3.5 线性注意力（Gated DeltaNet）层的形状参数。
+        uint32_t linear_num_qk_heads = 0;
+        uint32_t linear_num_v_heads = 0;
+        uint32_t linear_qk_head_dim = 0;
+        uint32_t linear_v_head_dim = 0;
+        uint32_t linear_conv_kernel_dim = 0;
+        // full attention 层的出现间隔：layer i 是 full attention 当且仅当
+        // (i + 1) % full_attention_interval == 0。0 表示全部是 full attention（v1）。
+        uint32_t full_attention_interval = 0;
+        float partial_rotary_factor = 1.0f; // RoPE 只旋转 head_dim 的这一比例
+        uint32_t eos_token_id = 0; // 0 = 未指定，用 CLI 默认
+
+        // --- 量化参数（仅 dtype == kI4 时有意义）---
+        uint32_t quant_group_size = 0; // 0 = 未量化；128 = INT4 典型 group size
+
+        // layer 类型判断。interval == 0（v1）或 model_type == kQwen2 时恒为 false。
+        bool is_linear_layer(uint32_t layer_idx) const {
+            if (full_attention_interval <= 1) return false;
+            return (layer_idx + 1) % full_attention_interval != 0;
+        }
+
+        int n_full_layers() const {
+            if (full_attention_interval <= 1) return static_cast<int>(n_layers);
+            return static_cast<int>(n_layers / full_attention_interval);
+        }
+
+        // full attention 层在 KV cache 里的紧凑下标（只给 full 层分配 cache）。
+        int full_layer_cache_index(uint32_t layer_idx) const {
+            return static_cast<int>((layer_idx + 1) / full_attention_interval - 1);
+        }
+
+        // linear attention 层在 GDN 状态里的紧凑下标（= 层号减去前面的 full 层数）。
+        int linear_layer_cache_index(uint32_t layer_idx) const {
+            return static_cast<int>(layer_idx - (layer_idx + 1) / full_attention_interval);
+        }
     };
 
     // 加载并校验一个 .tqwen 文件。

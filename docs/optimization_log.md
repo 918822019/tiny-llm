@@ -610,6 +610,66 @@
 
 ---
 
+### gdn_neon（2026-08-17）
+
+- **优化栈**：fp16 满栈 + ops_neon + **GDN 四算子 NEON 化**（Qwen3.5 专属）
+- **是什么**：为 Qwen3.5-0.8B 的 Gated DeltaNet 层新增 4 个 NEON 变体，
+  经过两轮优化迭代。四个算子共用 `--ops-impl neon` 开关（自注册进 GDN ops
+  dispatch，兜底到各自 `_ref`）。具体改动：
+  1. **gdn_step_neon**（delta rule 递归步，128×128 状态矩阵）：
+     - 第一轮：沿 v_dim 向量化、分块 chunk=64（16 累加器）、三遍独立
+     - 第二轮：融合 Pass 2+3 为单次遍历（省 64KB S 重读）、4× 循环展开、
+       `__builtin_prefetch` 预取 2 行
+  2. **causal_conv1d_update_neon**（dim=6144, kernel_size=4）：
+     - vld3q/vld4q 跨通道解交错、双路 8 通道展开重叠 exp 延迟
+  3. **l2norm_inplace_neon**（n=128, 每层 32 次调用）：
+     - vrsqrteq_f32 + 2 步 Newton-Raphson 替代标量 sqrt+div、16 元素展开
+  4. **rmsnorm_gated_neon**（n=128, SiLU 门控）：
+     - vrsqrte 计算 scale、向量化 exp 多项式、双路 8 元素展开
+  5. **dispatch 基建**：4 组注册表 + 4 通用入口 + 4 自注册宏 + runtime 调用点替换
+- **假设**：指令效率 + 减少内存搬运（GDN 递归步的 S 矩阵 64KB 三遍读写是主要瓶颈）
+- **结果**（A/B 基准，4 层 fake Qwen3.5 模型，真实 GDN 维度 128×128）：
+
+  | 算子 | Ref (us/tok) | NEON (us/tok) | 加速比 |
+  |------|-------------|--------------|-------|
+  | gdn_recurrent | 560.5 | 214.3 | **2.62×** |
+  | gdn_conv1d | 55.7 | 14.6 | **3.81×** |
+  | gdn_l2norm | 6.0 | 2.9 | **2.06×** |
+  | gdn_norm | 11.6 | 3.5 | **3.27×** |
+  | **合计** | **633.7** | **235.4** | **2.69×** |
+
+- **vs 上一配置**：GDN 层非投影算子总耗时 634→235 us/tok（2.69×）。
+  实际端到端 decode（含 matvec 投影、FFN 等）从 40.3→38.8 ms/tok（GDN 算子
+  仅占 1.6% 的 total decode，主瓶颈仍在 matvec 带宽墙）
+- **验证**：78/78 单测全过（含 7 个 GDN NEON 专属 case：l2norm/rmsnorm_gated/
+  conv1d/conv1d_inplace/gdn_step/gdn_step_multi_step/gdn_step_small_dims）。
+  Token 输出与 ref 完全一致（greedy argmax 逐位相同）。
+  数值容差：S 矩阵 ≤1e-5，output o ≤1e-4，其余 ≤1e-5。
+- **瓶颈转移**：GDN 层内部 top op 仍为 gdn_recurrent（214 us，占 91%），
+  理论极限 ~3.5×（受 L1/L2 带宽墙限制）。下一步真正的大头是 GDN 投影矩阵
+  （gdn_proj/gdn_out_proj 占整体 ~90%），需 INT4 量化或更高效 matvec。
+- **意外 / 教训**：
+  1. **Apple Silicon vdivq_f32 很快**（~7 cycles）：用 vrecpeq+Newton 替代
+     在 Cortex-A78 上是经典优化，但在 M 系列反而更慢——rmsnorm 从 3.28× 跌到
+     3.11×。已回退为 vdivq。教训：microarch 差异大，必须实测。
+  2. **融合遍是此量级 kernel 的主要收益来源**：gdn_step 从 2.10→2.62× 主要
+     靠消除一遍 64KB 重读（减 33% 内存流量），循环展开和预取只贡献 ~10%。
+  3. **l2norm 在 n=128 时受函数调用开销制约**：计算本身 ~80 cycles，
+     sqrt+div 就占 30 cycles。vrsqrte 替代是性价比最高的单点优化。
+- **复现**：
+  ```bash
+  # 需要 fake35_bench.tqwen（4 层真实 GDN 维度）
+  python3 tools/make_fake_qwen35_bench.py  # 或用 /tmp/fake35_bench.tqwen
+  ./build/runtime/tinyqwen --model /tmp/fake35_bench.tqwen \
+      --tokens 3,7,11 --max-new-tokens 32 --eos -1 \
+      --ops-impl ref --profile-out /tmp/ref.json     # A 组
+  ./build/runtime/tinyqwen --model /tmp/fake35_bench.tqwen \
+      --tokens 3,7,11 --max-new-tokens 32 --eos -1 \
+      --ops-impl neon --profile-out /tmp/neon.json   # B 组
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

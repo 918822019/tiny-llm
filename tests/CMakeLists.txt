@@ -11,6 +11,8 @@ add_executable(tinyqwen_tests
         test_kv_cache.cpp
         test_config.cpp
         test_ops_neon.cpp
+        test_gdn_ops.cpp
+        test_gdn_ops_neon.cpp
 )
 # 显式链两个 OBJECT 库：同 runtime/CMakeLists.txt 注释——OBJECT 库的 .o
 # 要直接链给可执行才上链接行（变体的静态注册器依赖这一点）。

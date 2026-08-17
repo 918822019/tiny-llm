@@ -39,11 +39,43 @@ namespace tinyqwen {
 
     // 格式版本号。将来改了布局就 +1，老 loader 遇到新版本会直接拒绝，
     // 而不是硬着头皮读错。
-    inline constexpr uint32_t kFormatVersion = 1;
+    //   v1: Qwen2.x 单一架构（所有层同构 full attention + SwiGLU）。
+    //   v2: header 布局不变（仍是 192 字节），但 reserved[96] 区域按
+    //       TinyHeaderV2Ext 解读，携带混合架构（Gated DeltaNet + full
+    //       attention）所需的额外字段。v1 文件继续原样加载。
+    inline constexpr uint32_t kFormatVersion = 2;
+
+    // loader 接受的最低版本（v1 文件向后兼容）。
+    inline constexpr uint32_t kFormatVersionMin = 1;
 
     // 对齐粒度：每个 tensor 数据的起始偏移都要是 64 的倍数。
     // 64 = 常见 CPU 缓存行大小，对齐后读取缓存友好（见 primer 第 4 节）。
     inline constexpr size_t kAlignment = 64;
+
+    // ---------------------------------------------------------------------------
+    // INT4 量化 packing 布局常量。
+    // 非对称 uint4 [0,15]，per-group (128 元素) 有 scale + zero_point（均 fp16）。
+    // 每组内存布局：[scale_fp16(2B) | zero_fp16(2B) | packed_uint4(64B)] = 68B。
+    // 反量化：float_val = (uint4_val - zero) * scale。
+    // 低 nibble 在前：byte & 0x0F = 偶数下标元素，byte >> 4 = 奇数下标元素。
+    // ---------------------------------------------------------------------------
+    inline constexpr int kI4DefaultGroupSize = 128;
+    inline constexpr int kI4GroupHeaderBytes = 4;  // scale(2) + zero(2)
+    inline constexpr int kI4GroupDataBytes = 64;   // 128 nibbles packed
+    inline constexpr int kI4GroupTotalBytes = 68;  // header + data
+
+    // 给定 group_size，计算单行的字节数。
+    inline constexpr size_t i4_row_bytes(int in_dim, int group_size) {
+        const int n_groups = (in_dim + group_size - 1) / group_size;
+        const int data_bytes = group_size / 2;
+        return static_cast<size_t>(n_groups) * (kI4GroupHeaderBytes + data_bytes);
+    }
+
+    // 模型架构族。决定 forward 走哪条路径、按什么名字绑权重。
+    enum class ModelType : uint32_t {
+        kQwen2 = 0, // Qwen2 / Qwen2.5：所有层同构（full attention + SwiGLU）
+        kQwen35 = 1, // Qwen3.5 混合架构：Gated DeltaNet + full attention 3:1 交替
+    };
 
     // 数据类型编号。v1 只用 f32，其余是为将来量化预留的。
     enum class Dtype : uint32_t {
@@ -83,8 +115,28 @@ namespace tinyqwen {
         uint64_t tensor_table_offset; // tensor 表的起始偏移（v1 固定 = 192）
         uint64_t data_offset; // 第一个 tensor 数据的偏移，% 64 == 0
         uint64_t total_bytes; // 整个文件的字节数（加载时用来校验）
-        char reserved[96]; // 预留空间，必须全 0，方便将来扩展
+        char reserved[96]; // v1 必须全 0；v2 按 TinyHeaderV2Ext 解读
     };
+
+    // v2 扩展头：复用 TinyHeader::reserved[96] 的前 64 字节。
+    // version >= 2 时加载端把 reserved 按此结构 memcpy 出来读。
+    // 导出端（exporter）写 v2 文件时填这些字段，剩余字节补 0。
+    struct TinyHeaderV2Ext {
+        uint32_t model_type; // ModelType：0 = Qwen2.x，1 = Qwen3.5 混合
+        uint32_t linear_num_qk_heads; // GDN 线性注意力的 Q/K 头数
+        uint32_t linear_num_v_heads; // GDN 线性注意力的 V 头数
+        uint32_t linear_qk_head_dim; // GDN 每个 Q/K 头的维度
+        uint32_t linear_v_head_dim; // GDN 每个 V 头的维度
+        uint32_t linear_conv_kernel_dim; // GDN 内 causal conv1d 的 kernel 大小
+        uint32_t full_attention_interval; // 每 N 层出现一个 full attention（3:1 -> 4）
+        float partial_rotary_factor; // RoPE 只旋转 head_dim 的该比例（0.25）
+        uint32_t eos_token_id; // stop token（Qwen3.5 = 248044）
+        uint32_t pad; // 必须填 0，保持 8 字节对齐
+        // --- 量化字段（仅 dtype == kI4 时有意义；非量化文件此处全 0）---
+        uint32_t quant_group_size; // INT4 每组元素数（128 典型）；0 = 未量化
+        char ext_reserved[20]; // 余量，必须全 0
+    };
+    static_assert(sizeof(TinyHeaderV2Ext) == 64, "TinyHeaderV2Ext must be 64 bytes");
 
     // tensor 名字最长 64 字节。
     inline constexpr size_t kMaxTensorName = 64;

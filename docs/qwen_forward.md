@@ -85,6 +85,66 @@ attention 读取 `seq_len = p + 1`（含当前 token，先 append 再 attend）�
 | 累加精度      | fp32       | matvec/rmsnorm 用 double 累加，输出 fp32   |
 | tokenizer | 内置         | 外部 Python 提供 token ids               |
 
+## Qwen3.5 混合架构（v2）
+
+Qwen3.5 用 **Gated DeltaNet（linear attention）+ full attention** 按
+`full_attention_interval`（3:1 → 4）交替。FFN/residual/norm 结构与上面一致，
+差异只在 token mixer。对应实现仍在 `runtime/qwen_model.cpp`。
+
+### full attention 层（无 bias，有 QK-norm / partial RoPE / 输出门）
+
+```text
+n1   = RMSNorm(x, input_layernorm)                 # zero-centered，权重已折 +1
+qg   = q_proj @ n1                                  # [2*qd]：每头前 hd 是 q、后 hd 是 gate
+q, gate = deinterleave(qg)                          # q:[qd], gate:[qd]
+k    = k_proj @ n1                                  # [kvd]
+v    = v_proj @ n1                                  # [kvd]
+q_h  = RMSNorm(q_h, q_norm)   (per head)            # zero-centered，已折 +1
+k_h  = RMSNorm(k_h, k_norm)   (per head)
+q,k  = PartialRoPE(q, k, pos, theta, rotary_dim)    # 只旋转每头前 rotary_dim 维
+KV.append(k, v)
+a    = Attention(q, K, V)                           # GQA, scale=1/sqrt(hd)
+a    = a * sigmoid(gate)                            # 输出门
+x    = x + o_proj @ a
+```
+
+partial RoPE：`rotary_dim = head_dim * partial_rotary_factor`（0.8B = 256·0.25 = 64），
+只旋转每头前 `rotary_dim` 个分量（rotate-half），其余原样保留；频率按
+`rotary_dim`（而非 head_dim）归一化。纯文本下 mRoPE 三轴位置相同，交织退化为普通 RoPE。
+
+### linear attention 层（Gated DeltaNet，O(1) 状态）
+
+```text
+n1    = RMSNorm(x, input_layernorm)
+mixed = in_proj_qkv @ n1                            # [conv_dim=2*key_dim+value_dim]
+z     = in_proj_z @ n1                              # [value_dim]
+b     = in_proj_b @ n1                              # [n_v_heads]
+a     = in_proj_a @ n1                              # [n_v_heads]
+mixed = SiLU(CausalConv1d_step(mixed, conv_state))  # depthwise, kernel=4；state 推进
+q,k,v = split(mixed)                                # key_dim/key_dim/value_dim
+q_h   = l2norm(q_h) / sqrt(qk_head_dim)  (per qk head)
+k_h   = l2norm(k_h)                      (per qk head)
+g     = -exp(A_log) * softplus(a + dt_bias)         # per v head（衰减对数）
+beta  = sigmoid(b)                                  # per v head
+# delta rule 递归步（per v head，状态 S:[qk_dim, v_dim]）：
+S     = exp(g) * S
+kv_mem = S^T @ k
+S     = S + outer(k, beta * (v - kv_mem))
+o     = S^T @ q
+o     = RMSNormGated(o, z, norm)  = RMSNorm(o)*norm*SiLU(z)   # per v head
+x     = x + out_proj @ o
+```
+
+GDN 无 KV cache：`conv_state`（最近 kernel-1 个输入）与递归矩阵 `S` 大小固定，
+与序列长度无关（`runtime/gdn_state.h`）。full attention 层才用 KV cache（紧凑下标）。
+
+### 数值要点
+
+- `l2norm(x)=x/sqrt(sum(x^2)+1e-6)`；q 归一化后再乘 `1/sqrt(qk_head_dim)`。
+- `softplus(t)=log(1+exp(t))`（t>20 时取 t，避免溢出）；g、beta 均为 fp32。
+- causal conv1d 的 state 存 **silu 前**的原始投影值；就地更新时须先保存当前输入，
+  防止被输出覆盖（有专门单测 `conv1d_inplace_state_not_corrupted`）。
+
 ---
 
 相关文档：实现见 `runtime/qwen_model.cpp`（op 顺序与本文一一对应）；

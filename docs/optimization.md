@@ -246,6 +246,10 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()     
   `ref`（默认）→ `double_2_float`（+float 累加）→ `acc4`（+4 链并行累加，
   标量）→ `neon_nofma`（+NEON 向量化，仅 aarch64）→ `neon`（+FMA，仅 aarch64）。
   各层贡献见 `optimization_log.md` 的 neon_nofma 条目（阶梯账本）。
-- 其余算子（rmsnorm/rope/attention/...）目前直接调 `_ref`；将来要优化哪个，
-  照第 4 节给它也加一个通用入口即可。
+- **非 matvec 算子分发**（ops dispatch）：rmsnorm/rope/attention/swiglu/argmax
+  五个注册表共享 `--ops-impl` 开关。`neon` 变体已全部就位（见 ops_neon 条目）。
+- **GDN 算子分发**（Qwen3.5 专属）：l2norm_inplace/causal_conv1d_update/
+  gdn_step/rmsnorm_gated 四个注册表，同样共用 `--ops-impl` 开关。NEON 变体
+  已就位（见 gdn_neon 条目），合计加速 2.69×。关键优化：gdn_step 融合遍减少
+  64KB 内存搬运、vrsqrte/vexpq 多项式逼近消除标量瓶颈。详见 `kernels/gdn/README.md`。
 - 优化记录与数字：`optimization_log.md`。

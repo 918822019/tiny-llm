@@ -9,10 +9,14 @@ using namespace tinyqwen;
 TEST (format_header_layout) {
     EXPECT_EQ(sizeof(TinyHeader), (size_t) 192);
     EXPECT_EQ(sizeof(TensorEntry), (size_t) 120);
+    EXPECT_EQ(sizeof(TinyHeaderV2Ext), (size_t) 64);
     EXPECT_EQ(std::memcmp(kMagic, "TINYQWEN", 8), 0);
-    EXPECT_EQ(kFormatVersion, 1u);
+    EXPECT_EQ(kFormatVersion, 2u);
+    EXPECT_EQ(kFormatVersionMin, 1u);
     EXPECT_EQ(kAlignment, (size_t) 64);
     EXPECT_EQ((int) Dtype::kF32, 0);
+    EXPECT_EQ((int) ModelType::kQwen2, 0);
+    EXPECT_EQ((int) ModelType::kQwen35, 1);
 }
 
 TEST (format_dtype_sizes) {

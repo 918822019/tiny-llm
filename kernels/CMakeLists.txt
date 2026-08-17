@@ -51,6 +51,19 @@ add_library(tinyqwen_kernels OBJECT
         argmax/argmax_ref.cpp
         # argmax NEON 变体（两遍法：NEON 求 max + NEON 找首个相等下标，与 ref 逐位一致；仅 aarch64）。
         argmax/argmax_neon.cpp
+        # INT4 weight-only：非对称 uint4 per-group(128) 量化参考实现（正确性锚）。
+        matvec/matvec_i4_ref.cpp
+        matvec/matvec_i4_neon.cpp
+        matvec/matmul_ref.cpp
+        matvec/matmul_i4_ref.cpp
+        # Qwen3.5 Gated DeltaNet（GDN）算子：l2norm / causal conv1d 单步 /
+        # gated delta rule 递归步 / 门控 RMSNorm / partial RoPE（v2 新增）。
+        gdn/gdn_ops_ref.cpp
+        # GDN NEON 变体（仅 aarch64，其他平台编译为空）。
+        gdn/l2norm_inplace_neon.cpp
+        gdn/rmsnorm_gated_neon.cpp
+        gdn/causal_conv1d_update_neon.cpp
+        gdn/gdn_step_neon.cpp
         dispatch.cpp
 )
 target_include_directories(tinyqwen_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1,4 +1,4 @@
-# tiny binary format（.tqwen）v1
+# tiny binary format（.tqwen）v1 / v2
 
 `.tqwen` 是 tinyqwen 的权重文件格式。设计目标：**无依赖、可 mmap、64B 对齐、
 Python 导出 / C++ 加载零歧义**。格式的唯一契约是 `runtime/tiny_format.h`，本文档
@@ -42,7 +42,7 @@ data_offset     tensor 数据区（每个 tensor 的 offset 均为 64B 对齐）
 | tensor_table_offset | u64      | v1 固定 = 192                                             |
 | data_offset         | u64      | 第一个 tensor 数据偏移，64B 对齐                                  |
 | total_bytes         | u64      | 文件总字节数                                                  |
-| reserved            | char[96] | 必须为 0                                                   |
+| reserved            | char[96] | v1 必须全 0；v2 前 64 B 按 `TinyHeaderV2Ext` 解读（见 §7），其余为 0 |
 
 ## 3. TensorEntry（120 B）
 
@@ -98,6 +98,73 @@ o_proj 与 MLP 无 bias。bias 必须在 RoPE 之前加到 q/k/v 上。
 
 约 0.5B 参数（tied，embedding 计一次）→ 约 2 GB。这是 v1 的已知代价，
 INT8/INT4 阶段会显著缩小；runtime 侧 KV cache 与权重内存独立核算。
+
+## 7. v2：Qwen3.5 混合架构扩展
+
+v2 不改 header 大小与整体布局，仅把 `reserved[96]` 的前 64 字节定义为
+`TinyHeaderV2Ext`（`runtime/tiny_format.h`），用于描述 Gated DeltaNet + full
+attention 的混合层结构。loader 接受 version ∈ {1, 2}；v1 文件不受影响。
+
+### 7.1 TinyHeaderV2Ext（64 B，位于 reserved 前 64 B）
+
+字段顺序（`<7I f 2I 24s`）：
+
+| 字段                       | 类型  | 说明                                                |
+|--------------------------|-----|---------------------------------------------------|
+| model_type               | u32 | 0 = Qwen2.x，1 = Qwen3.5 混合                          |
+| linear_num_qk_heads      | u32 | GDN 的 Q/K 头数（0.8B: 16）                             |
+| linear_num_v_heads       | u32 | GDN 的 V 头数（0.8B: 16）                               |
+| linear_qk_head_dim       | u32 | GDN 每个 Q/K 头维度（0.8B: 128）                          |
+| linear_v_head_dim        | u32 | GDN 每个 V 头维度（0.8B: 128）                            |
+| linear_conv_kernel_dim   | u32 | GDN causal conv1d kernel（0.8B: 4）                  |
+| full_attention_interval  | u32 | 每 N 层一个 full attention（3:1 → 4）                    |
+| partial_rotary_factor    | f32 | full attention RoPE 只旋转 head_dim 的该比例（0.8B: 0.25） |
+| eos_token_id             | u32 | stop token（Qwen3.5: 248044）                        |
+| pad                      | u32 | 必须为 0                                              |
+| ext_reserved             | char[24] | 必须全 0                                          |
+
+层类型：`layer i` 为 full attention 当且仅当 `(i+1) % full_attention_interval == 0`，
+其余为 linear（GDN）。KV cache 只为 full 层分配；GDN 层用固定大小的递归状态
+（`runtime/gdn_state.h`），与序列长度无关。
+
+### 7.2 Qwen3.5 tensor 命名与 shape（0.8B）
+
+HF 权重带 `model.language_model.` 前缀，导出时统一去掉以复用 Qwen2.x 命名。
+**full attention 层**（`self_attn`）：
+
+| name                                        | shape                        | 备注                              |
+|---------------------------------------------|------------------------------|---------------------------------|
+| `model.layers.{i}.self_attn.q_proj.weight`  | [2·qd, hidden]               | 每头前 head_dim 是 query、后半是输出门 gate |
+| `model.layers.{i}.self_attn.k_proj.weight`  | [kvd, hidden]                |                                 |
+| `model.layers.{i}.self_attn.v_proj.weight`  | [kvd, hidden]                |                                 |
+| `model.layers.{i}.self_attn.o_proj.weight`  | [hidden, qd]                 |                                 |
+| `model.layers.{i}.self_attn.q_norm.weight`  | [head_dim]                   | zero-centered，导出时已 **+1**        |
+| `model.layers.{i}.self_attn.k_norm.weight`  | [head_dim]                   | zero-centered，导出时已 **+1**        |
+
+**linear attention 层**（`linear_attn`，Gated DeltaNet）：
+
+| name                                          | shape                 | 备注                       |
+|-----------------------------------------------|-----------------------|--------------------------|
+| `model.layers.{i}.linear_attn.in_proj_qkv.weight` | [conv_dim, hidden] | conv_dim=2·key_dim+value_dim |
+| `model.layers.{i}.linear_attn.in_proj_z.weight` | [value_dim, hidden] | 输出门 z                    |
+| `model.layers.{i}.linear_attn.in_proj_b.weight` | [n_v_heads, hidden] | beta（写入门）投影             |
+| `model.layers.{i}.linear_attn.in_proj_a.weight` | [n_v_heads, hidden] | a（dt）投影                  |
+| `model.layers.{i}.linear_attn.out_proj.weight` | [hidden, value_dim]  |                          |
+| `model.layers.{i}.linear_attn.conv1d.weight`  | [conv_dim, kernel]    | HF [d,1,k] 导出时 squeeze 成 [d,k] |
+| `model.layers.{i}.linear_attn.A_log`          | [n_v_heads]           | 衰减 A 的 log               |
+| `model.layers.{i}.linear_attn.dt_bias`        | [n_v_heads]           | dt 偏置                    |
+| `model.layers.{i}.linear_attn.norm.weight`    | [v_head_dim]          | RMSNormGated，标准（不 +1）    |
+
+**共享**：`input_layernorm.weight` / `post_attention_layernorm.weight` /
+`model.norm.weight` 为 zero-centered RMSNorm，导出时统一 **+1**；`mlp.*` 与
+Qwen2.x 一致（SwiGLU，无 bias）。Qwen3.5 attention 无 q/k/v bias。
+
+### 7.3 zero-centered RMSNorm 折叠约定
+
+Qwen3.5 的 `Qwen3_5RMSNorm` 是 `(1+w)·norm(x)`（权重初始 0）。为让 C++ 复用同一个
+`rmsnorm` kernel，导出端把 `+1` 折进权重（存 `1+w`）。适用：input/post/model norm、
+q_norm、k_norm。**例外**：`linear_attn.norm` 是 `Qwen3_5RMSNormGated`
+（`w·norm(x)·silu(z)`），为标准形式，不折叠，由 `rmsnorm_gated` kernel 处理。
 
 ---
 

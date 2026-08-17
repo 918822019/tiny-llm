@@ -1,0 +1,62 @@
+{
+  "date": "2026-08-14",
+  "prompt": "中国的首都是",
+  "prompt_tokens": [105538, 59975, 100132],
+  "decode_tokens": 512,
+  "platform": "macOS arm64 (Apple Silicon M5 Pro, 5P+10E)",
+  "sampling": "greedy",
+  "methodology": {
+    "tinyqwen": "profiler 逐 token 计时，纯 decode 中位数（不含加载/prefill）",
+    "mnn": "外部 wall-clock；用 max_new_tokens=1 单独测加载+prefill 开销后相减，得纯 decode"
+  },
+  "results_pure_decode": [
+    {
+      "label": "MNN 3.6.1.2 int4 (HQQ)",
+      "quant": "int4", "threads": 8,
+      "pure_decode_ms_per_tok": 3.68, "tok_per_sec": 272,
+      "load_plus_prefill_s": 0.22, "total_wall_s": 2.10,
+      "model_size_mb": 265, "effective_bw_gb_s": 72,
+      "note": "int4 已不是带宽瓶颈（有效带宽仅 72 GB/s），受 dequant+i8mm 计算限制"
+    },
+    {
+      "label": "tinyqwen f16 neon_mt_kv_nt",
+      "quant": "fp16", "threads": 12,
+      "pure_decode_ms_per_tok": 5.50, "tok_per_sec": 182,
+      "total_wall_s": 3.3,
+      "model_size_mb": 988, "effective_bw_gb_s": 180
+    },
+    {
+      "label": "MNN fp16",
+      "quant": "fp16", "threads": 8,
+      "pure_decode_ms_per_tok": 6.83, "tok_per_sec": 146,
+      "load_plus_prefill_s": 0.907, "total_wall_s": 4.397,
+      "model_size_mb": 988, "effective_bw_gb_s": 145,
+      "note": "模型来自 mnn_workspace/experiments/lora_fp16_v2（quant_bit=16，未挂 LoRA）"
+    },
+    {
+      "label": "tinyqwen fp32 neon_mt_kv_nt",
+      "quant": "fp32", "threads": 8,
+      "pure_decode_ms_per_tok": 11.31, "tok_per_sec": 88,
+      "model_size_mb": 1976, "effective_bw_gb_s": 175
+    }
+  ],
+  "thread_sweeps": {
+    "tinyqwen_f16": {"4": 7.49, "6": 7.18, "8": 5.81, "12": 5.50, "16": 5.83},
+    "mnn_fp16": {"4": 9.49, "8": 8.59, "12": 9.89, "16": 13.08}
+  },
+  "analysis": {
+    "fp16_vs_fp16": "同精度纯 decode：tinyqwen 5.50 vs MNN 6.83 ms/tok，tinyqwen 快 1.24x。有效带宽 180 vs 145 GB/s",
+    "why_tinyqwen_wins": [
+      "LDNP 非临时流式加载（内联汇编）绕过 cache，不污染不 alias，把带宽榨得更干",
+      "融合减同步：kv 成对（48→24 次 matvec）+ qkv 融合 + gate/up 融合，每 token 的 fork-join 次数减半再减半",
+      "常驻线程池 + 逐机调优线程数（M5 Pro 5P+10E 实测 12 最优）；MNN 默认 4 线程吃不饱",
+      "零框架开销：decode 热路径没有 op dispatch/tensor 分配/图调度；0.5B 小模型（hidden=896）每层 matvec 仅几十 µs，MNN 每 token ~500 次 kernel launch 的固定开销占比被放大",
+      "权重预打包成 kernel 理想布局（.tqwen），无运行时重排/间接寻址"
+    ],
+    "caveats": [
+      "差距只有 1.24x，不是数量级碾压；MNN int4（3.68 ms/tok）仍大幅领先，因为量化把权重流量压到 1/4",
+      "tinyqwen 是单模型单机单负载特化（hidden=896、24 层、batch=1、seq≤600 全部硬编码）；MNN 要通用支持 100+ 架构、prefill+decode 双路径、LoRA、多模态、多后端，这是通用性税",
+      "MNN fp16 模型加载要 0.9s vs int4 的 0.22s——小模型场景下加载开销也不可忽略"
+    ]
+  }
+}
