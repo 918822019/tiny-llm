@@ -54,8 +54,17 @@ def main() -> None:
             messages,
             add_generation_prompt=True,
             tokenize=True,
+            return_dict=False,  # 强制返回纯 token id 列表（而非 BatchEncoding）
         )
+        # 兜底：个别版本仍可能返回 dict/张量，统一转成一维 int 列表。
+        if not isinstance(tokens, (list, tuple)):
+            tokens = tokens["input_ids"] if "input_ids" in tokens else tokens
+        if hasattr(tokens, "tolist"):
+            tokens = tokens.tolist()
         tokens = list(tokens)
+        # 可能带 batch 维 [[...]]，展平成一维。
+        if tokens and isinstance(tokens[0], (list, tuple)):
+            tokens = list(tokens[0])
     else:
         # Qwen2 的 tokenizer 没有 BOS；不要悄悄添加特殊 token。
         tokens = tokenizer(args.prompt, add_special_tokens=False)["input_ids"]

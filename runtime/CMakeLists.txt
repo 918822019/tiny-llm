@@ -9,6 +9,7 @@ add_library(tinyqwen_runtime OBJECT
         tensor.cpp
         model_loader.cpp
         kv_cache.cpp
+        gdn_state.cpp
         profiler.cpp
         config.cpp
         qwen_model.cpp

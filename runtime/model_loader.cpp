@@ -92,15 +92,16 @@ namespace tinyqwen {
             fail(err, "bad magic (not a .tqwen file): " + path);
             return false;
         }
-        if (header_.version != kFormatVersion) {
-            fail(err, "unsupported format version: " + std::to_string(header_.version));
+        if (header_.version < kFormatVersionMin || header_.version > kFormatVersion) {
+            fail(err, "unsupported format version: " + std::to_string(header_.version) +
+                      " (this build supports " + std::to_string(kFormatVersionMin) + ".." +
+                      std::to_string(kFormatVersion) + ")");
             return false;
         }
-        // v1 支持 f32 与 f16（weight-only 半精度：权重 f16、计算 f32）。
-        // i8/i4 仍预留拒绝（亚字节布局需要专门处理，见 known_limitations）。
         if (header_.dtype != static_cast<uint32_t>(Dtype::kF32) &&
-            header_.dtype != static_cast<uint32_t>(Dtype::kF16)) {
-            fail(err, "v1 loader supports dtype f32/f16, got " + std::to_string(header_.dtype));
+            header_.dtype != static_cast<uint32_t>(Dtype::kF16) &&
+            header_.dtype != static_cast<uint32_t>(Dtype::kI4)) {
+            fail(err, "loader supports dtype f32/f16/i4, got " + std::to_string(header_.dtype));
             return false;
         }
         // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了。
@@ -156,12 +157,22 @@ namespace tinyqwen {
                 fail(err, "tensor #" + std::to_string(i) + ": bad ndim " + std::to_string(e.ndim));
                 return false;
             }
-            // v1 约定全文件单一 dtype：每个 tensor 必须与 header 声明一致。
-            if (e.dtype != header_.dtype) {
-                fail(err, "tensor #" + std::to_string(i) + ": dtype " +
-                              std::to_string(e.dtype) + " != header dtype " +
-                              std::to_string(header_.dtype) + " (v1 is uniform-dtype)");
-                return false;
+            // dtype 校验：kI4 文件允许混合（大矩阵 kI4、小向量 kF32）；
+            // f32/f16 文件仍要求全文件单一 dtype。
+            if (static_cast<Dtype>(header_.dtype) == Dtype::kI4) {
+                if (e.dtype != static_cast<uint32_t>(Dtype::kI4) &&
+                    e.dtype != static_cast<uint32_t>(Dtype::kF32)) {
+                    fail(err, "tensor #" + std::to_string(i) + ": i4 file allows only "
+                              "i4/f32 tensors, got dtype " + std::to_string(e.dtype));
+                    return false;
+                }
+            } else {
+                if (e.dtype != header_.dtype) {
+                    fail(err, "tensor #" + std::to_string(i) + ": dtype " +
+                                  std::to_string(e.dtype) + " != header dtype " +
+                                  std::to_string(header_.dtype) + " (uniform-dtype)");
+                    return false;
+                }
             }
             // 元素个数 = 各维相乘；任何一维为 0 都是非法的。
             uint64_t numel = 1;
@@ -179,10 +190,18 @@ namespace tinyqwen {
                     return false;
                 }
             }
-            // 声明的字节数必须等于 元素个数 * 每元素字节数（f32=4 / f16=2）。
-            if (e.nbytes != numel * dtype_size(static_cast<Dtype>(header_.dtype))) {
-                fail(err, "tensor #" + std::to_string(i) + ": nbytes mismatch");
-                return false;
+            // 声明的字节数校验：INT4 用 group-based 公式；f32/f16 用元素数 * 元素字节。
+            if (static_cast<Dtype>(e.dtype) == Dtype::kI4) {
+                if (e.ndim != 2) {
+                    fail(err, "tensor #" + std::to_string(i) + ": i4 tensor must be 2D");
+                    return false;
+                }
+                // nbytes 延迟到阶段 4 解析 quant_group_size 后再验（此处先记录）。
+            } else {
+                if (e.nbytes != numel * dtype_size(static_cast<Dtype>(e.dtype))) {
+                    fail(err, "tensor #" + std::to_string(i) + ": nbytes mismatch");
+                    return false;
+                }
             }
             // 数据偏移必须 64B 对齐、且落在数据区内。
             if (e.offset % kAlignment != 0 || e.offset < header_.data_offset) {
@@ -230,6 +249,89 @@ namespace tinyqwen {
         config_.rms_norm_eps = h.rms_norm_eps;
         config_.rope_theta = h.rope_theta;
         config_.tied_embeddings = h.tied_embeddings != 0;
+
+        // ---- 阶段 4：v2 扩展头（混合架构字段）。v1 文件跳过，配置保持默认 ----
+        if (header_.version >= 2) {
+            TinyHeaderV2Ext ext{};
+            std::memcpy(&ext, header_.reserved, sizeof(ext));
+
+            if (ext.model_type > static_cast<uint32_t>(ModelType::kQwen35)) {
+                fail(err, "unknown model_type: " + std::to_string(ext.model_type));
+                return false;
+            }
+            if (ext.pad != 0) {
+                fail(err, "v2 ext pad field must be 0");
+                return false;
+            }
+
+            config_.model_type = static_cast<ModelType>(ext.model_type);
+            config_.linear_num_qk_heads = ext.linear_num_qk_heads;
+            config_.linear_num_v_heads = ext.linear_num_v_heads;
+            config_.linear_qk_head_dim = ext.linear_qk_head_dim;
+            config_.linear_v_head_dim = ext.linear_v_head_dim;
+            config_.linear_conv_kernel_dim = ext.linear_conv_kernel_dim;
+            config_.full_attention_interval = ext.full_attention_interval;
+            config_.partial_rotary_factor = ext.partial_rotary_factor;
+            config_.eos_token_id = ext.eos_token_id;
+            config_.quant_group_size = ext.quant_group_size;
+
+            // 混合架构（qwen3_5）自洽性校验。fail fast：这些值接下来直接用来
+            // 建模，错一个就是静默算错。
+            if (config_.model_type == ModelType::kQwen35) {
+                if (config_.linear_num_qk_heads == 0 || config_.linear_num_v_heads == 0 ||
+                    config_.linear_qk_head_dim == 0 || config_.linear_v_head_dim == 0 ||
+                    config_.linear_conv_kernel_dim < 2) {
+                    fail(err, "qwen3_5: linear attention shape fields must be set "
+                              "(conv kernel >= 2)");
+                    return false;
+                }
+                if (config_.full_attention_interval < 2) {
+                    fail(err, "qwen3_5: full_attention_interval must be >= 2");
+                    return false;
+                }
+                if (config_.n_layers % config_.full_attention_interval != 0) {
+                    fail(err, "qwen3_5: n_layers must be divisible by "
+                              "full_attention_interval");
+                    return false;
+                }
+                if (config_.partial_rotary_factor <= 0.0f ||
+                    config_.partial_rotary_factor > 1.0f) {
+                    fail(err, "qwen3_5: partial_rotary_factor must be in (0, 1]");
+                    return false;
+                }
+                // GDN 的 query/key 头数要能对齐到 value 头数（repeat_interleave）。
+                if (config_.linear_num_v_heads % config_.linear_num_qk_heads != 0) {
+                    fail(err, "qwen3_5: linear_num_v_heads % linear_num_qk_heads != 0");
+                    return false;
+                }
+            }
+        }
+
+        // ---- 阶段 5：INT4 量化校验（quant_group_size + 每个 I4 tensor 的 nbytes）----
+        if (static_cast<Dtype>(header_.dtype) == Dtype::kI4) {
+            if (config_.quant_group_size == 0 || config_.quant_group_size > 1024) {
+                fail(err, "i4 file: quant_group_size must be in [1,1024], got " +
+                          std::to_string(config_.quant_group_size));
+                return false;
+            }
+            if (config_.quant_group_size % 2 != 0) {
+                fail(err, "i4 file: quant_group_size must be even");
+                return false;
+            }
+            const int gs = static_cast<int>(config_.quant_group_size);
+            for (const auto &kv : tensors_) {
+                const TensorView &t = kv.second;
+                if (t.dtype != Dtype::kI4) continue;
+                const uint64_t expected = t.shape[0] * i4_row_bytes(
+                    static_cast<int>(t.shape[1]), gs);
+                if (t.nbytes != expected) {
+                    fail(err, "tensor '" + kv.first + "': i4 nbytes mismatch, expected " +
+                              std::to_string(expected) + " got " + std::to_string(t.nbytes));
+                    return false;
+                }
+            }
+        }
+
         return true;
     }
 
@@ -245,6 +347,13 @@ namespace tinyqwen {
                     c.n_layers, c.hidden_size, c.intermediate_size, c.n_heads, c.n_kv_heads,
                     c.head_dim, c.vocab_size, c.max_seq_len, (int) c.tied_embeddings);
         std::printf("rms_norm_eps=%g rope_theta=%g\n", c.rms_norm_eps, c.rope_theta);
+        if (c.model_type == ModelType::kQwen35) {
+            std::printf("qwen3_5 hybrid: attn_interval=%u linear_qk=%ux%u linear_v=%ux%u "
+                        "conv=%u rotary=%g eos=%u\n",
+                        c.full_attention_interval, c.linear_num_qk_heads, c.linear_qk_head_dim,
+                        c.linear_num_v_heads, c.linear_v_head_dim, c.linear_conv_kernel_dim,
+                        (double) c.partial_rotary_factor, c.eos_token_id);
+        }
         std::printf("%-56s %-18s %-5s %12s %14s\n", "name", "shape", "dtype", "offset", "nbytes");
         for (const std::string &name: order_) {
             const TensorView &t = tensors_.at(name);

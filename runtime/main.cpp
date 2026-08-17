@@ -36,7 +36,9 @@ namespace {
         int max_new_tokens = 16;
         int max_seq_len = 1024;
         int topk = 0;
-        int eos = 151645; // Qwen2.5 的 im_end；传 -1 禁用
+        // 停止符：-2 = 按模型自动（v2 文件头带 eos_token_id 就用它，否则
+        // Qwen2.5 的 im_end 151645）；-1 = 禁用；其余值 = 显式指定。
+        int eos = -2;
         bool verbose = false;
         bool no_fuse_gate_up = false;
         bool no_fuse_qkv = false;
@@ -57,7 +59,8 @@ namespace {
                      "                          gen token; 0 = off)\n"
                      "  --dump-logits PATH      dump full logits (fp32 binary) after every forward\n"
                      "  --profile-out PATH      write profiler JSON\n"
-                     "  --eos ID                stop token, default 151645, -1 disables\n"
+                     "  --eos ID                stop token, -1 disables; default = model's own\n"
+                     "                          eos (v2 header) or 151645 for v1 files\n"
                      "  --config PATH           key=value config file (CLI flags override it)\n"
                      "  --matvec-impl NAME      matvec kernel: ref (default; neon later)\n"
                      "  --ops-impl NAME         non-matvec ops (rmsnorm/rope/attention/swiglu/\n"
@@ -207,12 +210,29 @@ int main(int argc, char **argv) {
     }
     if (args.verbose) file.print_summary();
 
+    // ---- 解析停止符 eos：CLI 显式值 > 模型文件头（v2）> Qwen2.5 默认 ----
+    if (args.eos == -2) {
+        const uint32_t hdr_eos = file.config().eos_token_id;
+        args.eos = hdr_eos != 0 ? static_cast<int>(hdr_eos) : 151645;
+        std::fprintf(stderr, "[init] eos: %d (auto)\n", args.eos);
+    }
+
     // ---- 按模型 dtype 选择 matvec 实现（f32/f16 各有独立注册表）----
     // 加载模型在前、选实现在后：同一个实现名（如 "ref"/"neon_mt_kv_nt"）
     // 在两个注册表里各有一份，按文件 dtype 查对应的表——f32 模型配
     // f16 专属实现（或反过来）会在这里 fail fast，而不是静默兜底。
     const bool is_f16 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kF16);
-    if (is_f16) {
+    const bool is_i4 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kI4);
+    if (is_i4) {
+        if (!tinyqwen::set_matvec_i4_impl_by_name(impl_name.c_str())) {
+            std::fprintf(stderr,
+                         "error: unknown i4 matvec_impl '%s' (available: %s)\n",
+                         impl_name.c_str(), tinyqwen::available_matvec_i4_impls());
+            return 2;
+        }
+        std::fprintf(stderr, "[init] matvec impl: %s (i4 weights, group=%u)\n",
+                     tinyqwen::matvec_i4_impl_name(), file.config().quant_group_size);
+    } else if (is_f16) {
         if (!tinyqwen::set_matvec_f16_impl_by_name(impl_name.c_str())) {
             std::fprintf(stderr,
                          "error: unknown f16 matvec_impl '%s' (available: %s)\n",
@@ -247,7 +267,9 @@ int main(int argc, char **argv) {
 
     // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作。
     tinyqwen::Profiler profiler(!args.profile_out.empty());
-    profiler.set_meta("qwen2.5-0.5b-like", "cpu_ref", is_f16 ? "f16w_fp32a" : "fp32");
+    const bool is_qwen35 = file.config().model_type == tinyqwen::ModelType::kQwen35;
+    profiler.set_meta(is_qwen35 ? "qwen3.5-hybrid" : "qwen2.5-like", "cpu_ref",
+                      is_f16 ? "f16w_fp32a" : "fp32");
 
     // ---- 建模：校验权重、分配 KV cache 和 workspace ----
     std::unique_ptr<tinyqwen::QwenModel> model;
@@ -257,6 +279,10 @@ int main(int argc, char **argv) {
     }
     std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",
                  model->kv_cache().memory_bytes() / (1024.0 * 1024.0), args.max_seq_len);
+    if (is_qwen35) {
+        std::fprintf(stderr, "[init] gdn state: %.1f MB (O(1) w.r.t. seq len)\n",
+                     model->gdn_state_bytes() / (1024.0 * 1024.0));
+    }
 
     // ---- 选择 decode engine（GPU-resident forward，opt-in）----
     // 默认空 = CPU forward（参考路径）。--engine cuda 时把整段 forward 搬上
@@ -340,27 +366,35 @@ int main(int argc, char **argv) {
         std::printf("\n");
     };
 
-    // ---- prefill 阶段（token-by-token）----
-    // 把 prompt 的每个 token 依次喂进模型。每步都填 KV cache 并产生 logits，
-    // 但我们只关心最后一步——它的 argmax 就是第一个要生成的 token。
-    // prefill 结束后，`next` 就是第一个生成 token。
+    // ---- prefill 阶段 ----
+    // 批量 GEMM 路径：一次处理所有 prompt token 的线性投影，显著降低延迟。
+    // verbose 模式退回逐 token 以输出每步中间结果。
     int next = 0;
     tinyqwen::TopKResult topk;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        const bool last_prefill = i + 1 == tokens.size();
-        // 是否要让 forward 顺带返回 top-k：verbose 时需要；或者开了 --topk
-        // 且这是最后一个 prompt token（要打印第一个生成 token 的分布）。
-        const bool need_topk = args.verbose || (args.topk > 0 && last_prefill);
-        if (engine) {
-            next = engine_step(tokens[i], true); // GPU-resident forward
-        } else {
+    if (engine) {
+        // GPU-resident engine 没有批量 prefill 入口，只能逐 token 喂进去
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            next = engine_step(tokens[i], true);
+            if (args.verbose) {
+                std::fprintf(stderr, "[prefill] %zu/%zu id=%d -> next=%d\n", i + 1, tokens.size(),
+                             tokens[i], next);
+            }
+        }
+    } else if (args.verbose) {
+        // 逐 token：可打印每步详情
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const bool last_prefill = i + 1 == tokens.size();
+            const bool need_topk = args.topk > 0 && last_prefill;
             next = model->forward_token(tokens[i], need_topk ? &topk : nullptr, args.topk);
             dump();
-        }
-        if (args.verbose) {
             std::fprintf(stderr, "[prefill] %zu/%zu id=%d -> next=%d\n", i + 1, tokens.size(),
                          tokens[i], next);
         }
+    } else {
+        // 批量 GEMM prefill
+        const bool need_topk = args.topk > 0;
+        next = model->forward_prefill(tokens.data(), static_cast<int>(tokens.size()),
+                                      need_topk ? &topk : nullptr, args.topk);
     }
     std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
     if (args.topk > 0) print_topk(topk); // 第一个生成 token g0 的分数分布

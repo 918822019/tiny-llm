@@ -242,3 +242,103 @@ TEST (loader_rejects_mixed_dtype) {
     EXPECT_TRUE(err.find("dtype") != std::string::npos);
     std::remove(path.c_str());
 }
+
+// ---- v2（Qwen3.5 混合架构）header 扩展块测试 ------------------------------
+
+namespace {
+    // 在已写好的文件上覆写 header.reserved 为 v2 扩展块（模拟 qwen3_5 导出）。
+    // write_file 默认 n_layers=2，这里把 interval 设为 2 保证整除。
+    void patch_v2_ext(const std::string &path) {
+        TinyHeaderV2Ext ext{};
+        ext.model_type = static_cast<uint32_t>(ModelType::kQwen35);
+        ext.linear_num_qk_heads = 2;
+        ext.linear_num_v_heads = 2;
+        ext.linear_qk_head_dim = 4;
+        ext.linear_v_head_dim = 4;
+        ext.linear_conv_kernel_dim = 4;
+        ext.full_attention_interval = 2; // n_layers=2 -> layer0 linear, layer1 full
+        ext.partial_rotary_factor = 0.25f;
+        ext.eos_token_id = 248044;
+        ext.pad = 0;
+
+        FILE *f = std::fopen(path.c_str(), "r+b");
+        EXPECT_TRUE(f != nullptr);
+        std::fseek(f, static_cast<long>(offsetof(TinyHeader, reserved)), SEEK_SET);
+        std::fwrite(&ext, 1, sizeof(ext), f);
+        std::fclose(f);
+    }
+} // namespace
+
+TEST (loader_v2_qwen35_ext) {
+    const std::string path = "tinyqwen_test_v2.tqwen";
+    write_file(path, sample_tensors()); // version=kFormatVersion(2)，reserved 全 0
+    patch_v2_ext(path);
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(file.load(path, &err));
+    EXPECT_TRUE(err.empty());
+
+    const ModelConfig &c = file.config();
+    EXPECT_TRUE(c.model_type == ModelType::kQwen35);
+    EXPECT_EQ(c.linear_num_qk_heads, 2u);
+    EXPECT_EQ(c.linear_num_v_heads, 2u);
+    EXPECT_EQ(c.linear_qk_head_dim, 4u);
+    EXPECT_EQ(c.linear_v_head_dim, 4u);
+    EXPECT_EQ(c.linear_conv_kernel_dim, 4u);
+    EXPECT_EQ(c.full_attention_interval, 2u);
+    EXPECT_NEAR(c.partial_rotary_factor, 0.25, 1e-9);
+    EXPECT_EQ(c.eos_token_id, 248044u);
+
+    // 层类型与紧凑 cache 下标。interval=2，n_layers=2：
+    //   layer0 (0+1)%2=1 -> linear；layer1 (1+1)%2=0 -> full。
+    EXPECT_TRUE(c.is_linear_layer(0));
+    EXPECT_TRUE(!c.is_linear_layer(1));
+    EXPECT_EQ(c.n_full_layers(), 1);
+    EXPECT_EQ(c.full_layer_cache_index(1), 0);
+    EXPECT_EQ(c.linear_layer_cache_index(0), 0);
+    std::remove(path.c_str());
+}
+
+TEST (loader_v1_defaults_to_qwen2) {
+    // 不写扩展块（reserved 全 0）的 v2 文件应解释为 qwen2，且 is_linear_layer 恒 false。
+    const std::string path = "tinyqwen_test_v2_qwen2.tqwen";
+    write_file(path, sample_tensors()); // reserved 全 0 -> model_type=0
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(file.load(path, &err));
+    EXPECT_TRUE(err.empty());
+    const ModelConfig &c = file.config();
+    EXPECT_TRUE(c.model_type == ModelType::kQwen2);
+    EXPECT_TRUE(!c.is_linear_layer(0));
+    EXPECT_TRUE(!c.is_linear_layer(1));
+    EXPECT_EQ(c.n_full_layers(), (int) c.n_layers);
+    std::remove(path.c_str());
+}
+
+TEST (loader_v2_rejects_bad_interval) {
+    // interval=3 但 n_layers=2 不整除 -> 必须拒绝。
+    const std::string path = "tinyqwen_test_v2_badint.tqwen";
+    write_file(path, sample_tensors());
+    TinyHeaderV2Ext ext{};
+    ext.model_type = static_cast<uint32_t>(ModelType::kQwen35);
+    ext.linear_num_qk_heads = 2;
+    ext.linear_num_v_heads = 2;
+    ext.linear_qk_head_dim = 4;
+    ext.linear_v_head_dim = 4;
+    ext.linear_conv_kernel_dim = 4;
+    ext.full_attention_interval = 3; // 2 % 3 != 0
+    ext.partial_rotary_factor = 0.25f;
+    FILE *f = std::fopen(path.c_str(), "r+b");
+    std::fseek(f, static_cast<long>(offsetof(TinyHeader, reserved)), SEEK_SET);
+    std::fwrite(&ext, 1, sizeof(ext), f);
+    std::fclose(f);
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(!file.load(path, &err));
+    EXPECT_TRUE(err.find("interval") != std::string::npos ||
+                err.find("divisible") != std::string::npos);
+    std::remove(path.c_str());
+}

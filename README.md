@@ -1,11 +1,15 @@
 # tinyqwen
 
-面向单模型（Qwen2.5-0.5B-like decoder-only）的端侧实验 runtime。
+面向单模型（Qwen2.5-0.5B / Qwen3.5-0.8B decoder-only）的端侧实验 runtime。
 第一版目标：**CPU-only、FP32 reference、batch=1、token-by-token decode**。
 不追求通用推理框架，不做 graph executor。
 
 > **当前状态**
 > - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，生成 token 与 HuggingFace 逐位一致；
+> - ✅ **已支持 Qwen3.5-0.8B 混合架构**（Gated DeltaNet + full attention 3:1）：
+>   v2 格式、GDN 递归/conv 状态、partial RoPE、QK-norm、输出门。已在 macOS 用真实
+>   Qwen3.5-0.8B 端到端生成连贯文本；随机权重小模型与 HF eager 对齐 max_abs_err ≈ 1e-6
+>   （`tools/align_fake_qwen35_model.py`）；
 > - 性能：fp32 标量基线 230 ms/token → **fp16 满栈 + 全融合 ≈ 6.3 ms/token（36×）**。
 >   已抵达带宽墙，fp16 路线正式关闭（结论与账本见 `docs/optimization_log.md`）；
 > - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、两套 kernel 分发层
@@ -50,9 +54,16 @@ Android NDK 交叉编译与真机运行流程见 `docs/android.md`。
 1. **导出权重**（Python，一次）：
 
    ```bash
+   # Qwen2.x（写 v1 格式）
    python tools/export_qwen_to_tiny.py \
      --model Qwen/Qwen2.5-0.5B \
      --out model.tqwen
+
+   # Qwen3.5 混合架构（自动识别 model_type，写 v2 格式；
+   # HF 权重需先下载到本地目录，见脚本内 find_local_dir 说明）
+   python tools/export_qwen_to_tiny.py \
+     --model <本地 Qwen3.5-0.8B 目录> \
+     --out model_qwen35.tqwen
    ```
 
 2. **生成 token ids**（C++ v1 不内置 tokenizer）：
@@ -91,10 +102,17 @@ Android NDK 交叉编译与真机运行流程见 `docs/android.md`。
 profiler → PyTorch eager 对齐）：
 
 ```bash
+# Qwen2.x（full attention）
 python tools/make_fake_model.py --out /tmp/fake.tqwen
 ./build/runtime/tinyqwen --model /tmp/fake.tqwen --tokens 3,7,11,2 \
-  --max-new-tokens 8 --topk 5 --profile-out /tmp/profile.json
+  --max-new-tokens 8 --max-seq-len 32 --topk 5
 python tools/align_fake_model.py        # C++ vs HF Qwen2 逐位置 logits，~1e-7
+
+# Qwen3.5 混合架构（Gated DeltaNet + full attention）
+python tools/make_fake_qwen35_model.py --out /tmp/fake35.tqwen --hf-out /tmp/fake35.pt
+./build/runtime/tinyqwen --model /tmp/fake35.tqwen --tokens 3,7,11,2 \
+  --max-new-tokens 8 --max-seq-len 32 --topk 5
+python tools/align_fake_qwen35_model.py # C++ vs HF Qwen3_5 逐位置 logits，~1e-6
 ```
 
 `--dump-logits PATH` 可导出每步全量 logits（fp32 binary），用于逐位置排查。

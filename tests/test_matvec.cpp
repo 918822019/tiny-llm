@@ -1016,3 +1016,170 @@ TEST (matvec_f16_cuda_fused_pair_qkv_match_ref) {
 
     EXPECT_TRUE(set_matvec_f16_impl_by_name("ref")); // 恢复默认
 }
+
+
+// ---- INT4 量化 kernel 测试 ----
+
+TEST (matvec_i4_ref_known_values) {
+    // 手工构造一个 [2, 4] 的 INT4 packed 矩阵（group_size=4）。
+    // 每组：[scale_fp16(2B) | zero_fp16(2B) | packed(2B)]
+    // group_total_bytes = 4 + 4/2 = 6 bytes per group
+    // row_bytes = 1 group * 6 = 6 bytes
+    // 总共 2 行 * 6 = 12 bytes
+    //
+    // 设 scale=2.0, zero=1.0，则 dequant = (val - 1.0) * 2.0
+    // vals: [3, 5, 0, 15] -> dequant: [4, 8, -2, 28]
+    // x = [1, 1, 1, 1]
+    // row0 dot x = 4 + 8 + (-2) + 28 = 38
+
+    const int out_dim = 2, in_dim = 4, group_size = 4;
+    uint8_t w[12]; // 2 rows * 6 bytes
+
+    // Row 0: scale=2.0(fp16=0x4000), zero=1.0(fp16=0x3C00)
+    // vals: [3, 5, 0, 15] -> packed: byte0 = (5<<4)|3 = 0x53, byte1 = (15<<4)|0 = 0xF0
+    uint16_t scale_h = 0x4000; // fp16 for 2.0
+    uint16_t zero_h = 0x3C00;  // fp16 for 1.0
+    std::memcpy(w + 0, &scale_h, 2);
+    std::memcpy(w + 2, &zero_h, 2);
+    w[4] = 0x53; // low=3, high=5
+    w[5] = 0xF0; // low=0, high=15
+
+    // Row 1: scale=1.0(fp16=0x3C00), zero=0.0(fp16=0x0000)
+    // vals: [1, 2, 3, 4] -> dequant: [1, 2, 3, 4]
+    // packed: byte0 = (2<<4)|1 = 0x21, byte1 = (4<<4)|3 = 0x43
+    scale_h = 0x3C00; // fp16 for 1.0
+    zero_h = 0x0000;  // fp16 for 0.0
+    std::memcpy(w + 6, &scale_h, 2);
+    std::memcpy(w + 8, &zero_h, 2);
+    w[10] = 0x21; // low=1, high=2
+    w[11] = 0x43; // low=3, high=4
+
+    float x[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float y[2] = {0};
+
+    matvec_i4(w, x, y, out_dim, in_dim, group_size);
+
+    // row0: (3-1)*2 + (5-1)*2 + (0-1)*2 + (15-1)*2 = 4+8-2+28 = 38
+    EXPECT_NEAR(y[0], 38.0f, 1e-3);
+    // row1: (1-0)*1 + (2-0)*1 + (3-0)*1 + (4-0)*1 = 10
+    EXPECT_NEAR(y[1], 10.0f, 1e-3);
+}
+
+TEST (matvec_i4_ref_multi_group) {
+    // [1, 8] 矩阵，group_size=4 -> 2 groups per row
+    // group_total = 4 + 2 = 6, row_bytes = 12
+    const int out_dim = 1, in_dim = 8, group_size = 4;
+    uint8_t w[12]; // 1 row * 12 bytes
+
+    // Group 0: scale=1.0, zero=0.0, vals=[1,1,1,1]
+    uint16_t s = 0x3C00, z = 0x0000;
+    std::memcpy(w + 0, &s, 2);
+    std::memcpy(w + 2, &z, 2);
+    w[4] = 0x11; // low=1, high=1
+    w[5] = 0x11; // low=1, high=1
+
+    // Group 1: scale=0.5(fp16=0x3800), zero=2.0(fp16=0x4000), vals=[4,6,8,10]
+    // dequant: (4-2)*0.5=1, (6-2)*0.5=2, (8-2)*0.5=3, (10-2)*0.5=4
+    s = 0x3800; z = 0x4000;
+    std::memcpy(w + 6, &s, 2);
+    std::memcpy(w + 8, &z, 2);
+    w[10] = (6 << 4) | 4; // low=4, high=6
+    w[11] = (10 << 4) | 8; // low=8, high=10
+
+    float x[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    float y[1] = {0};
+
+    matvec_i4(w, x, y, out_dim, in_dim, group_size);
+
+    // group0: 1+1+1+1 = 4; group1: 1+2+3+4 = 10; total = 14
+    EXPECT_NEAR(y[0], 14.0f, 1e-3);
+}
+
+TEST (matvec_i4_dispatch_selects_impl) {
+    EXPECT_TRUE(set_matvec_i4_impl_by_name("ref"));
+    EXPECT_TRUE(!set_matvec_i4_impl_by_name("nonexistent_i4_impl"));
+}
+
+TEST (matvec_i4_neon_matches_ref) {
+    // 用确定性伪随机数据测试 NEON 与 ref 一致性。
+    // [out=64, in=256], group_size=128 → 2 groups per row
+    if (!set_matvec_i4_impl_by_name("neon")) {
+        // 非 ARM 平台，跳过
+        return;
+    }
+    const int out_dim = 64, in_dim = 256, group_size = 128;
+    const int group_data = group_size / 2; // 64
+    const int group_total = 4 + group_data; // 68
+    const int groups_per_row = in_dim / group_size; // 2
+    const int row_bytes = groups_per_row * group_total; // 136
+
+    std::vector<uint8_t> w(out_dim * row_bytes);
+    std::vector<float> x(in_dim);
+    std::vector<float> y_neon(out_dim);
+    std::vector<float> y_ref(out_dim);
+
+    // 确定性伪随机填充
+    uint32_t seed = 42;
+    auto rng = [&]() -> uint32_t {
+        seed = seed * 1664525u + 1013904223u;
+        return seed;
+    };
+
+    // 填 x
+    for (int i = 0; i < in_dim; ++i) {
+        x[i] = static_cast<float>(static_cast<int>(rng() % 200) - 100) * 0.01f;
+    }
+
+    // 填 weights: scale=0.1(fp16=0x2E66), zero=8.0(fp16=0x4800)
+    uint16_t scale_h = 0x2E66; // ~0.1 in fp16
+    uint16_t zero_h = 0x4800;  // 8.0 in fp16
+    for (int o = 0; o < out_dim; ++o) {
+        for (int g = 0; g < groups_per_row; ++g) {
+            uint8_t *gp = w.data() + o * row_bytes + g * group_total;
+            std::memcpy(gp, &scale_h, 2);
+            std::memcpy(gp + 2, &zero_h, 2);
+            for (int b = 0; b < group_data; ++b) {
+                gp[4 + b] = static_cast<uint8_t>(rng() & 0xFF);
+            }
+        }
+    }
+
+    // NEON
+    set_matvec_i4_impl_by_name("neon");
+    matvec_i4(w.data(), x.data(), y_neon.data(), out_dim, in_dim, group_size);
+
+    // Ref
+    set_matvec_i4_impl_by_name("ref");
+    matvec_i4(w.data(), x.data(), y_ref.data(), out_dim, in_dim, group_size);
+
+    for (int i = 0; i < out_dim; ++i) {
+        float tol = std::abs(y_ref[i]) * 1e-4f + 1e-5f;
+        EXPECT_NEAR(y_neon[i], y_ref[i], tol);
+    }
+}
+
+TEST (matmul_ref_matches_iterated_matvec) {
+    // Y[M,N] = W[M,K] × X[K,N] should equal N matvecs
+    const int M = 8, K = 16, N = 4;
+    std::vector<float> w(M * K), x(K * N), y_mm(M * N), y_mv(M * N);
+
+    uint32_t seed = 123;
+    auto rng = [&]() -> float {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(static_cast<int>(seed % 200) - 100) * 0.01f;
+    };
+    for (auto &v : w) v = rng();
+    for (auto &v : x) v = rng();
+
+    // matmul
+    matmul_f32(w.data(), x.data(), y_mm.data(), M, K, N);
+
+    // N individual matvecs
+    for (int c = 0; c < N; ++c) {
+        matvec_f32(w.data(), x.data() + c * K, y_mv.data() + c * M, M, K);
+    }
+
+    for (int i = 0; i < M * N; ++i) {
+        EXPECT_NEAR(y_mm[i], y_mv[i], 1e-5);
+    }
+}

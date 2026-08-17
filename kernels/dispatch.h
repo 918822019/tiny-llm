@@ -96,6 +96,59 @@ namespace tinyqwen {
                         const float *x, float *yq, float *yk, float *yv,
                         int q_dim, int kv_dim, int in_dim);
 
+    // ---- INT4 weight-only 路径（非对称 uint4，per-group scale+zero，interleaved）----
+    //
+    // 签名比 f32/f16 多一个 group_size 参数：kernel 内部按 interleaved 布局
+    // 逐组解包反量化。权重指针类型 = const uint8_t*（packed bytes，包含 scale/zero）。
+    using MatvecI4Fn = void (*)(const uint8_t *w, const float *x, float *y,
+                                int out_dim, int in_dim, int group_size);
+
+    void register_matvec_i4_impl(const char *name, MatvecI4Fn fn);
+    bool set_matvec_i4_impl_by_name(const char *name);
+    const char *matvec_i4_impl_name();
+    const char *available_matvec_i4_impls();
+    void matvec_i4(const uint8_t *w, const float *x, float *y,
+                   int out_dim, int in_dim, int group_size);
+
+    using MatvecPairI4Fn = void (*)(const uint8_t *w1, const uint8_t *w2, const float *x,
+                                    float *y1, float *y2, int out_dim, int in_dim, int group_size);
+    void register_matvec_i4_pair_impl(const char *name, MatvecPairI4Fn fn);
+    void matvec_pair_i4(const uint8_t *w1, const uint8_t *w2, const float *x,
+                        float *y1, float *y2, int out_dim, int in_dim, int group_size);
+
+    using MatvecQkvI4Fn = void (*)(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
+                                   const float *x, float *yq, float *yk, float *yv,
+                                   int q_dim, int kv_dim, int in_dim, int group_size);
+    void register_matvec_qkv_i4_impl(const char *name, MatvecQkvI4Fn fn);
+    void matvec_qkv_i4(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
+                       const float *x, float *yq, float *yk, float *yv,
+                       int q_dim, int kv_dim, int in_dim, int group_size);
+
+    // ---- Matmul (GEMM) 路径：prefill 批量投影 ----
+    //
+    // Y[M,N] = W[M,K] × X[K,N]。X 和 Y 按列主序存储：每列 = 一个 token 的向量。
+    // W 行主序（与 matvec 共用同一份权重布局）。
+    // N=1 时退化为 matvec，但专门的 matvec kernel 通常更快（少 loop overhead）。
+    using MatmulFn = void (*)(const float *w, const float *x, float *y,
+                              int M, int K, int N);
+    void register_matmul_impl(const char *name, MatmulFn fn);
+    bool set_matmul_impl_by_name(const char *name);
+    void matmul_f32(const float *w, const float *x, float *y, int M, int K, int N);
+
+    using MatmulI4Fn = void (*)(const uint8_t *w, const float *x, float *y,
+                                int M, int K, int N, int group_size);
+    void register_matmul_i4_impl(const char *name, MatmulI4Fn fn);
+    void matmul_i4(const uint8_t *w, const float *x, float *y,
+                   int M, int K, int N, int group_size);
+
+#define TINYQWEN_MATMUL_VARIANT(fn, name)                                              \
+    [[maybe_unused]] static const bool tqwen_reg_mm_##fn =                             \
+            (tinyqwen::register_matmul_impl(name, fn), true)
+
+#define TINYQWEN_MATMUL_I4_VARIANT(fn, name)                                           \
+    [[maybe_unused]] static const bool tqwen_reg_mm_i4_##fn =                          \
+            (tinyqwen::register_matmul_i4_impl(name, fn), true)
+
     // ---- 非 matvec 算子分发（ops dispatch）----
     //
     // rmsnorm / rope / attention_decode / swiglu / argmax 这五个算子在
@@ -120,7 +173,7 @@ namespace tinyqwen {
     void register_swiglu_impl(const char *name, SwigluFn fn);
     void register_argmax_impl(const char *name, ArgmaxFn fn);
 
-    // 按名字选择 ops 实现（五个算子共用一个名字）。找到任一注册即返回 true。
+    // 按名字选择 ops 实现（所有非 matvec 算子共用一个名字）。找到任一注册即返回 true。
     bool set_ops_impl_by_name(const char *name);
     const char *ops_impl_name();
 
@@ -171,6 +224,32 @@ namespace tinyqwen {
     void gpu_decode_reset(GpuDecodeEngine *e);
     void gpu_decode_destroy(GpuDecodeEngine *e);
     const float *gpu_decode_logits(const GpuDecodeEngine *e); // device 指针（供 dump）
+
+    // ---- GDN（Gated DeltaNet）算子分发 ----
+    //
+    // Qwen3.5 的 GDN 层专属算子：l2norm / causal conv1d / gated delta rule 递归 /
+    // 门控 RMSNorm。与上面五个算子共用同一个实现名（--ops-impl neon 同时启用）。
+    using CausalConv1dUpdateFn = void (*)(const float *x, float *conv_state,
+                                          const float *weight, float *out,
+                                          int dim, int kernel_size);
+    using L2normInplaceFn = void (*)(float *x, int n, float eps);
+    using GdnStepFn = void (*)(float *S, const float *q, const float *k, const float *v,
+                               float g, float beta, float *o, int qk_dim, int v_dim);
+    using RmsnormGatedFn = void (*)(const float *x, const float *gate, const float *weight,
+                                    float *y, int n, float eps);
+
+    void register_causal_conv1d_update_impl(const char *name, CausalConv1dUpdateFn fn);
+    void register_l2norm_inplace_impl(const char *name, L2normInplaceFn fn);
+    void register_gdn_step_impl(const char *name, GdnStepFn fn);
+    void register_rmsnorm_gated_impl(const char *name, RmsnormGatedFn fn);
+
+    void causal_conv1d_update(const float *x, float *conv_state, const float *weight,
+                              float *out, int dim, int kernel_size);
+    void l2norm_inplace(float *x, int n, float eps);
+    void gdn_step(float *S, const float *q, const float *k, const float *v,
+                  float g, float beta, float *o, int qk_dim, int v_dim);
+    void rmsnorm_gated(const float *x, const float *gate, const float *weight,
+                       float *y, int n, float eps);
 } // namespace tinyqwen
 
 // 变体自注册宏：写在实现文件末尾、namespace tinyqwen 内部（fn 要用非限定名）。
@@ -205,6 +284,19 @@ namespace tinyqwen {
     [[maybe_unused]] static const bool tqwen_reg_qkv_f16_##fn =                      \
             (tinyqwen::register_matvec_qkv_f16_impl(name, fn), true)
 
+// INT4 路径的自注册宏（登记进 i4 / i4-pair / i4-qkv 注册表）。
+#define TINYQWEN_MATVEC_I4_VARIANT(fn, name)                                         \
+    [[maybe_unused]] static const bool tqwen_reg_i4_##fn =                           \
+            (tinyqwen::register_matvec_i4_impl(name, fn), true)
+
+#define TINYQWEN_MATVEC_I4_PAIR_VARIANT(fn, name)                                    \
+    [[maybe_unused]] static const bool tqwen_reg_i4_pair_##fn =                      \
+            (tinyqwen::register_matvec_i4_pair_impl(name, fn), true)
+
+#define TINYQWEN_MATVEC_QKV_I4_VARIANT(fn, name)                                     \
+    [[maybe_unused]] static const bool tqwen_reg_qkv_i4_##fn =                       \
+            (tinyqwen::register_matvec_qkv_i4_impl(name, fn), true)
+
 // 非 matvec 算子的自注册宏（各登记进对应算子注册表；key 用同一个实现名）。
 #define TINYQWEN_RMSNORM_VARIANT(fn, name)                                           \
     [[maybe_unused]] static const bool tqwen_reg_rmsnorm_##fn =                      \
@@ -235,3 +327,20 @@ namespace tinyqwen {
             (tinyqwen::register_gpu_decode_impl(name_str, create_fn, step_fn,        \
                                                 reset_fn, destroy_fn, logits_fn),     \
              true)
+
+// GDN 算子的自注册宏（共用 ops 实现名）。
+#define TINYQWEN_CAUSAL_CONV1D_UPDATE_VARIANT(fn, name)                              \
+    [[maybe_unused]] static const bool tqwen_reg_conv1d_##fn =                       \
+            (tinyqwen::register_causal_conv1d_update_impl(name, fn), true)
+
+#define TINYQWEN_L2NORM_INPLACE_VARIANT(fn, name)                                    \
+    [[maybe_unused]] static const bool tqwen_reg_l2norm_##fn =                       \
+            (tinyqwen::register_l2norm_inplace_impl(name, fn), true)
+
+#define TINYQWEN_GDN_STEP_VARIANT(fn, name)                                          \
+    [[maybe_unused]] static const bool tqwen_reg_gdn_step_##fn =                     \
+            (tinyqwen::register_gdn_step_impl(name, fn), true)
+
+#define TINYQWEN_RMSNORM_GATED_VARIANT(fn, name)                                     \
+    [[maybe_unused]] static const bool tqwen_reg_rmsnorm_gated_##fn =                \
+            (tinyqwen::register_rmsnorm_gated_impl(name, fn), true)

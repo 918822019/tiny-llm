@@ -11,6 +11,8 @@ add_executable(tinyqwen_tests
         test_kv_cache.cpp
         test_config.cpp
         test_ops_neon.cpp
+        test_gdn_ops.cpp
+        test_gdn_ops_neon.cpp
 )
 # GPU decode engine 的算子对齐测试只在 CUDA 构建编译（引用了 device 指针
 # 启动器，链接 kernels 的 CUDA OBJECT）；无 CUDA 平台不受影响。

@@ -19,9 +19,15 @@ tinyqwen/
 │   ├── ref_ops.h           # 所有 reference kernel 的签名约定（共用）
 │   ├── dispatch.h/.cpp     # 分发层 + 注册表：model 调通用入口 matvec_f32()；
 │   │                       # 变体用 TINYQWEN_MATVEC_VARIANT 宏自注册（共用）
-│   └── <op>/               # 每个算子一个文件夹：rmsnorm/rope/matvec/softmax/attention/silu/argmax
-│       ├── <op>_<dtype>_ref.cpp          # 参考实现（base）
-│       └── <op>_<dtype>_<variant>.cpp    # 【改进位】优化版 kernel，只增不删（见 optimization.md）
+│   ├── <op>/               # 每个算子一个文件夹：rmsnorm/rope/matvec/softmax/attention/silu/argmax
+│   │   ├── <op>_<dtype>_ref.cpp          # 参考实现（base）
+│   │   └── <op>_<dtype>_<variant>.cpp    # 【改进位】优化版 kernel，只增不删（见 optimization.md）
+│   └── gdn/               # Qwen3.5 GDN（Gated DeltaNet）专属算子
+│       ├── gdn_ops_ref.cpp               # 4 个 ref 实现（l2norm/conv1d/gdn_step/rmsnorm_gated）
+│       ├── gdn_step_neon.cpp             # delta rule 递归步 NEON（融合遍 + 4× 展开）
+│       ├── causal_conv1d_update_neon.cpp  # depthwise conv1d NEON（8 通道解交错）
+│       ├── l2norm_inplace_neon.cpp        # L2 归一化 NEON（vrsqrte + 16 元素展开）
+│       └── rmsnorm_gated_neon.cpp         # 门控 RMSNorm NEON（双路 exp 展开）
 │
 ├── tools/                  # Python 工具（不进 CMake）
 │   ├── export_qwen_to_tiny.py   # HF safetensors/bf16 -> .tqwen（fp32）

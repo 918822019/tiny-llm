@@ -1,4 +1,5 @@
 #include "dispatch.h"
+#include "gdn_ops.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -216,6 +217,148 @@ namespace tinyqwen {
         matvec_pair_f16(wk, wv, x, yk, yv, kv_dim, in_dim);
     }
 
+    // ---- INT4 路径：与 f32/f16 对称的第三套注册表/选择器/入口 ----
+    namespace {
+        std::unordered_map<std::string, MatvecI4Fn> &i4_registry() {
+            static std::unordered_map<std::string, MatvecI4Fn> r;
+            return r;
+        }
+
+        std::unordered_map<std::string, MatvecPairI4Fn> &i4_pair_registry() {
+            static std::unordered_map<std::string, MatvecPairI4Fn> r;
+            return r;
+        }
+
+        std::unordered_map<std::string, MatvecQkvI4Fn> &qkv_i4_registry() {
+            static std::unordered_map<std::string, MatvecQkvI4Fn> r;
+            return r;
+        }
+
+        MatvecI4Fn g_i4_current = nullptr;
+        std::string g_i4_current_name;
+    } // namespace
+
+    void register_matvec_i4_impl(const char *name, MatvecI4Fn fn) {
+        i4_registry()[name] = fn;
+    }
+
+    bool set_matvec_i4_impl_by_name(const char *name) {
+        const auto &r = i4_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_i4_current = it->second;
+        g_i4_current_name = name;
+        return true;
+    }
+
+    const char *matvec_i4_impl_name() {
+        return g_i4_current_name.empty() ? "ref" : g_i4_current_name.c_str();
+    }
+
+    const char *available_matvec_i4_impls() {
+        static std::string joined;
+        if (joined.empty()) {
+            std::vector<std::string> names;
+            for (const auto &kv : i4_registry()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i) joined += ", ";
+                joined += names[i];
+            }
+        }
+        return joined.c_str();
+    }
+
+    void matvec_i4(const uint8_t *w, const float *x, float *y,
+                   int out_dim, int in_dim, int group_size) {
+        MatvecI4Fn fn = g_i4_current;
+        if (!fn) {
+            auto it = i4_registry().find("ref");
+            if (it == i4_registry().end()) {
+                std::fprintf(stderr,
+                             "tinyqwen: matvec_i4 'ref' 未注册——检查 kernels 是否被整体链接\n");
+                std::abort();
+            }
+            fn = it->second;
+        }
+        fn(w, x, y, out_dim, in_dim, group_size);
+    }
+
+    void register_matvec_i4_pair_impl(const char *name, MatvecPairI4Fn fn) {
+        i4_pair_registry()[name] = fn;
+    }
+
+    void matvec_pair_i4(const uint8_t *w1, const uint8_t *w2, const float *x,
+                        float *y1, float *y2, int out_dim, int in_dim, int group_size) {
+        const auto &pr = i4_pair_registry();
+        auto it = pr.find(matvec_i4_impl_name());
+        if (it != pr.end()) {
+            it->second(w1, w2, x, y1, y2, out_dim, in_dim, group_size);
+            return;
+        }
+        matvec_i4(w1, x, y1, out_dim, in_dim, group_size);
+        matvec_i4(w2, x, y2, out_dim, in_dim, group_size);
+    }
+
+    void register_matvec_qkv_i4_impl(const char *name, MatvecQkvI4Fn fn) {
+        qkv_i4_registry()[name] = fn;
+    }
+
+    void matvec_qkv_i4(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
+                       const float *x, float *yq, float *yk, float *yv,
+                       int q_dim, int kv_dim, int in_dim, int group_size) {
+        const auto &r = qkv_i4_registry();
+        auto it = r.find(matvec_i4_impl_name());
+        if (it != r.end()) {
+            it->second(wq, wk, wv, x, yq, yk, yv, q_dim, kv_dim, in_dim, group_size);
+            return;
+        }
+        matvec_i4(wq, x, yq, q_dim, in_dim, group_size);
+        matvec_pair_i4(wk, wv, x, yk, yv, kv_dim, in_dim, group_size);
+    }
+
+    // ---- Matmul (GEMM) 分发 ----
+    namespace {
+        std::unordered_map<std::string, MatmulFn> &mm_registry() {
+            static std::unordered_map<std::string, MatmulFn> r;
+            return r;
+        }
+        MatmulFn g_mm_current = nullptr;
+
+        std::unordered_map<std::string, MatmulI4Fn> &mm_i4_registry() {
+            static std::unordered_map<std::string, MatmulI4Fn> r;
+            return r;
+        }
+        MatmulI4Fn g_mm_i4_current = nullptr;
+    } // namespace
+
+    void register_matmul_impl(const char *name, MatmulFn fn) {
+        mm_registry()[name] = fn;
+        if (!g_mm_current) g_mm_current = fn;
+    }
+
+    bool set_matmul_impl_by_name(const char *name) {
+        auto &r = mm_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_mm_current = it->second;
+        return true;
+    }
+
+    void matmul_f32(const float *w, const float *x, float *y, int M, int K, int N) {
+        g_mm_current(w, x, y, M, K, N);
+    }
+
+    void register_matmul_i4_impl(const char *name, MatmulI4Fn fn) {
+        mm_i4_registry()[name] = fn;
+        if (!g_mm_i4_current) g_mm_i4_current = fn;
+    }
+
+    void matmul_i4(const uint8_t *w, const float *x, float *y,
+                   int M, int K, int N, int group_size) {
+        g_mm_i4_current(w, x, y, M, K, N, group_size);
+    }
+
     // ---- 非 matvec 算子分发 ----
     namespace {
         std::unordered_map<std::string, RmsnormFn> &rmsnorm_registry() {
@@ -239,7 +382,25 @@ namespace tinyqwen {
             return r;
         }
 
-        // 五个算子共用的当前实现名。空 = 未显式选择，通用入口兜底到 _ref。
+        // GDN 算子注册表。
+        std::unordered_map<std::string, CausalConv1dUpdateFn> &conv1d_registry() {
+            static std::unordered_map<std::string, CausalConv1dUpdateFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, L2normInplaceFn> &l2norm_registry() {
+            static std::unordered_map<std::string, L2normInplaceFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, GdnStepFn> &gdn_step_registry() {
+            static std::unordered_map<std::string, GdnStepFn> r;
+            return r;
+        }
+        std::unordered_map<std::string, RmsnormGatedFn> &rmsnorm_gated_registry() {
+            static std::unordered_map<std::string, RmsnormGatedFn> r;
+            return r;
+        }
+
+        // 所有非 matvec 算子共用的当前实现名。空 = 未显式选择，通用入口兜底到 _ref。
         std::string g_ops_name;
     } // namespace
 
@@ -250,6 +411,19 @@ namespace tinyqwen {
     }
     void register_swiglu_impl(const char *name, SwigluFn fn) { swiglu_registry()[name] = fn; }
     void register_argmax_impl(const char *name, ArgmaxFn fn) { argmax_registry()[name] = fn; }
+
+    void register_causal_conv1d_update_impl(const char *name, CausalConv1dUpdateFn fn) {
+        conv1d_registry()[name] = fn;
+    }
+    void register_l2norm_inplace_impl(const char *name, L2normInplaceFn fn) {
+        l2norm_registry()[name] = fn;
+    }
+    void register_gdn_step_impl(const char *name, GdnStepFn fn) {
+        gdn_step_registry()[name] = fn;
+    }
+    void register_rmsnorm_gated_impl(const char *name, RmsnormGatedFn fn) {
+        rmsnorm_gated_registry()[name] = fn;
+    }
 
     bool set_ops_impl_by_name(const char *name) {
         // "ref" = 兜底默认：清空当前名（通用入口自动落回各自 _ref），恒接受。
@@ -262,7 +436,9 @@ namespace tinyqwen {
         const std::string n = name;
         const bool any = rmsnorm_registry().count(n) || rope_registry().count(n) ||
                          attention_registry().count(n) || swiglu_registry().count(n) ||
-                         argmax_registry().count(n);
+                         argmax_registry().count(n) ||
+                         conv1d_registry().count(n) || l2norm_registry().count(n) ||
+                         gdn_step_registry().count(n) || rmsnorm_gated_registry().count(n);
         if (!any) return false;
         g_ops_name = n;
         return true;
@@ -389,5 +565,50 @@ namespace tinyqwen {
     void gpu_decode_destroy(GpuDecodeEngine *e) { g_gpu_current->destroy(e); }
     const float *gpu_decode_logits(const GpuDecodeEngine *e) {
         return g_gpu_current->logits(e);
+    }
+
+    // ---- GDN 算子通用入口 ----
+
+    void causal_conv1d_update(const float *x, float *conv_state, const float *weight,
+                              float *out, int dim, int kernel_size) {
+        const auto &r = conv1d_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(x, conv_state, weight, out, dim, kernel_size);
+            return;
+        }
+        causal_conv1d_update_ref(x, conv_state, weight, out, dim, kernel_size);
+    }
+
+    void l2norm_inplace(float *x, int n, float eps) {
+        const auto &r = l2norm_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(x, n, eps);
+            return;
+        }
+        l2norm_inplace_ref(x, n, eps);
+    }
+
+    void gdn_step(float *S, const float *q, const float *k, const float *v,
+                  float g, float beta, float *o, int qk_dim, int v_dim) {
+        const auto &r = gdn_step_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(S, q, k, v, g, beta, o, qk_dim, v_dim);
+            return;
+        }
+        gdn_step_ref(S, q, k, v, g, beta, o, qk_dim, v_dim);
+    }
+
+    void rmsnorm_gated(const float *x, const float *gate, const float *weight,
+                       float *y, int n, float eps) {
+        const auto &r = rmsnorm_gated_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(x, gate, weight, y, n, eps);
+            return;
+        }
+        rmsnorm_gated_ref(x, gate, weight, y, n, eps);
     }
 } // namespace tinyqwen
