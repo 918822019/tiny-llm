@@ -1026,6 +1026,52 @@
 
 ---
 
+### gpu_engine_cudagraph（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。
+- **优化栈**：gpu_engine（f16，GPU-resident 整段 forward）+ **CUDA Graph
+  capture/replay**
+- **是什么**：`engine_step` 首次调用时把整段 launch 序列（embed→24 层→
+  final norm/lm_head→argmax，~300 次 launch）`cudaStreamBeginCapture` 成
+  一个 `cudaGraphExec_t`；之后每步只更新两个 device int（`d_pos`/
+  `d_token`）的内容，再 `cudaGraphLaunch` 复用同一份图。前提改动：
+  `embed_lookup`/`rope`/`kv_append`/`attention_decode` 的 `token`/`pos`
+  参数从"按值传参"改成"传 device 指针、kernel 内解引用"——因为一份 graph
+  一旦 capture，node 的参数值就固定了，每步变化的标量必须来自固定地址才能
+  被 replay 时读到新值，不需要逐 node 用 `cudaGraphExecKernelNodeSetParams`
+  打补丁。`engine_reset`（`seq_len=0`）不触发重新 capture，因为 graph 结构
+  本身不依赖 pos 的值。
+- **假设**：启动开销类。上一条目诊断"4.89ms 离带宽地板还差 ~3.3ms，主要是
+  每 token ~300 次 kernel 启动的开销"，CUDA Graph 把整段启动批成一次
+  `cudaGraphLaunch`，预期是"最大头"。
+- **结果**：decode 中位 **4.63ms/token**（4 遍同场 A/B 交替测：A1 4.88/A2
+  4.90（无 graph）、B1 4.62/B2 4.64（有 graph），各 27 个稳态 decode
+  token），p95 ~4.97
+- **vs 上一配置**：**1.06×**（同场 A/B 交替，4.89→4.63，两种顺序下结果一致，
+  排除了机器漂移/顺序红利）
+- **vs 原始基线**：跨机器（Mac fp32-baseline 是 M 系芯片），无意义，仅存档，
+  同 `gpu_engine` 条目的处理方式。
+- **验证**：71 单测全过（新增：`test_gpu_ops.cpp` 里 rope/kv_append/
+  attention/embed 4 个测试因签名改动同步改为 device 指针调用，数值断言
+  不变）；`--engine cuda` 在 fp32/f16 模型上 16-token 与 golden（CPU ref）
+  逐位一致，f16 32-token 与 CPU forward 逐位一致；`scripts/verify.sh`
+  （CPU 路径门禁）全过，未受影响。
+- **瓶颈转移**：engine 路径无 op 级 profiler（同 gpu_engine 条目的既有限制），
+  下一刀转向 kernel 内部效率（见 `gpu_engine_warprow`）。
+- **意外 / 教训**：
+  1. **收益（1.06×）远小于"最大头"的预期**：日志诊断的 ~3.3ms 缺口不能
+     简单归因于"launch 次数多"。本机是 x86 高速主机，单次 kernel enqueue
+     到 stream 的 CPU 侧开销本就很低，graph 省下来的主要是 driver 侧重复
+     的参数校验/队列管理，而不是能大幅压缩的部分——"诊断听起来合理"和
+     "测出来真值钱"是两件事，这里又是一次提醒（同构于 `neon_mt_bal` 条目
+     "假设被证伪"）。
+  2. **不是白费**：1.06× 虽小但方向稳（两次交替测都在同一水平），且改动
+     本身（device 指针间接引用）是后续任何"减少每步开销"优化的基础设施，
+     不是一次性的。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh gpu_engine_cudagraph --extra-args "--engine cuda"`
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

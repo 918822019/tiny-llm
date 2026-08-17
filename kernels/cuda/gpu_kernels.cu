@@ -185,17 +185,21 @@ namespace gpu {
     // ========================================================================
     // embed_lookup：hidden = embed 表第 token 行（f16 时逐元素转 fp32）。
     // ========================================================================
-    __global__ void embed_f32_kernel(float *hidden, const float *embed, int token, int hidden_dim) {
+    __global__ void embed_f32_kernel(float *hidden, const float *embed, const int *token_ptr,
+                                     int hidden_dim) {
         const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        const int token = *token_ptr;
         if (i < hidden_dim) hidden[i] = embed[static_cast<size_t>(token) * hidden_dim + i];
     }
-    __global__ void embed_f16_kernel(float *hidden, const __half *embed, int token, int hidden_dim) {
+    __global__ void embed_f16_kernel(float *hidden, const __half *embed, const int *token_ptr,
+                                     int hidden_dim) {
         const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        const int token = *token_ptr;
         if (i < hidden_dim)
             hidden[i] = __half2float(embed[static_cast<size_t>(token) * hidden_dim + i]);
     }
-    void embed_lookup(cudaStream_t s, float *hidden, const void *embed, int token, int hidden_dim,
-                      bool is_f16) {
+    void embed_lookup(cudaStream_t s, float *hidden, const void *embed, const int *token,
+                      int hidden_dim, bool is_f16) {
         const int blocks = (hidden_dim + kBlock - 1) / kBlock;
         if (is_f16)
             GPU_LAUNCH(embed_f16_kernel<<<blocks, kBlock, 0, s>>>(
@@ -255,11 +259,12 @@ namespace gpu {
     // powf/cosf/sinf（与 rope_ref 的单精度一致）。q、k 各启动一段。
     // ========================================================================
     __global__ void rope_kernel(float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
-                                int pos, float theta) {
+                                const int *pos_ptr, float theta) {
         const int half = head_dim / 2;
         const int total = (n_heads + n_kv_heads) * half; // 所有 (head, i) 配对
         const int t = blockIdx.x * blockDim.x + threadIdx.x;
         if (t >= total) return;
+        const int pos = *pos_ptr;
         const int i = t % half;    // 配对内下标
         const int h_all = t / half; // 第几个 (head)（先 q 后 k）
         float *base;
@@ -277,7 +282,7 @@ namespace gpu {
         base[i + half] = x1 * c + x0 * s;
     }
     void rope(cudaStream_t s, float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
-              int pos, float theta) {
+              const int *pos, float theta) {
         const int half = head_dim / 2;
         const int total = (n_heads + n_kv_heads) * half;
         GPU_LAUNCH(rope_kernel<<<(total + kBlock - 1) / kBlock, kBlock, 0, s>>>(
@@ -289,11 +294,12 @@ namespace gpu {
     // 共 n_kv_heads*head_dim 个 float/每个 k 和 v。
     // ========================================================================
     __global__ void kv_append_kernel(float *k_plane, float *v_plane, const float *k_in,
-                                     const float *v_in, int pos, int n_kv_heads, int max_seq_len,
-                                     int head_dim) {
+                                     const float *v_in, const int *pos_ptr, int n_kv_heads,
+                                     int max_seq_len, int head_dim) {
         const int per = n_kv_heads * head_dim; // k（或 v）的元素总数
         const int t = blockIdx.x * blockDim.x + threadIdx.x;
         if (t >= 2 * per) return;
+        const int pos = *pos_ptr;
         const bool is_v = t >= per;
         const int idx = is_v ? t - per : t; // [0, per)
         const int h = idx / head_dim;
@@ -305,7 +311,8 @@ namespace gpu {
         else k_plane[dst] = k_in[idx];
     }
     void kv_append(cudaStream_t s, float *k_plane, float *v_plane, const float *k_in,
-                   const float *v_in, int pos, int n_kv_heads, int max_seq_len, int head_dim) {
+                   const float *v_in, const int *pos, int n_kv_heads, int max_seq_len,
+                   int head_dim) {
         const int per = n_kv_heads * head_dim;
         const int total = 2 * per;
         GPU_LAUNCH(kv_append_kernel<<<(total + kBlock - 1) / kBlock, kBlock, 0, s>>>(
@@ -317,10 +324,11 @@ namespace gpu {
     // 串行（与 ref 同序），head_dim 维并行。对齐 attention_decode_ref。
     // ========================================================================
     __global__ void attention_kernel(float *out, const float *q, const float *k_cache,
-                                     const float *v_cache, int seq_len, int max_seq_len,
+                                     const float *v_cache, const int *pos_ptr, int max_seq_len,
                                      int n_heads, int n_kv_heads, int head_dim, float scale) {
         const int h = blockIdx.x;
         if (h >= n_heads) return;
+        const int seq_len = *pos_ptr + 1;
         const int i = threadIdx.x; // 负责 head_dim 里的第 i 维（要求 blockDim.x>=head_dim）
         const int heads_per_kv = n_heads / n_kv_heads;
         const int kv = h / heads_per_kv;
@@ -361,11 +369,11 @@ namespace gpu {
         if (active) oh[i] = oh_i * inv_l;
     }
     void attention_decode(cudaStream_t s, float *out, const float *q, const float *k_cache,
-                          const float *v_cache, int seq_len, int max_seq_len, int n_heads,
+                          const float *v_cache, const int *pos, int max_seq_len, int n_heads,
                           int n_kv_heads, int head_dim, float scale) {
         // block 大小取 >= head_dim 的最小 kBlock 倍数（head_dim=64 → 256）。
         GPU_LAUNCH(attention_kernel<<<n_heads, kBlock, 0, s>>>(
-                out, q, k_cache, v_cache, seq_len, max_seq_len, n_heads, n_kv_heads, head_dim,
+                out, q, k_cache, v_cache, pos, max_seq_len, n_heads, n_kv_heads, head_dim,
                 scale));
     }
 

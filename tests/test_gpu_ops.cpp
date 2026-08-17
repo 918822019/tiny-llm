@@ -81,11 +81,12 @@ TEST (gpu_rope_matches_ref) {
     for (int pos : {0, 1, 7, 100}) {
         std::vector<float> qr = q, kr = k, qg = q, kg = k;
         rope_ref(qr.data(), kr.data(), n_heads, n_kv_heads, head_dim, pos, 10000.0f);
-        DBuf dq(qn * sizeof(float)), dk(kn * sizeof(float));
+        DBuf dq(qn * sizeof(float)), dk(kn * sizeof(float)), dpos(sizeof(int));
         cudaMemcpy(dq.p, qg.data(), qn * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(dk.p, kg.data(), kn * sizeof(float), cudaMemcpyHostToDevice);
-        gpu::rope(nullptr, dq.as<float>(), dk.as<float>(), n_heads, n_kv_heads, head_dim, pos,
-                  10000.0f);
+        cudaMemcpy(dpos.p, &pos, sizeof(int), cudaMemcpyHostToDevice);
+        gpu::rope(nullptr, dq.as<float>(), dk.as<float>(), n_heads, n_kv_heads, head_dim,
+                  dpos.as<int>(), 10000.0f);
         cudaDeviceSynchronize();
         cudaMemcpy(qg.data(), dq.p, qn * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(kg.data(), dk.p, kn * sizeof(float), cudaMemcpyDeviceToHost);
@@ -116,9 +117,10 @@ TEST (gpu_embed_matches_host) {
     std::vector<float> embed((size_t)vocab * hidden), h_ref(hidden), h_gpu(hidden);
     for (size_t i = 0; i < embed.size(); ++i) embed[i] = rnd((int)i, 29, 0.125f);
     for (int j = 0; j < hidden; ++j) h_ref[j] = embed[(size_t)token * hidden + j];
-    DBuf de(embed.size() * sizeof(float)), dh(hidden * sizeof(float));
+    DBuf de(embed.size() * sizeof(float)), dh(hidden * sizeof(float)), dtok(sizeof(int));
     cudaMemcpy(de.p, embed.data(), embed.size() * sizeof(float), cudaMemcpyHostToDevice);
-    gpu::embed_lookup(nullptr, dh.as<float>(), de.p, token, hidden, false);
+    cudaMemcpy(dtok.p, &token, sizeof(int), cudaMemcpyHostToDevice);
+    gpu::embed_lookup(nullptr, dh.as<float>(), de.p, dtok.as<int>(), hidden, false);
     cudaDeviceSynchronize();
     cudaMemcpy(h_gpu.data(), dh.p, hidden * sizeof(float), cudaMemcpyDeviceToHost);
     for (int j = 0; j < hidden; ++j) EXPECT_NEAR(h_gpu[j], h_ref[j], 1e-5);
@@ -165,14 +167,15 @@ TEST (gpu_kv_append_matches_host) {
             vh[dst] = v_in[h * head_dim + d];
         }
     DBuf dkp(plane * sizeof(float)), dvp(plane * sizeof(float)), dki(per * sizeof(float)),
-            dvi(per * sizeof(float));
+            dvi(per * sizeof(float)), dpos(sizeof(int));
     // device plane 清零，k_in/v_in 上传，kernel 写入 pos 槽位。
     cudaMemset(dkp.p, 0, plane * sizeof(float));
     cudaMemset(dvp.p, 0, plane * sizeof(float));
     cudaMemcpy(dki.p, k_in.data(), per * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dvi.p, v_in.data(), per * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dpos.p, &pos, sizeof(int), cudaMemcpyHostToDevice);
     gpu::kv_append(nullptr, dkp.as<float>(), dvp.as<float>(), dki.as<float>(), dvi.as<float>(),
-                   pos, n_kv_heads, max_seq_len, head_dim);
+                   dpos.as<int>(), n_kv_heads, max_seq_len, head_dim);
     cudaDeviceSynchronize();
     std::vector<float> kg(plane), vg(plane);
     cudaMemcpy(kg.data(), dkp.p, plane * sizeof(float), cudaMemcpyDeviceToHost);
@@ -198,13 +201,15 @@ TEST (gpu_attention_matches_ref) {
         attention_decode_ref(q.data(), kc.data(), vc.data(), seq_len, max_seq_len, n_heads,
                              n_kv_heads, head_dim, scale, o_ref.data());
         DBuf dq(qn * sizeof(float)), dkc(plane * sizeof(float)), dvc(plane * sizeof(float)),
-                dout(qn * sizeof(float));
+                dout(qn * sizeof(float)), dpos(sizeof(int));
         cudaMemcpy(dq.p, q.data(), qn * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(dkc.p, kc.data(), plane * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(dvc.p, vc.data(), plane * sizeof(float), cudaMemcpyHostToDevice);
+        const int pos = seq_len - 1; // attention_decode 现在吃 pos，内部算 seq_len=pos+1
+        cudaMemcpy(dpos.p, &pos, sizeof(int), cudaMemcpyHostToDevice);
         gpu::attention_decode(nullptr, dout.as<float>(), dq.as<float>(), dkc.as<float>(),
-                              dvc.as<float>(), seq_len, max_seq_len, n_heads, n_kv_heads, head_dim,
-                              scale);
+                              dvc.as<float>(), dpos.as<int>(), max_seq_len, n_heads, n_kv_heads,
+                              head_dim, scale);
         cudaDeviceSynchronize();
         cudaMemcpy(o_gpu.data(), dout.p, qn * sizeof(float), cudaMemcpyDeviceToHost);
         for (int i = 0; i < qn; ++i) EXPECT_NEAR(o_gpu[i], o_ref[i], 5e-3);

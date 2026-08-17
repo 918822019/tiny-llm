@@ -79,6 +79,17 @@ namespace tinyqwen {
         // argmax 结果（device），seq_len 由 host 计数
         int *d_next = nullptr;
         int seq_len = 0;
+
+        // CUDA Graph：整段 decode 只 capture 一次，之后每步靠更新 d_pos/d_token
+        // 的内容 + cudaGraphLaunch 复用同一份 launch 序列（省掉 ~300 次/token
+        // 的 launch 开销）。d_pos/d_token 是 kernel 通过指针解引用读的固定地址，
+        // pos_host/token_host 是 cudaMemcpyAsync 的稳定源地址（engine_step 末尾
+        // 已经 cudaStreamSynchronize，保证下一步覆写前上一步的 H2D 已经完成)。
+        int *d_pos = nullptr, *d_token = nullptr;
+        int pos_host = 0, token_host = 0;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t graph_exec = nullptr;
+        bool graph_ready = false;
     };
 
     namespace {
@@ -249,6 +260,8 @@ namespace tinyqwen {
         ENG_CHECK(cudaMemset(e->d_kv, 0, kv_floats * sizeof(float)));
 
         ENG_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->d_next), sizeof(int)));
+        ENG_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->d_pos), sizeof(int)));
+        ENG_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->d_token), sizeof(int)));
 
         std::fprintf(stderr,
                      "[gpu engine] 权重已常驻显存（%s），kv %.1f MB，max_seq_len=%d\n",
@@ -260,22 +273,16 @@ namespace tinyqwen {
     }
 
     // ========================================================================
-    // decode_step：单 stream 串起整段 forward，末尾一次 argmax D2H。
+    // launch_forward：整段 forward 的 launch 序列本体，与 CUDA Graph capture
+    // 和"未 capture 时直接跑一遍"共用同一份代码。pos/token 一律从 e->d_pos/
+    // e->d_token 读（device 指针），这样 capture 出来的 graph 与具体 pos/token
+    // 的值无关，可以反复 replay，只需在 replay 前把新值 memcpy 进那两个地址。
     // ========================================================================
-    static int engine_step(GpuDecodeEngine *e, int token_id) {
-        const int pos = e->seq_len;
-        if (token_id < 0 || token_id >= e->vocab) {
-            std::fprintf(stderr, "gpu engine: token_id %d 越界 [0,%d)\n", token_id, e->vocab);
-            std::abort();
-        }
-        if (pos >= e->max_seq_len) {
-            std::fprintf(stderr, "gpu engine: 位置 %d 超过 max_seq_len %d\n", pos, e->max_seq_len);
-            std::abort();
-        }
+    static void launch_forward(GpuDecodeEngine *e) {
         cudaStream_t s = e->stream;
 
         // 1. 词嵌入
-        gpu::embed_lookup(s, e->d_hidden, e->d_embed, token_id, e->hidden, e->is_f16);
+        gpu::embed_lookup(s, e->d_hidden, e->d_embed, e->d_token, e->hidden, e->is_f16);
 
         // 2. 逐层 transformer
         for (int i = 0; i < e->n_layers; ++i) {
@@ -289,12 +296,13 @@ namespace tinyqwen {
             gpu::bias_add(s, e->d_q, L.qb, e->q_dim);
             gpu::bias_add(s, e->d_k, L.kb, e->kv_dim);
             gpu::bias_add(s, e->d_v, L.vb, e->kv_dim);
-            gpu::rope(s, e->d_q, e->d_k, e->n_heads, e->n_kv_heads, e->head_dim, pos,
+            gpu::rope(s, e->d_q, e->d_k, e->n_heads, e->n_kv_heads, e->head_dim, e->d_pos,
                       e->rope_theta);
-            gpu::kv_append(s, k_plane, v_plane, e->d_k, e->d_v, pos, e->n_kv_heads,
+            gpu::kv_append(s, k_plane, v_plane, e->d_k, e->d_v, e->d_pos, e->n_kv_heads,
                            e->max_seq_len, e->head_dim);
-            gpu::attention_decode(s, e->d_attn, e->d_q, k_plane, v_plane, pos + 1, e->max_seq_len,
-                                  e->n_heads, e->n_kv_heads, e->head_dim, e->attn_scale);
+            gpu::attention_decode(s, e->d_attn, e->d_q, k_plane, v_plane, e->d_pos,
+                                  e->max_seq_len, e->n_heads, e->n_kv_heads, e->head_dim,
+                                  e->attn_scale);
             mv(e, L.o, e->d_attn, e->d_o, e->hidden, e->q_dim);
             gpu::residual_add(s, e->d_hidden, e->d_o, e->hidden);
             gpu::rmsnorm(s, e->d_normed, e->d_hidden, L.post_ln, e->hidden, e->rms_eps);
@@ -308,8 +316,51 @@ namespace tinyqwen {
         gpu::rmsnorm(s, e->d_normed, e->d_hidden, e->d_final_norm, e->hidden, e->rms_eps);
         mv(e, e->d_lm_head, e->d_normed, e->d_logits, e->vocab, e->hidden);
 
-        // 4. argmax + 唯一的 D2H
+        // 4. argmax
         gpu::argmax(s, e->d_logits, e->d_next, e->vocab);
+    }
+
+    // ========================================================================
+    // decode_step：首次调用顺带 capture 整段 launch 序列成 graph——注意 stream
+    // capture 期间 kernel **不会**实际执行，只是被记录进 graph，所以 capture
+    // 完、instantiate 完之后要显式 cudaGraphLaunch 一次，这一步才算真正跑完
+    // （不是"空跑热身"，是"capture + 立即 replay 一次"）。之后每步只更新
+    // d_pos/d_token 的内容 + cudaGraphLaunch 复用同一份 graph，省掉逐 kernel
+    // re-launch 的固定开销。末尾一次 argmax D2H。
+    // ========================================================================
+    static int engine_step(GpuDecodeEngine *e, int token_id) {
+        const int pos = e->seq_len;
+        if (token_id < 0 || token_id >= e->vocab) {
+            std::fprintf(stderr, "gpu engine: token_id %d 越界 [0,%d)\n", token_id, e->vocab);
+            std::abort();
+        }
+        if (pos >= e->max_seq_len) {
+            std::fprintf(stderr, "gpu engine: 位置 %d 超过 max_seq_len %d\n", pos, e->max_seq_len);
+            std::abort();
+        }
+        cudaStream_t s = e->stream;
+
+        // pos_host/token_host 是 engine 常驻成员，地址稳定；上一步末尾已经
+        // cudaStreamSynchronize 过，这里覆写不会和上一步的 H2D 竞争。
+        e->pos_host = pos;
+        e->token_host = token_id;
+        ENG_CHECK(cudaMemcpyAsync(e->d_pos, &e->pos_host, sizeof(int), cudaMemcpyHostToDevice, s));
+        ENG_CHECK(
+                cudaMemcpyAsync(e->d_token, &e->token_host, sizeof(int), cudaMemcpyHostToDevice, s));
+
+        if (!e->graph_ready) {
+            ENG_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            launch_forward(e);
+            ENG_CHECK(cudaStreamEndCapture(s, &e->graph));
+            ENG_CHECK(cudaGraphInstantiate(&e->graph_exec, e->graph, nullptr, nullptr, 0));
+            ENG_CHECK(cudaGraphDestroy(e->graph)); // exec 已经吃透，graph 对象可以扔
+            e->graph = nullptr;
+            e->graph_ready = true;
+        }
+        // capture 期间 kernel 未真正执行（只是被记录），首次和后续都要靠
+        // cudaGraphLaunch 才会真正跑一遍。
+        ENG_CHECK(cudaGraphLaunch(e->graph_exec, s));
+
         ENG_CHECK(cudaStreamSynchronize(s)); // 等整段完成，顺带捕获运行期错误
         int next = 0;
         ENG_CHECK(cudaMemcpy(&next, e->d_next, sizeof(int), cudaMemcpyDeviceToHost));
@@ -334,6 +385,8 @@ namespace tinyqwen {
         freep(e->d_hidden); freep(e->d_normed); freep(e->d_q); freep(e->d_k); freep(e->d_v);
         freep(e->d_attn); freep(e->d_o); freep(e->d_gate); freep(e->d_up); freep(e->d_ffn);
         freep(e->d_logits); freep(e->d_kv); freep(e->d_next);
+        freep(e->d_pos); freep(e->d_token);
+        if (e->graph_ready) cudaGraphExecDestroy(e->graph_exec);
         if (e->stream) cudaStreamDestroy(e->stream);
         delete e;
     }
