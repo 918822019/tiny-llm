@@ -88,7 +88,10 @@ if (TINYQWEN_HAS_CUDA)
             matvec/matvec_f32_cuda_resident_coal.cu
             # f16 权重版 cuda_resident_coal（权重流量减半）；与 f32 同名注册，
             # 按模型 dtype 解析（f16 模型 + --matvec-impl cuda_resident_coal 用本文件）。
-            matvec/matvec_f16_cuda_resident_coal.cu)
+            matvec/matvec_f16_cuda_resident_coal.cu
+            # cuda_resident_coal_ws = coal kernel + x/y 常驻 workspace + 删冗余 sync
+            # （砍每调用固定开销；kernel 与 coal 逐字相同）。
+            matvec/matvec_f32_cuda_resident_coal_ws.cu)
     set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
     target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
 endif ()

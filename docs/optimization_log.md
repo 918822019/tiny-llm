@@ -34,6 +34,7 @@
 | cuda_resident_ws（x86_64 + A10） | aa30aa5 | 46.05 | 46.52 | N/A（跨机器，基线是 M 系芯片） | 1.03×（vs cuda_resident，≈无效）；12.67×（同场 vs 本机 ref） | x/y 常驻 workspace（删每调用 alloc/free）——证伪归档：CUDA 池化小分配，瓶颈实为 kernel 非合并访存 |
 | cuda_resident_coal（x86_64 + A10） | 7356481 | 9.16 | 9.81 | N/A（跨机器，基线是 M 系芯片） | 5.17×（vs cuda_resident）；63.94×（同场 vs 本机 ref） | matvec kernel 改合并访存（block-per-row + warp 归约），warp 读权重从 32 条分散 cache line → 1 条满线；CUDA 路线首次逼近带宽地板 |
 | f16_cuda_resident_coal（x86_64 + A10） | 3408267 | 7.68 | 8.14 | N/A（跨机器，基线是 M 系芯片） | 1.18×（vs f32_cuda_coal，同场） | 权重 fp16（流量减半）：理论 2× 被 Amdahl 稀释成 1.18×——时间大头已是固定开销而非带宽，诊断价值大于提速价值 |
+| cuda_resident_coal_ws（x86_64 + A10） | 716d63c | 7.97 | 8.34 | N/A（跨机器，基线是 M 系芯片） | 1.15×（vs cuda_resident_coal，同场） | 砍每调用开销：x/y 常驻 workspace（删 680 次 alloc/free）+ 删冗余 cudaDeviceSynchronize（同步 D2H 已保证完成）；kernel 未动 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -851,6 +852,48 @@
      半精度量化），不是 f32 的 ref——跨族对齐没有意义。测试里用
      float_to_half 构造 0.125 倍数权重（half 可精确表示），隔离量化噪声。
 - **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_cuda_resident_coal --extra-args "--matvec-impl cuda_resident_coal"`
+
+---
+
+### cuda_resident_coal_ws（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。跨机器的
+  "vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline + cuda_resident_coal + 砍每调用开销
+  （x/y workspace + 删冗余 sync）
+- **是什么**：新增 `kernels/matvec/matvec_f32_cuda_resident_coal_ws.cu`。
+  kernel 与 cuda_resident_coal **逐字相同**，只改 host 包装两处：
+  ① x/y 改 grow-only 常驻 workspace（删掉每调用 cudaMalloc/cudaFree×2，
+  ~680 次/token）；② 删掉冗余的 `cudaDeviceSynchronize()`——后面的 D2H
+  `cudaMemcpy` 本就同步、会等 kernel 完成，显式 sync 是重复保险。
+- **假设**：削减固定开销类。f16 条目已诊断主矛盾是每调用开销；此刀直指它。
+- **结果**：decode 中位 **7.97 ms/token**（3 遍取中位，每遍 27 样本），p95 8.34
+- **vs 上一配置**：**1.15×（同场 A/B，vs cuda_resident_coal）**——对照
+  （model.tqwen + cuda_resident_coal，即 fp32 版）中位 9.18（p95 9.61）→
+  变体 7.97，同 binary 同场交错测量。
+- **归因拆分**：workspace 单独上次已证≈0（cuda_resident_ws 47.40→46.05），
+  所以这 ~1.2ms 的增量**主要来自删冗余 sync**（~170 次/token 的全设备同步
+  调用开销），workspace 贡献趋近 0 但为后续融合铺了地基。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 27.92× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（60 单测全过，含新增
+  `matvec_cuda_resident_coal_ws_matches_ref`：小→大→回小 shape 压 workspace
+  扩容/复用，多 shape 交替连跑压"删 sync 后的调用时序"无竞态；golden token
+  16 个逐位一致）
+- **瓶颈转移**：top op 不变（lm_head / qkv_proj / gate_up_proj）。7.97 里
+  权重读 ~3.3ms（f32），剩 ~4.7ms 是**每次调用都逃不掉的三件套**：kernel
+  启动 + H2D x + D2H y（各 ~170 次/token，每次合 ~9µs）。逐调用削已经削到
+  头了，要再降只能**减少调用次数**——下一刀 B：qkv 三合一、gate_up 二合一
+  的 CUDA 融合（把 ~170 次 matvec 砍到 ~100 次），或更彻底的 CUDA Graph。
+- **意外 / 教训**：
+  1. **"冗余 sync"是隐蔽的固定开销**：它看起来只是"保险"，但 170 次/token
+     累加成 ~1ms+。判断能否删的依据是"后续是否已有同步点"——这里同步 D2H
+     已保证 kernel 完成，显式 sync 即纯开销。删 sync 前务必确认有等价的
+     同步语义兜底，否则会引入读未就绪的竞态。
+  2. **逐调用优化有天花板**：alloc/free、sync 都削过之后，剩下的启动 + 两次
+     拷贝是"每调用必付"的底价，单靠优化单次调用无法再降——必须从"减少
+     调用次数"或"批量提交"破局。这为 B（融合）定好了方向。
+- **复现**：`./scripts/bench.sh cuda_resident_coal_ws --extra-args "--matvec-impl cuda_resident_coal_ws"`
 
 ---
 
