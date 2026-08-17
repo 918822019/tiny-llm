@@ -2,8 +2,10 @@
 //
 // 设计要点：
 //   - 全部接收 device 指针、在给定 stream 上启动，内部不做 H2D/D2H；
-//   - matvec 用与 matvec_f*_cuda_resident_coal*.cu 同款的 coalesced 行点积
-//     （block-per-row + warp-shuffle 两级归约），engine 直接用 device 权重；
+//   - matvec 用 warp-per-row（一个 warp 独立归约一整行，8 warp/block 同时
+//     算 8 行，纯 shuffle、无 shared mem/__syncthreads）；这一点与
+//     matvec_f*_cuda_resident_coal*.cu 的 block-per-row 方案不同——engine
+//     自带一份独立实现，改动不影响那批已测好的 dispatch 变体；
 //   - 非 matvec 算子逐个对齐 *_ref 的数值（rmsnorm 用 double 累加平方和、
 //     rope 用 powf/cosf/sinf、swiglu 用 expf 除法形式），容差见 tests。
 // 仅 CUDA 构建编译。
@@ -56,59 +58,59 @@ namespace gpu {
             return shared[0];
         }
 
-        // coalesced 行点积：线程沿 in_dim 跨步乘加，warp 内连续读。返回本线程部分和。
+        constexpr int kWarpsPerBlock = kBlock / kWarp; // 8
+
+        // coalesced 行点积：warp 内 32 线程沿 in_dim 跨步（stride 32）乘加，
+        // 一个 warp 独立算完一整行，只用 warp-shuffle，不需要 shared mem/
+        // __syncthreads（一个 block 里 8 个 warp 各管各的行，互不依赖）。
         template <typename W>
-        __device__ __forceinline__ float row_partial(const W *w_row, const float *x, int in_dim) {
+        __device__ __forceinline__ float row_partial_warp(const W *w_row, const float *x,
+                                                          int in_dim, int lane) {
             float acc = 0.0f;
-            for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            for (int i = lane; i < in_dim; i += kWarp) {
                 acc += static_cast<float>(w_row[i]) * x[i];
             }
             return acc;
         }
         // f16 特化：__half2float。
         template <>
-        __device__ __forceinline__ float row_partial<__half>(const __half *w_row, const float *x,
-                                                             int in_dim) {
+        __device__ __forceinline__ float
+        row_partial_warp<__half>(const __half *w_row, const float *x, int in_dim, int lane) {
             float acc = 0.0f;
-            for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            for (int i = lane; i < in_dim; i += kWarp) {
                 acc += __half2float(w_row[i]) * x[i];
             }
             return acc;
         }
-        // 把一个 block 的部分和归约成单一值并写到 out[row]。
-        __device__ void reduce_write(float partial, float *out, int row, float *shared) {
-            const int lane = threadIdx.x & (kWarp - 1);
-            const int wid = threadIdx.x / kWarp;
-            partial = warp_sum(partial);
-            if (lane == 0) shared[wid] = partial;
-            __syncthreads();
-            const int nw = blockDim.x / kWarp;
-            if (wid == 0) {
-                float t = (lane < nw) ? shared[lane] : 0.0f;
-                t = warp_sum(t);
-                if (lane == 0) out[row] = t;
-            }
-        }
     } // namespace
 
     // ========================================================================
-    // matvec：block-per-row coalesced。single / pair / qkv 共享同一套归约。
+    // matvec：warp-per-row（一个 warp 独立算一整行），一个 block 装
+    // kWarpsPerBlock=8 个 warp、同时算 8 行。之前是 block-per-row（256 线程
+    // 归约 896 个元素，每线程只摸 ~3.5 个、还要两级 shared mem 归约+两次
+    // __syncthreads）；k/v_proj 这类小矩阵（128/256 行）在那个方案下线程
+    // 利用率低。warp-per-row 把归约收窄到 32 线程/warp-shuffle-only，每线程
+    // 摸 in_dim/32（896 时 28 个）个元素，且不同 warp 之间零同步开销，单次
+    // launch 处理的行数不变、只是每个 block 干更多活——launch 次数不变，
+    // 但 block 数从"总行数"降到"总行数/8"，配合更高的每线程算力利用率。
+    // single / pair / qkv 共享同一套 warp 内归约。
     // ========================================================================
     template <typename W>
     __global__ void matvec_single_kernel(const W *w, const float *x, float *y, int out_dim,
                                          int in_dim) {
-        __shared__ float s[kBlock / kWarp];
-        const int row = blockIdx.x;
+        const int lane = threadIdx.x & (kWarp - 1);
+        const int row = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarp;
         if (row >= out_dim) return;
         const W *w_row = w + static_cast<size_t>(row) * in_dim;
-        reduce_write(row_partial(w_row, x, in_dim), y, row, s);
+        const float sum = warp_sum(row_partial_warp(w_row, x, in_dim, lane));
+        if (lane == 0) y[row] = sum;
     }
 
     template <typename W>
     __global__ void matvec_pair_kernel(const W *w1, const W *w2, const float *x, float *y1,
                                        float *y2, int out_dim, int in_dim) {
-        __shared__ float s[kBlock / kWarp];
-        const int grow = blockIdx.x; // [0, 2*out_dim)
+        const int lane = threadIdx.x & (kWarp - 1);
+        const int grow = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarp; // [0, 2*out_dim)
         if (grow >= 2 * out_dim) return;
         const W *W_sel;
         float *out;
@@ -116,15 +118,16 @@ namespace gpu {
         if (grow < out_dim) { W_sel = w1; out = y1; row = grow; }
         else { W_sel = w2; out = y2; row = grow - out_dim; }
         const W *w_row = W_sel + static_cast<size_t>(row) * in_dim;
-        reduce_write(row_partial(w_row, x, in_dim), out, row, s);
+        const float sum = warp_sum(row_partial_warp(w_row, x, in_dim, lane));
+        if (lane == 0) out[row] = sum;
     }
 
     template <typename W>
     __global__ void matvec_qkv_kernel(const W *wq, const W *wk, const W *wv, const float *x,
                                       float *yq, float *yk, float *yv, int q_dim, int kv_dim,
                                       int in_dim) {
-        __shared__ float s[kBlock / kWarp];
-        const int grow = blockIdx.x; // [0, q_dim + 2*kv_dim)
+        const int lane = threadIdx.x & (kWarp - 1);
+        const int grow = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarp; // [0, q_dim+2*kv_dim)
         const int total = q_dim + 2 * kv_dim;
         if (grow >= total) return;
         const W *W_sel;
@@ -134,51 +137,57 @@ namespace gpu {
         else if (grow < q_dim + kv_dim) { W_sel = wk; out = yk; row = grow - q_dim; }
         else { W_sel = wv; out = yv; row = grow - q_dim - kv_dim; }
         const W *w_row = W_sel + static_cast<size_t>(row) * in_dim;
-        reduce_write(row_partial(w_row, x, in_dim), out, row, s);
+        const float sum = warp_sum(row_partial_warp(w_row, x, in_dim, lane));
+        if (lane == 0) out[row] = sum;
     }
 
     // ---- matvec launchers ----
     // 启动后立即查启动错误（配置非法等会在这里 fail loud；运行期错误由
     // engine 末尾的 cudaDeviceSynchronize 兜底）。变参宏：kernel 调用的实参
-    // 里有逗号，单参宏会被预处理器拆开。
+    // 里有逗号，单参宏会被预处理器拆开。grid = ceil(总行数 / kWarpsPerBlock)，
+    // block 仍是 kBlock=256（8 个 warp）。
 #define GPU_LAUNCH(...)                                                              \
     do {                                                                             \
         __VA_ARGS__;                                                                 \
         GPU_CHECK(cudaGetLastError());                                               \
     } while (0)
+#define GPU_ROW_BLOCKS(total_rows) (((total_rows) + kWarpsPerBlock - 1) / kWarpsPerBlock)
 
     void matvec_f16(cudaStream_t s, const uint16_t *w, const float *x, float *y, int out_dim,
                     int in_dim) {
-        GPU_LAUNCH(matvec_single_kernel<__half><<<out_dim, kBlock, 0, s>>>(
+        GPU_LAUNCH(matvec_single_kernel<__half><<<GPU_ROW_BLOCKS(out_dim), kBlock, 0, s>>>(
                 reinterpret_cast<const __half *>(w), x, y, out_dim, in_dim));
     }
     void matvec_f16_pair(cudaStream_t s, const uint16_t *w1, const uint16_t *w2, const float *x,
                          float *y1, float *y2, int out_dim, int in_dim) {
-        GPU_LAUNCH(matvec_pair_kernel<__half><<<2 * out_dim, kBlock, 0, s>>>(
+        GPU_LAUNCH(matvec_pair_kernel<__half><<<GPU_ROW_BLOCKS(2 * out_dim), kBlock, 0, s>>>(
                 reinterpret_cast<const __half *>(w1), reinterpret_cast<const __half *>(w2), x, y1,
                 y2, out_dim, in_dim));
     }
     void matvec_f16_qkv(cudaStream_t s, const uint16_t *wq, const uint16_t *wk,
                         const uint16_t *wv, const float *x, float *yq, float *yk, float *yv,
                         int q_dim, int kv_dim, int in_dim) {
-        GPU_LAUNCH(matvec_qkv_kernel<__half><<<q_dim + 2 * kv_dim, kBlock, 0, s>>>(
-                reinterpret_cast<const __half *>(wq), reinterpret_cast<const __half *>(wk),
-                reinterpret_cast<const __half *>(wv), x, yq, yk, yv, q_dim, kv_dim, in_dim));
+        GPU_LAUNCH(matvec_qkv_kernel<__half>
+                           <<<GPU_ROW_BLOCKS(q_dim + 2 * kv_dim), kBlock, 0, s>>>(
+                                   reinterpret_cast<const __half *>(wq),
+                                   reinterpret_cast<const __half *>(wk),
+                                   reinterpret_cast<const __half *>(wv), x, yq, yk, yv, q_dim,
+                                   kv_dim, in_dim));
     }
     void matvec_f32(cudaStream_t s, const float *w, const float *x, float *y, int out_dim,
                     int in_dim) {
-        GPU_LAUNCH(matvec_single_kernel<float><<<out_dim, kBlock, 0, s>>>(w, x, y, out_dim,
-                                                                           in_dim));
+        GPU_LAUNCH(matvec_single_kernel<float><<<GPU_ROW_BLOCKS(out_dim), kBlock, 0, s>>>(
+                w, x, y, out_dim, in_dim));
     }
     void matvec_f32_pair(cudaStream_t s, const float *w1, const float *w2, const float *x,
                          float *y1, float *y2, int out_dim, int in_dim) {
-        GPU_LAUNCH(matvec_pair_kernel<float><<<2 * out_dim, kBlock, 0, s>>>(w1, w2, x, y1, y2,
-                                                                             out_dim, in_dim));
+        GPU_LAUNCH(matvec_pair_kernel<float><<<GPU_ROW_BLOCKS(2 * out_dim), kBlock, 0, s>>>(
+                w1, w2, x, y1, y2, out_dim, in_dim));
     }
     void matvec_f32_qkv(cudaStream_t s, const float *wq, const float *wk, const float *wv,
                         const float *x, float *yq, float *yk, float *yv, int q_dim, int kv_dim,
                         int in_dim) {
-        GPU_LAUNCH(matvec_qkv_kernel<float><<<q_dim + 2 * kv_dim, kBlock, 0, s>>>(
+        GPU_LAUNCH(matvec_qkv_kernel<float><<<GPU_ROW_BLOCKS(q_dim + 2 * kv_dim), kBlock, 0, s>>>(
                 wq, wk, wv, x, yq, yk, yv, q_dim, kv_dim, in_dim));
     }
 

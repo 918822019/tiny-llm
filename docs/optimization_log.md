@@ -1072,6 +1072,53 @@
 
 ---
 
+### gpu_engine_warprow（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。
+- **优化栈**：gpu_engine_cudagraph + **matvec 改 warp-per-row（多行每
+  block）**
+- **是什么**：`kernels/cuda/gpu_kernels.cu` 的 `matvec_single_kernel`/
+  `matvec_pair_kernel`/`matvec_qkv_kernel`（engine 内部 `gpu::` namespace
+  自带一份，不影响 `matvec_f*_cuda_resident_coal*.cu` 那批独立 dispatch
+  变体）从 block-per-row（256 线程/block 归约一行，两级 shared mem + 两次
+  `__syncthreads`）改成 **warp-per-row**：一个 warp（32 线程）独立归约一整
+  行（stride 32，全程只用 warp-shuffle，无 shared mem/无同步），一个 block
+  装 8 个 warp、同时算 8 行；grid 从"总行数"降到"总行数/8"。选 warp-per-row
+  而不是 split-K：k/v_proj 融合进 qkv kernel 后是 1152 行里的一段，行数（乃
+  至 pair 的 9728、single 的 896/151936）从不稀缺到需要 split-K 补 SM，真正
+  浪费的是 block 内 256 线程只分到 in_dim=896/256≈3.5 个元素的低利用率。
+- **假设**：并行粒度/占用类，直接对应上一条目诊断"k/v_proj 128 行
+  block-per-row 占用低"。
+- **结果**：decode 中位 **3.44ms/token**（3 遍同场测：3.44/3.44/3.45），
+  p95 ~3.84
+- **vs 上一配置**：**1.35×**（vs gpu_engine_cudagraph 的 4.63ms，同机同场）
+- **vs 原始基线**（gpu_engine，无 graph 无 warprow，4.89ms）：**1.42×**
+- **交互**：两步优化实测组合 1.42× ≈ 1.06×（cudagraph）× 1.35×（warprow）
+  ≈ 1.43×，乘积近似成立，无明显负交互——两者分别作用在"host 侧调度开销"
+  和"device 侧 kernel 内部归约效率"两个不同维度，互不干扰。
+- **验证**：71 单测全过（含 `gpu_matvec_matches_ref` 覆盖 out_dim=128,
+  in_dim=896 的 k/v_proj 真实形状，5e-3 容差覆盖归约顺序变化带来的浮点误
+  差）；`--engine cuda` 在 fp32/f16 模型上 16-token 与 golden 逐位一致，f16
+  32-token 与 CPU forward 逐位一致（reduction 顺序变了但贪心 argmax 结果
+  未翻转）；`scripts/verify.sh` 全过。
+- **瓶颈转移**：engine 路径仍无 op 级 profiler 覆盖，留待下次引入 profiling
+  hook 再细分；合理猜测 lm_head（151936 行，本次同样吃到 warp-per-row 的
+  收益）和层内 matvec 仍是耗时大头，继续压缩需要降权重流量（量化）或用
+  tensor core，而不是再切并行粒度。
+- **意外 / 教训**：
+  1. **真正的"大头"在这一步，不在 CUDA Graph**：1.35× 远超上一步的 1.06×，
+     证实"诊断里排第二的手段"实测反而是第一大贡献——日志诊断的顺序
+     （① graph ② 小 matvec 并行）不等于实际收益的顺序，两个都做、都测，
+     才知道哪个真的值钱。
+  2. **warp 内 32 路 shuffle 归约 + 无 shared mem** 对 in_dim~896 这种"短"
+     归约特别合适：省掉两次 `__syncthreads` 和跨 warp 的 shared mem 读写，
+     且每线程从 3.5 个元素提到 28 个，算术强度显著提升——这类"归约粒度
+     和数据规模错配"的问题，比"block 数够不够喂饱 SM"更常见也更容易被
+     忽视（本例里 block 数从来没缺过）。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh gpu_engine_warprow --extra-args "--engine cuda"`
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）
