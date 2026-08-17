@@ -32,6 +32,7 @@
 | cuda（⚠️ 换机器：x86_64 + A10） | 7fc4a2d | 333.75 | 356.47 | N/A（跨机器，基线是 M 系芯片） | 1.75×（同场 vs 本机 ref） | matvec CUDA 参考变体（每次调用重传权重）：打通 CUDA 路径，朴素形态如实记录 |
 | cuda_resident（x86_64 + A10） | dd58fd2 | 47.40 | 48.07 | N/A（跨机器，基线是 M 系芯片） | 12.30×（同场 vs 本机 ref）；7.04× vs 朴素 cuda | matvec 权重常驻显存（按 host 指针缓存 device 副本），砍掉每 token ~2GB 的 PCIe 重传；GPU 从此反超本机最好 CPU 变体 |
 | cuda_resident_ws（x86_64 + A10） | aa30aa5 | 46.05 | 46.52 | N/A（跨机器，基线是 M 系芯片） | 1.03×（vs cuda_resident，≈无效）；12.67×（同场 vs 本机 ref） | x/y 常驻 workspace（删每调用 alloc/free）——证伪归档：CUDA 池化小分配，瓶颈实为 kernel 非合并访存 |
+| cuda_resident_coal（x86_64 + A10） | 7356481 | 9.16 | 9.81 | N/A（跨机器，基线是 M 系芯片） | 5.17×（vs cuda_resident）；63.94×（同场 vs 本机 ref） | matvec kernel 改合并访存（block-per-row + warp 归约），warp 读权重从 32 条分散 cache line → 1 条满线；CUDA 路线首次逼近带宽地板 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -742,6 +743,9 @@
   matvec kernel**（block-per-row：一个 block 算一行、线程沿 in_dim
   连续读权重、shared memory/warp 归约求点积），把 HBM 带宽吃满，
   目标逼近 3–5 ms/tok 的带宽地板。
+  （后记：已被 cuda_resident_coal 条目兑现——合并访存一步 47.40→9.16，
+  5.17×，诊断完全正确；而本条的 workspace 思路在 kernel 降下来后重新
+  变成下一刀，见该条瓶颈转移。）
 - **意外 / 教训**：
   1. **归因猜测被测量打脸是常态，测了才知道**：上一条信誓旦旦"剩余大头
      是 680 次 alloc/free"，实测只值 3%。教训：CUDA 运行时对小分配有
@@ -751,6 +755,58 @@
      "排除项"——后人不用再猜 alloc/free 是不是瓶颈。与 neon_mt_bal
      归档同款处理（实测收益≈0，归档保留，不删）。
 - **复现**：`./scripts/bench.sh cuda_resident_ws --extra-args "--matvec-impl cuda_resident_ws"`
+
+---
+
+### cuda_resident_coal（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。跨机器的
+  "vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline（本机标量 ref）+ cuda_resident + 合并访存 kernel
+- **是什么**：新增 `kernels/matvec/matvec_f32_cuda_resident_coal.cu`。权重
+  常驻逻辑沿用 cuda_resident，唯一变化是 **kernel 访存/归约方式**：从
+  "一行一个 thread（warp 读 32 条分散 cache line）"改成 **block-per-row**
+  ——一个 block（256 线程）合算一行，线程沿 in_dim 跨步取数（warp 内任一
+  时刻读连续 32 个 float = 一条满 128B cache line），部分和经两级归约
+  （warp 内 `__shfl_down_sync` + warp 间 shared memory）合成行结果。
+- **假设**：访存模式类。ws 条目已定位朴素 kernel 的非合并访存把 HBM 流量
+  放大 ~32 倍（warp 每步读 32 条分散 cache line 只用回 128 字节）；改成
+  合并访存后权重读取 100% 有效，预期直逼 HBM 带宽地板（~3–4 ms/tok）。
+- **结果**：decode 中位 **9.16 ms/token**（3 遍取中位，每遍 27 样本），p95 9.81
+- **vs 上一配置**：**5.17×（vs cuda_resident：47.40 → 9.16，同机）**——
+  这是"合并访存"这一步的真实贡献。同场 A/B 对照（无额外参数 = 标量 ref）
+  中位 585.86（p95 592.07）→ 变体 9.16，即 vs 本机 ref 63.94×，同 binary
+  同场交错测量。
+- **本机 CPU 对照**：acc4（跨平台最快 CPU 标量变体）269.21 ms/tok——
+  cuda_resident_coal 比本机最好 CPU 变体快 **29.4×**。至此 CUDA 路线从
+  "输给 CPU"（朴素 cuda 333）一路打到"碾压 CPU"（9.16），三步完成逆转。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 24.29× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（58 单测全过，含新增
+  `matvec_cuda_resident_coal_matches_ref`：覆盖 in_dim 非 256 倍数、
+  in_dim<256（高编号线程空转）、大 out_dim block-per-row 等边界；
+  golden token 16 个逐位一致）。**对齐门禁还真抓到过一个 bug**——见教训 3。
+- **瓶颈转移**：top op 不变（lm_head / qkv_proj / gate_up_proj）。9.16 已
+  逼近但未到 HBM 地板（~3–4 ms/tok，权重 1.98GB/token ÷ ~600 GB/s）：
+  kernel 本体 ~3–4ms，其余 ~5ms 是**每调用的 x/y alloc/free（680 次/token）
+  + kernel 启动（170 次）+ cudaDeviceSynchronize（170 次）**。注意：ws 条目
+  曾证伪"alloc/free 是大头"——但那是在 kernel 还占 40+ms 时；如今 kernel
+  降到 ~4ms，这些固定开销的**相对**占比反升，ws 的思路此刻才真正值钱。
+  下一刀：x/y 常驻 workspace + 削减同步/启动开销（或 CUDA Graph 一次提交
+  整段 decode），目标逼近 3–5 ms/tok。
+- **意外 / 教训**：
+  1. **访存模式是最大的单项杠杆**：FLOPs 没变、搬运的字节数（原理上）没变，
+     只改"线程怎么读权重"就拿到 5.17×。GPU 上"算得快"之前先"读得对"——
+     合并访存是第一课，也是本次从 47 到 9 的全部原因。
+  2. **优化的时序性**：ws（删 alloc/free）在 47ms 时≈无效、在 9ms 时却成了
+     下一刀——不是 ws 错了，是它当时被更大的瓶颈（kernel）淹没。先砍
+     主导瓶颈、再回头收固定开销，这个顺序本身是方法论。
+  3. **对齐门禁抓到真 bug（且是熟人）**：首版测试挂在 shape(8,67) row6，
+     排查发现罪魁不是 kernel，而是测试数据生成用了 `size_t i` 导致
+     `(i*37%29)-14` 无符号下溢成 ~2.3e18——与 neon 条目 micro-bench 那次
+     是**同一类坑**。教训：误差异常先查数据生成；`size_t` 减法永远警惕。
+     kernel 本身一次就写对了。
+- **复现**：`./scripts/bench.sh cuda_resident_coal --extra-args "--matvec-impl cuda_resident_coal"`
 
 ---
 

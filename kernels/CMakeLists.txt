@@ -82,7 +82,10 @@ if (TINYQWEN_HAS_CUDA)
             # 删掉每调用的 cudaMalloc/cudaFree，kernel 仍逐字不变）。
             matvec/matvec_f32_cuda.cu
             matvec/matvec_f32_cuda_resident.cu
-            matvec/matvec_f32_cuda_resident_ws.cu)
+            matvec/matvec_f32_cuda_resident_ws.cu
+            # cuda_resident_coal = cuda_resident + 合并访存 kernel（block-per-row
+            # + warp shuffle 归约，warp 内连续读权重，吃满 HBM 带宽）。
+            matvec/matvec_f32_cuda_resident_coal.cu)
     set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
     target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
 endif ()
