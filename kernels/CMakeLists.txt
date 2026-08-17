@@ -96,7 +96,10 @@ if (TINYQWEN_HAS_CUDA)
             matvec/matvec_f16_cuda_resident_coal_ws.cu
             # f16 融合：qkv 三合一 + gate/up(pair) 二合一，减调用次数砍启动/拷贝开销；
             # 注册进 pair/qkv f16 注册表，同名 cuda_resident_coal_ws。
-            matvec/matvec_f16_cuda_fused.cu)
+            matvec/matvec_f16_cuda_fused.cu
+            # GPU decode engine 的算子 kernel（device 指针形态，供 engine 编排 +
+            # test_gpu_ops 对齐 *_ref）。engine 本体 gpu_engine.cu 后续加入。
+            cuda/gpu_kernels.cu)
     set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
     target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
 endif ()
