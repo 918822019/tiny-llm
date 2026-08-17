@@ -1119,6 +1119,59 @@
 
 ---
 
+### gpu_engine_attn_blocksize（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。
+- **优化栈**：gpu_engine_warprow + **attention_kernel block 收窄到 head_dim**
+- **是什么**：先用 `nsys profile --cuda-graph-trace=node --stats=true` 跑了
+  一遍 `--engine cuda`（64 decode token），按 kernel 聚合耗时——这才是本条目
+  的关键：**先测再猜**，没有再凭直觉排"下一刀"的优先级。结果
+  `attention_kernel` 占 ~31-35%/token（单项第一，比 matvec 加起来还多），
+  `matvec_single`（o_proj+down_proj+lm_head）~26-27%，`matvec_pair`
+  （gate+up）~20-21%，其余算子合计 ~20%。据此把 `attention_decode` 的
+  launch block size 从固定 `kBlock=256` 收紧成
+  `ceil(head_dim/kWarp)*kWarp`（本模型 head_dim=64 → 正好 64，2 个 warp），
+  这样 `attention_kernel` 里每个 timestep 都要做的 block 级双精度归约
+  （`block_sum_d`，两次 `__syncthreads`）从 8-warp 树缩到 2-warp，且
+  256 线程里原本白跑的 192 个（head_dim=64 时 `active` 恒假）全部消失。
+- **假设**：并行粒度/占用类，与 `gpu_engine_warprow` 同一诊断模式（block
+  内线程利用率低）。预期：kernel 内部耗时应随归约树变浅、无效线程消失而
+  明显下降，进而拉动 decode 总时延。
+- **结果**：decode 中位 **3.39ms/token**（3 遍同场测：3.39/3.39/3.40），
+  p95 ~3.77；**假设部分证伪**——重新 profile 确认 `attention_kernel` 平均
+  耗时只从 49.8us 降到 46.0us（降 ~8%，远不到"归约树变浅 4 倍"该有的降幅），
+  真实 decode 时延也只降了 ~1.5%（3.44→3.39ms），比 profile 里的 35% 占比
+  暗示的"biggest lever"小得多。
+- **vs 上一配置**：**1.015×**（vs gpu_engine_warprow 的 3.44ms，同场）
+- **vs 原始基线**（gpu_engine，无 graph/无 warprow/无本条，4.89ms）：**1.44×**
+- **验证**：71 单测全过（`gpu_attention_matches_ref` 覆盖 seq_len∈{1,3,16}，
+  launch 配置变了但数值断言不变，5e-3 容差下通过）；`--engine cuda` 在
+  fp32/f16 模型上 16-token 与 golden 逐位一致，f16 32-token 与 CPU forward
+  逐位一致；`scripts/verify.sh` 全过。
+- **瓶栈转移**：仍是 `attention_kernel` 第一大头（重新 profile 后从
+  ~35%→~29%，占比降了但仍居首），`matvec_single`/`matvec_pair` 相对占比
+  升到并列第一梯队。下一刀如果还要继续压 attention，方向应该是"消灭
+  timestep 间的串行依赖链"（online softmax 的 m/l/oh_i 状态跨迭代必须
+  串行更新），而不是再切并行粒度——这需要更大的重构（比如整体换成
+  flash-decoding 式的 split-KV + 最终归并），成本远高于本条目，暂不做。
+- **意外 / 教训**：
+  1. **这次真的"先测再改"，但预测力还是有限**：profile 告诉了我们
+     "attention 是第一大头"（这个结论后来站得住——重新 profile 后依然
+     第一），但没告诉我们"改 block size 能省多少"——kernel 内部的真实瓶颈
+     是 timestep 间的**串行内存延迟依赖链**（每次迭代要等上一轮 m/l/oh_i
+     更新完才能发下一轮的全局内存读取+归约），不是"归约树宽度"，所以把
+     归约树从 8-warp 砍到 2-warp 只省了树本身的开销（~8%），没碰到真正
+     的延迟大头。**profile 定位"哪个 kernel"很可靠，但定位"kernel 内部
+     哪个子机制"仍然需要更细粒度的工具**（如 ncu 的 stall reason 分析），
+     这是本条目和 `gpu_engine_cudagraph`/`gpu_engine_warprow` 两条对比后
+     补上的认知缺口。
+  2. **依然是净正、不撞回归**：1.015× 虽小，但方向稳（3 遍一致）、改动
+     风险低（只改 launch 配置、不改数值语义），符合"能测出正收益就
+     记账"的纪律，不因为小就不记录。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh gpu_engine_attn_blocksize --extra-args "--engine cuda"`
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

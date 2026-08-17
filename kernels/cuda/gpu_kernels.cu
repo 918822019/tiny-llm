@@ -380,8 +380,14 @@ namespace gpu {
     void attention_decode(cudaStream_t s, float *out, const float *q, const float *k_cache,
                           const float *v_cache, const int *pos, int max_seq_len, int n_heads,
                           int n_kv_heads, int head_dim, float scale) {
-        // block 大小取 >= head_dim 的最小 kBlock 倍数（head_dim=64 → 256）。
-        GPU_LAUNCH(attention_kernel<<<n_heads, kBlock, 0, s>>>(
+        // block 大小取 >= head_dim 的最小 warp（32）倍数——之前固定用 kBlock=256，
+        // 但 attention_kernel 每个 timestep 都要做一次 block 级归约（block_sum_d，
+        // 两次 __syncthreads），head_dim=64 时 256 线程里 192 个白白陪跑、归约树
+        // 还多一层，seq_len 次迭代的开销就被放大了；profile 显示这是 engine 里
+        // 单项占比最大的 kernel（~35%/token）。收紧到刚好覆盖 head_dim 的 warp
+        // 数（64→64），归约收窄到 2 个 warp 合并，无浪费线程。
+        const int block_size = ((head_dim + kWarp - 1) / kWarp) * kWarp;
+        GPU_LAUNCH(attention_kernel<<<n_heads, block_size, 0, s>>>(
                 out, q, k_cache, v_cache, pos, max_seq_len, n_heads, n_kv_heads, head_dim,
                 scale));
     }
