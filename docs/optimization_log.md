@@ -37,6 +37,7 @@
 | cuda_resident_coal_ws（x86_64 + A10） | 716d63c | 7.97 | 8.34 | N/A（跨机器，基线是 M 系芯片） | 1.15×（vs cuda_resident_coal，同场） | 砍每调用开销：x/y 常驻 workspace（删 680 次 alloc/free）+ 删冗余 cudaDeviceSynchronize（同步 D2H 已保证完成）；kernel 未动 |
 | f16_cuda_resident_coal_ws（x86_64 + A10） | cf5c805 | 6.54 | 7.01 | N/A（跨机器，基线是 M 系芯片） | 1.19×（vs f16_cuda_coal，同场） | f16 满栈 = f16_cuda_coal + x/y workspace + 删冗余 sync；A10 追平 Mac fp16 满栈量级（6.54 vs 6.35，跨机器仅参照） |
 | f16_cuda_fused（x86_64 + A10） | 47c5335 | 5.79 | 6.28 | N/A（跨机器，基线是 M 系芯片） | 1.07×（vs 部分融合，同场）；1.13×（vs 真不融合 6.54） | qkv 三合一 + gate_up 二合一 CUDA 融合（减 matvec 调用次数砍启动/拷贝），**5.79 压过 Mac fp16 满栈 6.35**（跨机器仅参照，目标达成） |
+| gpu_engine（x86_64 + A10） | 15e4653 | 4.89 | 5.23 | N/A（跨机器，基线是 M 系芯片） | 1.19×（vs CPU 驱动 f16 满栈，同场） | GPU-resident 整段 forward（权重/激活/KV 常驻显存，单 stream），消灭逐 matvec 桥接；e2e 与 CPU 逐位一致，低于 Mac 6.35 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -979,6 +980,49 @@
      mv_pair），直接拿它当"上一配置"会低估收益；用历史记录的真·不融合
      （6.54）做锚点才看得全 1.13×。对照的"纯度"本身是要审查的对象。
 - **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_cuda_fused --extra-args "--matvec-impl cuda_resident_coal_ws"`
+
+---
+
+### gpu_engine（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。跨机器的
+  "vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline + f16 权重 + **GPU-resident 整段 forward**
+  （权重/激活/KV 常驻显存，单 stream 跑完，每步仅 4B argmax 过 PCIe）
+- **是什么**：新增 `kernels/cuda/gpu_engine.cu`（engine 本体，自注册 "cuda"）
+  + `kernels/cuda/gpu_kernels.cu`（device 指针形态的 embed/rmsnorm/rope/
+  kv_append/attention/swiglu/argmax/bias/residual + coalesced matvec
+  single/pair/qkv）。dispatch 加 decode-engine registry，main 加 `--engine cuda`。
+  CPU `forward_token` 原样保留作参考。这是**架构级**改动，不是单 kernel。
+- **假设**：消灭桥接类。此前 forward 是 CPU 驱动，每 matvec 都 H2D x + D2H y、
+  非 matvec 算子在 CPU——这些桥接 + 同步是离带宽地板 ~1.6ms 还差 ~4ms 的主因。
+  整段常驻后应逼近地板。
+- **结果**：decode 中位 **4.89 ms/token**（3 遍取中位，每遍 27 样本），p95 5.23
+- **vs 上一配置**：**1.19×（同场 A/B，vs CPU 驱动 f16 满栈）**——对照
+  （model_f16 + cuda_resident_coal_ws，即上条 CPU 驱动融合版）中位 5.80
+  （p95 6.06）→ 变体 4.89，同 binary 同场交错测量。
+- **达成目标**：**4.89 < Mac fp16 满栈 6.35**（跨机器仅参照），且比本机 CPU
+  驱动 f16 满栈再快 1.19×。fp32 模型同样验证 golden 逐位一致。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 45.50× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（71 单测全过，CPU 默认路径 golden 逐位一致）；
+  **engine e2e：fp32 与 f16 模型 16-token golden 逐位一致，32-token 与 CPU
+  forward 逐位一致**——24 层 × 12 算子全链路一次写对。算子层另有 9 个单测
+  逐一对齐 *_ref（attention online-softmax+GQA、kv_append 索引逐位）。
+- **瓶颈转移**：engine 绕过了 op 级 profiler 作用域，top op 不再可见。4.89
+  离 f16 带宽地板（942MB÷~600GB/s ≈ 1.6ms）仍差 ~3.3ms，主要是**每 token
+  ~300 次 kernel 启动的开销 + 小矩阵（k/v_proj 128 行）block-per-row 低占用**。
+  下一刀：① CUDA Graph 把整段 decode 的启动批成一次（最大头）；② 小 matvec
+  改用更细并行（split-K / 多行每 block）喂满 SM。
+- **意外 / 教训**：
+  1. **整段常驻 e2e 一次写对**：靠的是算子层先逐个对齐 *_ref（9 个单测），
+     组装只是"按 forward_token 顺序串起来"。分层验证把 e2e 调试成本降到近零
+     ——这是"先算对再谈快"纪律在大改动上的复利。
+  2. **消灭桥接的收益（1.19×）小于预期**：因为上一版 CPU 驱动已经把 matvec
+     融合 + 权重常驻做好，桥接里"权重上传"那部分早被砍掉，剩下的主要是
+     x/y 小拷贝和同步——所以整段常驻的增量集中在启动/调度层，真正的启动
+     开销大头要靠 CUDA Graph 才能吃掉。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh gpu_engine --extra-args "--engine cuda"`
 
 ---
 

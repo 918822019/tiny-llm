@@ -74,6 +74,9 @@ target_link_libraries(tinyqwen_kernels PUBLIC Threads::Threads)
 # ---------------------------------------------------------------------------
 if (TINYQWEN_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # gpu_engine.cu 需要读 runtime 的 ModelFile/TensorView（仅头文件依赖，
+    # 不产生链接环：model_loader.h 不反向 include kernels 头）。
+    target_include_directories(tinyqwen_kernels PRIVATE ${CMAKE_SOURCE_DIR}/runtime)
     target_sources(tinyqwen_kernels PRIVATE
             # cuda = 参考版（每调用重传权重，量传输税的锚点）；
             # cuda_resident = 权重常驻显存（按 host 指针缓存 device 副本，
@@ -98,8 +101,11 @@ if (TINYQWEN_HAS_CUDA)
             # 注册进 pair/qkv f16 注册表，同名 cuda_resident_coal_ws。
             matvec/matvec_f16_cuda_fused.cu
             # GPU decode engine 的算子 kernel（device 指针形态，供 engine 编排 +
-            # test_gpu_ops 对齐 *_ref）。engine 本体 gpu_engine.cu 后续加入。
-            cuda/gpu_kernels.cu)
+            # test_gpu_ops 对齐 *_ref）。
+            cuda/gpu_kernels.cu
+            # GPU decode engine 本体：权重/激活/KV 常驻显存，单 stream 跑整段
+            # forward，自注册进 decode-engine registry（名字 "cuda"）。
+            cuda/gpu_engine.cu)
     set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
     target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
 endif ()
