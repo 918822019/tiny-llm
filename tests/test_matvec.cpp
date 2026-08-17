@@ -725,3 +725,60 @@ TEST (matvec_cuda_matches_ref) {
 
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
+
+TEST (matvec_cuda_resident_matches_ref) {
+    // 正确性门禁：cuda_resident 只在 CUDA 构建注册；其他平台 skip。
+    // 权重常驻缓存的正确性重点：
+    //   1. 首次调用（冷路径：上传 + 登记）结果正确；
+    //   2. 重复调用（热路径：命中缓存复用 device 副本）结果仍正确——
+    //      连跑多遍，确保缓存命中分支没有读到脏/错位数据；
+    //   3. 两块不同 host 指针的同形状权重交替调用——缓存按指针区分，
+    //      不能串线（A 的调用拿到 B 的 device 副本）。
+    if (!set_matvec_impl_by_name("cuda_resident")) {
+        std::printf("[skip] current build has no 'cuda_resident' matvec (no CUDA toolchain)\n");
+        return;
+    }
+
+    // 1+2) 同一块权重连跑 12 遍：第 1 遍走冷路径，其后全走缓存命中。
+    {
+        const int out_dim = 16, in_dim = 4103;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 12; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    }
+
+    // 3) 两块不同指针的同形状权重交替调用：缓存按 host 指针区分，
+    //    交替 8 轮，任何一轮结果错误都说明缓存串线。
+    {
+        const int out_dim = 8, in_dim = 501;
+        std::vector<float> wa(out_dim * in_dim), wb(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            wa[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+            wb[i] = static_cast<float>((i * 41 % 23) - 11) * 0.125f; // 不同的值
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+        std::vector<float> ya(out_dim), yb(out_dim), ra(out_dim), rb(out_dim);
+        matvec_f32_ref(wa.data(), x.data(), ra.data(), out_dim, in_dim);
+        matvec_f32_ref(wb.data(), x.data(), rb.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 8; ++rep) {
+            matvec_f32(wa.data(), x.data(), ya.data(), out_dim, in_dim);
+            matvec_f32(wb.data(), x.data(), yb.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) {
+                EXPECT_NEAR(ya[o], ra[o], 5e-3);
+                EXPECT_NEAR(yb[o], rb[o], 5e-3);
+            }
+        }
+    }
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}

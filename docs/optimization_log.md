@@ -30,6 +30,7 @@
 | f16 + qkv/gate_up 融合（**fp16 路线终点**） | 本次 | 6.37 | 6.77 | 36.2× | ≈1.1×（同场 A/B 乘积；跨窗绝对值受噪声污染） | qkv 三路融合 + gate/up 成对融合：fork-join 96→48 次/token。此后 fp16 路线正式关闭（见文末关闭小节） |
 | ops_neon | 2cdbdd0 | 6.35 | 6.87 | 35.08× | 1.05×（同场） | 非 matvec 五算子 NEON 化 + ops dispatch：argmax 10×/attention 2.3×/swiglu 3.1×/rmsnorm 2.5×，profile 合计省 ~0.48ms；非 matvec 开销 694→200µs |
 | cuda（⚠️ 换机器：x86_64 + A10） | 7fc4a2d | 333.75 | 356.47 | N/A（跨机器，基线是 M 系芯片） | 1.75×（同场 vs 本机 ref） | matvec CUDA 参考变体（每次调用重传权重）：打通 CUDA 路径，朴素形态如实记录 |
+| cuda_resident（x86_64 + A10） | dd58fd2 | 47.40 | 48.07 | N/A（跨机器，基线是 M 系芯片） | 12.30×（同场 vs 本机 ref）；7.04× vs 朴素 cuda | matvec 权重常驻显存（按 host 指针缓存 device 副本），砍掉每 token ~2GB 的 PCIe 重传；GPU 从此反超本机最好 CPU 变体 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -656,6 +657,53 @@
      x86 标量 ref 本来就比 M 系慢 2.6×），纪律上只认同场 A/B；汇总表里
      机器切换必须显式标注（本条已标）。
 - **复现**：`./scripts/bench.sh cuda --extra-args "--matvec-impl cuda"`
+
+---
+
+### cuda_resident（2026-08-17）
+
+- **机器**：与 cuda 条目同一台（x86_64 + NVIDIA A10）。跨机器的"vs 基线"
+  无意义（基线 222.59 是 M 系芯片），只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline（本机标量 ref）+ matvec cuda_resident 变体
+  （= cuda 参考版 + 权重常驻，kernel 逐字不变，只改 host 包装）
+- **是什么**：新增 `kernels/matvec/matvec_f32_cuda_resident.cu`。唯一改动：
+  权重不再每次调用重传——按 host 指针缓存 device 副本（首次见到上传一次，
+  之后命中缓存零拷贝）。device kernel 与 cuda 参考版**逐字相同**（一行一
+  thread、行内串行点积），刻意只改"权重常驻"这一个变量，便于归因。
+- **假设**：减少搬运类。cuda 条目已定位瓶颈是"每 token 经 PCIe 重传 ~2GB
+  权重"（传输税）；权重在 decode 期内容不变，理应只传一次。预期砍掉这
+  部分后 GPU 的 HBM 带宽（~600 GB/s）才开始真正派上用场。
+- **结果**：decode 中位 **47.40 ms/token**（3 遍取中位，每遍 27 样本），p95 48.07
+- **vs 上一配置**：**7.04×（vs 朴素 cuda：333.75 → 47.40，同机同场）**——
+  这才是"权重常驻"这一步的真实贡献。同场 A/B 对照（无额外参数 = 标量 ref）
+  中位 583.01（p95 589.21）→ 变体 47.40，即 vs 本机 ref 12.30×，同 binary
+  同场交错测量。
+- **本机 CPU 对照**：acc4（跨平台最快 CPU 标量变体）269.21 ms/tok——
+  cuda_resident 比本机最好 CPU 变体快 **5.68×**。**逆转了 cuda 条目的结论**：
+  朴素 cuda 输给 acc4（333 vs 269），权重常驻后 GPU 大幅反超。输赢不在
+  GPU 算力，在有没有把传输税砍掉。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 4.70× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（56 单测全过，含新增 `matvec_cuda_resident_matches_ref`：
+  冷路径 + 连跑 12 遍压缓存命中 + 两块不同指针同形状权重交替 8 轮防串线；
+  golden token 16 个逐位一致）
+- **瓶颈转移**：top op 仍是 `lm_head`、qkv_proj、down_proj（matvec 结构不变）。
+  权重读 now 走 HBM：decode 每 token 仍需把 ~2GB 权重从 HBM 读一遍，
+  A10 ~600 GB/s 带宽下限 ≈ **3–4 ms/token**——当前 47.40 离带宽地板还有
+  ~12× 空间。剩余成本大头在**每调用的 cudaMalloc/cudaFree（x/y，~680 次/token）
+  + 170 次 cudaDeviceSynchronize + 朴素 kernel 喂不带宽**。下一刀：
+  ① x/y 用常驻 workspace，删掉每调用 alloc/free；② kernel 改 block-per-row
+  + shared memory/warp 归约，把 HBM 带宽吃满（目标逼近 3–5 ms/tok）。
+- **意外 / 教训**：
+  1. **一步归因干净利落**：kernel 一个字没改，只把权重改成常驻，就拿到
+     7.04×——精确兑现了 cuda 条目"下一刀砍传输税"的预判。这再次印证
+     "先落参考版量出真实成本、再逐个变量拆"的价值：没有 333 那个锚点，
+     就说不清这 7× 是谁的功劳。
+  2. **GPU 反超 CPU 的开关是"少搬数据"，不是"算得快"**：本机 acc4 269，
+     朴素 cuda 333（输），常驻 cuda 47（赢 5.68×）。对带宽瓶颈型负载，
+     数据搬运路径的设计比算力选型更决定成败——与 CPU 侧 fp16 量化
+     （流量减半）带来主升浪是同一个规律。
+- **复现**：`./scripts/bench.sh cuda_resident --extra-args "--matvec-impl cuda_resident"`
 
 ---
 
