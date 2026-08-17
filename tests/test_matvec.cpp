@@ -956,3 +956,63 @@ TEST (matvec_f16_cuda_resident_coal_ws_matches_ref) {
 
     EXPECT_TRUE(set_matvec_f16_impl_by_name("ref")); // 恢复默认
 }
+
+TEST (matvec_f16_cuda_fused_pair_qkv_match_ref) {
+    // 正确性门禁：f16 融合实现（pair 二合一 + qkv 三合一）只在 CUDA 构建注册。
+    // 通过 dispatch 的 matvec_pair_f16 / matvec_qkv_f16 通用入口调用（当前
+    // impl = cuda_resident_coal_ws 时命中融合实现），逐输出与 matvec_f16_ref
+    // 对齐。权重取 0.125 倍数（half 精确表示），容差 5e-3。
+    if (!set_matvec_f16_impl_by_name("cuda_resident_coal_ws")) {
+        std::printf("[skip] current build has no f16 'cuda_resident_coal_ws' matvec (no CUDA toolchain)\n");
+        return;
+    }
+
+    auto fill = [](std::vector<uint16_t> &w) {
+        for (int i = 0; i < static_cast<int>(w.size()); ++i)
+            w[i] = float_to_half(static_cast<float>((i * 37 % 29) - 14) * 0.125f);
+    };
+
+    // ---- pair：y1 = W1@x，y2 = W2@x ----
+    {
+        const int out_dim = 128, in_dim = 896; // k/v_proj 真实形状
+        std::vector<uint16_t> w1((size_t)out_dim * in_dim), w2((size_t)out_dim * in_dim);
+        std::vector<float> x(in_dim);
+        fill(w1); fill(w2);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y1(out_dim), y2(out_dim), r1(out_dim), r2(out_dim);
+        matvec_f16_ref(w1.data(), x.data(), r1.data(), out_dim, in_dim);
+        matvec_f16_ref(w2.data(), x.data(), r2.data(), out_dim, in_dim);
+        for (int rep = 0; rep < 3; ++rep) {
+            matvec_pair_f16(w1.data(), w2.data(), x.data(), y1.data(), y2.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) {
+                EXPECT_NEAR(y1[o], r1[o], 5e-3);
+                EXPECT_NEAR(y2[o], r2[o], 5e-3);
+            }
+        }
+    }
+
+    // ---- qkv：yq = Wq@x（q_dim），yk/yv = Wk/Wv@x（kv_dim）----
+    {
+        const int q_dim = 896, kv_dim = 128, in_dim = 896; // Qwen2.5-0.5B 真实形状
+        std::vector<uint16_t> wq((size_t)q_dim * in_dim), wk((size_t)kv_dim * in_dim),
+                wv((size_t)kv_dim * in_dim);
+        std::vector<float> x(in_dim);
+        fill(wq); fill(wk); fill(wv);
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> yq(q_dim), yk(kv_dim), yv(kv_dim), rq(q_dim), rk(kv_dim), rv(kv_dim);
+        matvec_f16_ref(wq.data(), x.data(), rq.data(), q_dim, in_dim);
+        matvec_f16_ref(wk.data(), x.data(), rk.data(), kv_dim, in_dim);
+        matvec_f16_ref(wv.data(), x.data(), rv.data(), kv_dim, in_dim);
+        for (int rep = 0; rep < 3; ++rep) {
+            matvec_qkv_f16(wq.data(), wk.data(), wv.data(), x.data(), yq.data(), yk.data(),
+                           yv.data(), q_dim, kv_dim, in_dim);
+            for (int o = 0; o < q_dim; ++o) EXPECT_NEAR(yq[o], rq[o], 5e-3);
+            for (int o = 0; o < kv_dim; ++o) {
+                EXPECT_NEAR(yk[o], rk[o], 5e-3);
+                EXPECT_NEAR(yv[o], rv[o], 5e-3);
+            }
+        }
+    }
+
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("ref")); // 恢复默认
+}

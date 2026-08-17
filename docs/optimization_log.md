@@ -36,6 +36,7 @@
 | f16_cuda_resident_coal（x86_64 + A10） | 3408267 | 7.68 | 8.14 | N/A（跨机器，基线是 M 系芯片） | 1.18×（vs f32_cuda_coal，同场） | 权重 fp16（流量减半）：理论 2× 被 Amdahl 稀释成 1.18×——时间大头已是固定开销而非带宽，诊断价值大于提速价值 |
 | cuda_resident_coal_ws（x86_64 + A10） | 716d63c | 7.97 | 8.34 | N/A（跨机器，基线是 M 系芯片） | 1.15×（vs cuda_resident_coal，同场） | 砍每调用开销：x/y 常驻 workspace（删 680 次 alloc/free）+ 删冗余 cudaDeviceSynchronize（同步 D2H 已保证完成）；kernel 未动 |
 | f16_cuda_resident_coal_ws（x86_64 + A10） | cf5c805 | 6.54 | 7.01 | N/A（跨机器，基线是 M 系芯片） | 1.19×（vs f16_cuda_coal，同场） | f16 满栈 = f16_cuda_coal + x/y workspace + 删冗余 sync；A10 追平 Mac fp16 满栈量级（6.54 vs 6.35，跨机器仅参照） |
+| f16_cuda_fused（x86_64 + A10） | 47c5335 | 5.79 | 6.28 | N/A（跨机器，基线是 M 系芯片） | 1.07×（vs 部分融合，同场）；1.13×（vs 真不融合 6.54） | qkv 三合一 + gate_up 二合一 CUDA 融合（减 matvec 调用次数砍启动/拷贝），**5.79 压过 Mac fp16 满栈 6.35**（跨机器仅参照，目标达成） |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -935,6 +936,49 @@
   2. **追平≠超越，跨机器对比要克制**：6.54 vs Mac 6.35 是不同机器的参照，
      说明"方向对、量级到"，但真正的超越要靠下一步融合在本机实测兑现。
 - **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_cuda_resident_coal_ws --extra-args "--matvec-impl cuda_resident_coal_ws"`
+
+---
+
+### f16_cuda_fused（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。跨机器的
+  "vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline + f16_cuda_resident_coal_ws + qkv/gate_up 融合
+  = **f16 CUDA 满栈（含融合）**
+- **是什么**：新增 `kernels/matvec/matvec_f16_cuda_fused.cu`——给 qkv / pair
+  两个 f16 注册表各注册一个融合 kernel（名字与主表共享 cuda_resident_coal_ws，
+  model 的 mv_qkv / mv_pair 自动命中）：qkv 三合一（一个 kernel 按全局行号把
+  q/k/v 三段一起算）、gate_up 二合一。每组从"N 次 matvec 调用"变"1 次"：
+  共享一次 H2D x、只启动一个 kernel，每层 matvec 调用 7→4 次。
+- **假设**：减少调用次数类。cuda_resident_coal_ws 条目已定位剩余开销是
+  "每调用三件套"（启动 + H2D + D2H），融合直接砍调用数，是它的正面解法。
+- **结果**：decode 中位 **5.79 ms/token**（3 遍取中位，每遍 27 样本），p95 6.28
+- **vs 上一配置**：**1.07×（同场 A/B）**——对照（model_f16 + cuda_resident_coal_ws
+  + `--no-fuse-qkv --no-fuse-gate-up`）中位 6.22（p95 6.95）→ 变体 5.79，同 binary
+  同场交错测量。**口径注**：该对照的 k/v 仍走 pair 融合（非融合 qkv 路径里
+  k/v 本来就调 mv_pair），属"部分融合"，故 1.07× 偏保守；对真正全不融合
+  （上一条的 6.54）融合总收益 = 6.54→5.79 = **1.13×**。
+- **达成目标**：**5.79 < Mac fp16 满栈 6.35**——"压到 Mac 以下"兑现。
+  （跨机器对比仅作方向参照：A10 vs M 系芯片；但这是设定的目标，数字上达成。）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 38.45× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（62 单测全过，含新增
+  `matvec_f16_cuda_fused_pair_qkv_match_ref`：pair/qkv 融合输出逐一对齐
+  matvec_f16_ref，用 Qwen 真实形状 q_dim=896/kv_dim=128/in_dim=896）；
+  f16 golden token 16 个逐位一致。
+- **瓶颈转移**：top op 不变（lm_head / qkv_proj / topk_argmax）。5.79 里
+  权重读 ~1.7ms，剩 ~4ms：融合后调用数虽降，单次调用的启动/拷贝仍在，且
+  **非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax）还在 CPU**，
+  topk_argmax 已进 top op。下一刀候选：① 非 matvec 算子上 GPU（或整段
+  forward 常驻显存 + CUDA Graph）；② 更大模型/batch——那才是 A10 主场。
+- **意外 / 教训**：
+  1. **融合的收益随优化深入而递减**：resident 7×、coalesce 5×、融合只有
+     1.13×——越往后剩余开销越分散，单刀收益越小，这是优化后期的常态。
+     但融合是把"调用数"这个结构性开销砍掉的必要一步，积少成多。
+  2. **A/B 对照要选准**：`--no-fuse` 开关的对照仍含 pair 融合（k/v 走
+     mv_pair），直接拿它当"上一配置"会低估收益；用历史记录的真·不融合
+     （6.54）做锚点才看得全 1.13×。对照的"纯度"本身是要审查的对象。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_cuda_fused --extra-args "--matvec-impl cuda_resident_coal_ws"`
 
 ---
 
