@@ -262,6 +262,7 @@ namespace tinyqwen {
         ENG_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->d_next), sizeof(int)));
         ENG_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->d_pos), sizeof(int)));
         ENG_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->d_token), sizeof(int)));
+        gpu::argmax_init(); // argmax 内部 partial 缓冲必须在 capture 前分配好
 
         std::fprintf(stderr,
                      "[gpu engine] 权重已常驻显存（%s），kv %.1f MB，max_seq_len=%d\n",

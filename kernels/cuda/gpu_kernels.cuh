@@ -49,6 +49,10 @@ namespace gpu {
     void swiglu(cudaStream_t s, float *gate, const float *up, int n);
     // 全词表 argmax（严格 > 取首个，对齐 argmax_ref），结果写 device 的 out_idx。
     void argmax(cudaStream_t s, const float *logits, int *out_idx, int n);
+    // 预分配 argmax 内部的 partial 归约缓冲。cudaMalloc 在 stream capture 期间
+    // 不允许调用，engine 必须在第一次 engine_step（CUDA Graph capture）之前
+    // 调这个，把分配挪到 capture 开始前完成；测试直接调 argmax() 不需要。
+    void argmax_init();
 
     // ---- matvec（coalesced，device 指针）----
     void matvec_f16(cudaStream_t s, const uint16_t *w, const float *x, float *y, int out_dim,

@@ -407,7 +407,14 @@ namespace gpu {
     }
 
     // ========================================================================
-    // argmax：单 block 跨步扫描 + (value,index) 归约，严格 > 取首个（对齐 ref）。
+    // argmax：两阶段归约。之前是单 block(256 线程) 跨步扫全 vocab（151936 个
+    // float），profile 量到单次 ~220us——256 个线程扫近 15 万元素，并行度严重
+    // 不足（A10 72 个 SM 只吃到 1 个）。改成：①多 block 各扫一段、block 内
+    // 归约出局部最优写进 partial；②grid=1 的小 kernel 合并所有 partial 得到
+    // 全局最优。block 数固定在 kArgmaxBlocks（不随 n 增长），partial 缓冲
+    // 固定大小、进程内只分配一次（静态单例，仿 matvec_f32_cuda_resident*.cu
+    // 的常驻权重/workspace 写法；这次的 cudaMalloc 不挂在任何 stream 上，
+    // 首次调用即便发生在 CUDA Graph capture 期间也不受影响）。
     // ========================================================================
     struct ValIdx { float v; int idx; };
     __device__ __forceinline__ ValIdx better(ValIdx a, ValIdx b) {
@@ -416,15 +423,9 @@ namespace gpu {
         if (b.v > a.v) return b;
         return (a.idx <= b.idx) ? a : b;
     }
-    __global__ void argmax_kernel(const float *logits, int *out_idx, int n) {
-        __shared__ ValIdx sbest[kBlock / kWarp];
-        ValIdx local{-1e30f, 0};
-        // 每个线程负责 i = tid, tid+blockDim, ...（升序，配合严格 > 保留首个）。
-        for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float v = logits[i];
-            if (v > local.v) local = ValIdx{v, i};
-        }
-        // warp 内归约。
+    // block 内 (value,index) 归约：warp shuffle + 跨 warp shared mem 合并，
+    // 结果只在 threadIdx.x==0 处有效（调用方自行判断并使用）。
+    __device__ ValIdx block_reduce_best(ValIdx local, ValIdx *shared) {
         const int lane = threadIdx.x & (kWarp - 1);
         const int wid = threadIdx.x / kWarp;
         for (int off = kWarp / 2; off > 0; off >>= 1) {
@@ -433,22 +434,69 @@ namespace gpu {
             other.idx = __shfl_down_sync(~0u, local.idx, off);
             local = better(local, other);
         }
-        if (lane == 0) sbest[wid] = local;
+        if (lane == 0) shared[wid] = local;
         __syncthreads();
-        const int nw = blockDim.x / kWarp;
+        ValIdx result{-1e30f, INT32_MAX};
         if (wid == 0) {
-            ValIdx t = (lane < nw) ? sbest[lane] : ValIdx{-1e30f, INT32_MAX};
+            const int nw = blockDim.x / kWarp;
+            ValIdx t = (lane < nw) ? shared[lane] : ValIdx{-1e30f, INT32_MAX};
             for (int off = nw / 2; off > 0; off >>= 1) {
                 ValIdx other;
                 other.v = __shfl_down_sync(~0u, t.v, off);
                 other.idx = __shfl_down_sync(~0u, t.idx, off);
                 t = better(t, other);
             }
-            if (lane == 0) *out_idx = t.idx;
+            result = t;
         }
+        return result;
     }
+
+    constexpr int kArgmaxBlocks = 288; // ~4×A10 的 72 SM；短 kernel 也吃满
+
+    __global__ void argmax_partial_kernel(const float *logits, int n, ValIdx *partial) {
+        __shared__ ValIdx sbest[kBlock / kWarp];
+        ValIdx local{-1e30f, 0};
+        // grid-stride：每个线程负责 i、i+gridDim.x*blockDim.x、...（升序，配合
+        // 严格 > 保留首个），与原单 block 版语义一致，只是分摊到多个 block。
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+            const float v = logits[i];
+            if (v > local.v) local = ValIdx{v, i};
+        }
+        const ValIdx best = block_reduce_best(local, sbest);
+        if (threadIdx.x == 0) partial[blockIdx.x] = best;
+    }
+    __global__ void argmax_final_kernel(const ValIdx *partial, int num_partial, int *out_idx) {
+        __shared__ ValIdx sbest[kBlock / kWarp];
+        ValIdx local{-1e30f, 0};
+        for (int i = threadIdx.x; i < num_partial; i += blockDim.x) {
+            local = better(local, partial[i]);
+        }
+        const ValIdx best = block_reduce_best(local, sbest);
+        if (threadIdx.x == 0) *out_idx = best.idx;
+    }
+
+    namespace {
+        ValIdx *argmax_partial_buf() {
+            static ValIdx *buf = nullptr;
+            if (!buf) GPU_CHECK(cudaMalloc(&buf, kArgmaxBlocks * sizeof(ValIdx)));
+            return buf;
+        }
+    } // namespace
+
+    // cudaMalloc 在 stream capture 期间是禁止的（"operation not permitted when
+    // stream is capturing"），实测踩到过——engine_create 必须在第一次 engine_step
+    // （即 CUDA Graph capture 那一步）之前显式调用这个函数，把 partial 缓冲的
+    // 分配挪到 capture 开始前完成。测试直接调 argmax() 不涉及 capture，走懒分配
+    // 即可，不需要调这个。
+    void argmax_init() { argmax_partial_buf(); }
+
     void argmax(cudaStream_t s, const float *logits, int *out_idx, int n) {
-        GPU_LAUNCH(argmax_kernel<<<1, kBlock, 0, s>>>(logits, out_idx, n));
+        ValIdx *partial = argmax_partial_buf();
+        int blocks = (n + kBlock - 1) / kBlock;
+        if (blocks > kArgmaxBlocks) blocks = kArgmaxBlocks;
+        if (blocks < 1) blocks = 1;
+        GPU_LAUNCH(argmax_partial_kernel<<<blocks, kBlock, 0, s>>>(logits, n, partial));
+        GPU_LAUNCH(argmax_final_kernel<<<1, kBlock, 0, s>>>(partial, blocks, out_idx));
     }
 
 } // namespace gpu

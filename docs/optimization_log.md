@@ -1172,6 +1172,65 @@
 
 ---
 
+### gpu_engine_argmax_2pass（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。
+- **优化栈**：gpu_engine_attn_blocksize + **argmax 改两阶段归约**
+- **是什么**：profile（同上条目的 nsys 方法）显示 `argmax_kernel` 单次
+  ~220us——它是 `<<<1, 256>>>` 单 block 跨步扫全 vocab（151936 个 float），
+  256 个线程摸近 15 万元素，A10 72 个 SM 只吃到 1 个，并行度严重不足。
+  改成两阶段：①`argmax_partial_kernel`，`kArgmaxBlocks=288`（~4×SM 数）个
+  block 各用 grid-stride 扫一段、block 内归约出局部 (value,idx) 最优写进
+  固定大小的 `partial` 缓冲；②`argmax_final_kernel`，grid=1 合并 288 个
+  partial 得到全局最优。两个 kernel 共享抽出来的 `block_reduce_best` 归约
+  helper，tie-break（严格 > 取最小下标）逐位对齐原实现。partial 缓冲是
+  进程内单例、固定大小（不随 n 增长），仿 `matvec_f32_cuda_resident*.cu`
+  的常驻 workspace 写法。
+- **踩坑**：partial 缓冲最初写成"首次调用时懒分配"（`static` 指针，首次
+  `cudaMalloc`），实测直接炸：engine 第一次 `engine_step`（= CUDA Graph
+  capture 那一步）里调 argmax 时触发分配，报
+  `cudaMalloc ... operation not permitted when stream is capturing`——
+  cudaMalloc 在 stream capture 期间确实不允许调用（和上一条目"以为
+  block_sum_d 归约树宽度是瓶颈"一样，这次是"以为 cudaMalloc 不挂 stream
+  就总是安全"，两次都是先跑了才知道对不对）。修法：新增
+  `gpu::argmax_init()`，`engine_create` 里在所有其它 cudaMalloc 之后、
+  第一次 `engine_step` 之前显式调用一次，把分配挪到 capture 开始前完成；
+  测试直接调 `argmax()` 不涉及 capture，走懒分配即可，不用改。
+- **假设**：并行度类，与 `gpu_engine_warprow`/`gpu_engine_attn_blocksize`
+  同一诊断模式（block/thread 利用率低），但这次是"单 block 对整个 vocab"
+  这种更极端的形式。
+- **结果**：decode 中位 **3.19ms/token**（3 遍同场测：3.19/3.19/3.19），
+  p95 ~3.57；重新 profile 确认 argmax 从 ~220.9us/次砍到 ~6.1us/次
+  （partial 3.8us + final 2.3us），**36×**，与"这次真的是并行度瓶颈"的
+  诊断吻合——不同于上一条目 attention 的"诊断对但预测力有限"。
+- **vs 上一配置**：**1.06×**（vs gpu_engine_attn_blocksize 的 3.39ms，同场，
+  与 argmax 原占比~6.5% 吻合，说明这一刀几乎把该项开销压到了地板）
+- **vs 原始基线**（gpu_engine，无 graph/无 warprow/无 attn 收窄/无本条，
+  4.89ms）：**1.53×**
+- **验证**：71 单测全过（`gpu_argmax_matches_ref` 覆盖 n=151936 大数组、
+  平局取首个、全等取 0 等边界，两阶段版数值与单 block 版逐位一致）；
+  `--engine cuda` 在 fp32/f16 模型上 16-token 与 golden 逐位一致，f16
+  32-token 与 CPU forward 逐位一致；`scripts/verify.sh` 全过。
+- **瓶栈转移**：`attention_kernel`（~31%）和 `matvec_single`
+  （o_proj+down_proj+lm_head，~28%）并列第一梯队，`matvec_pair`
+  （gate+up，~22%）紧随。argmax/embed/kv_append/rope/swiglu 这类小算子
+  合计已 <10%，边际收益越来越薄——继续压需要回到之前两条目分析过的大项：
+  attention 的串行依赖链（需要 flash-decoding 式重构）或量化（权重流量
+  ÷4/÷8，同时压 matvec_single/pair/qkv 三块）。
+- **意外 / 教训**：
+  1. **"单 block 处理超大数组"是本次发现的第三种低并行度模式**：先是
+     matvec 的"block-per-row 线程摸太少"，再是 attention 的"block 内
+     归约树太宽但真正瓶颈是延迟"，这次是"干脆就一个 block"——三种模式
+     长得像但根因和修法都不同，profile 才能分清哪个 kernel 属于哪种。
+  2. **cudaMalloc 在 capture 期间被禁止，这是本 session 第二次"以为安全
+     实际不安全"的教训**：和 `gpu_engine_attn_blocksize` 条目的"以为
+     block size 是瓶颈"一样，都是先做了假设、写了代码、跑起来才发现假设
+     不成立——区别是这次是直接报错（好发现），上次是数字对但不及预期
+     （更隐蔽）。两次都验证了"写完就跑一遍"这个纪律的价值。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh gpu_engine_argmax_2pass --extra-args "--engine cuda"`
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）
