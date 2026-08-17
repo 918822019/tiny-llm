@@ -59,3 +59,22 @@ target_include_directories(tinyqwen_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # 所有链 tinyqwen_kernels 的目标（runtime/tests），无需各处重复写。
 find_package(Threads REQUIRED)
 target_link_libraries(tinyqwen_kernels PUBLIC Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# matvec 的 CUDA 参考变体（可选，只在检测到 CUDA 编译器时才编译进去）。
+# CUDA 语言探测 + CMAKE_CUDA_ARCHITECTURES 已在顶层 CMakeLists.txt 里做过
+# （必须在任何目标创建之前设置，见那里的注释），这里只消费
+# TINYQWEN_HAS_CUDA 这个开关。
+#
+# 和 NEON 变体的"其他平台编译为空"不是同一种机制——NEON 靠预处理器
+# `#if defined(__aarch64__)` 在源码层面自行留空；.cu 文件离不开 CUDA
+# 语言支持，没有 nvcc 时必须在 CMake 层就不把它加进编译，否则配置阶段
+# 直接报错。TINYQWEN_HAS_CUDA 为 OFF 时这一整块跳过，其他平台
+# （mac / Android / 没装 CUDA 的 CI）不受任何影响。
+# ---------------------------------------------------------------------------
+if (TINYQWEN_HAS_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(tinyqwen_kernels PRIVATE matvec/matvec_f32_cuda.cu)
+    set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
+    target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
+endif ()

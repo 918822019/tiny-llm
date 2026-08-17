@@ -29,6 +29,7 @@
 | f16_neon_mt_kv_nt | c8fba49 | 8.00 | 9.19 | 27.81× | 1.75×（同场 vs fp32 最佳栈） | 权重 f16 量化（流量减半）+ fp32 满栈移植 + 线程甜蜜点 6→8；非 matvec 固定开销 Amdahl 稀释，未到 2× |
 | f16 + qkv/gate_up 融合（**fp16 路线终点**） | 本次 | 6.37 | 6.77 | 36.2× | ≈1.1×（同场 A/B 乘积；跨窗绝对值受噪声污染） | qkv 三路融合 + gate/up 成对融合：fork-join 96→48 次/token。此后 fp16 路线正式关闭（见文末关闭小节） |
 | ops_neon | 2cdbdd0 | 6.35 | 6.87 | 35.08× | 1.05×（同场） | 非 matvec 五算子 NEON 化 + ops dispatch：argmax 10×/attention 2.3×/swiglu 3.1×/rmsnorm 2.5×，profile 合计省 ~0.48ms；非 matvec 开销 694→200µs |
+| cuda（⚠️ 换机器：x86_64 + A10） | 7fc4a2d | 333.75 | 356.47 | N/A（跨机器，基线是 M 系芯片） | 1.75×（同场 vs 本机 ref） | matvec CUDA 参考变体（每次调用重传权重）：打通 CUDA 路径，朴素形态如实记录 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -607,6 +608,54 @@
   待真机连接后跑 verify_android.sh 首测。
 - **下一步**：连真机跑 set_baseline_android.sh 建立 Android 基线，此后每个
   kernel 优化可用 record_android.sh 一键记录端侧数字。
+
+---
+
+### cuda（2026-08-17）
+
+- **⚠️ 首次换机器**：本条及之后的数字在 **x86_64 + NVIDIA A10**（8 CPU 核，
+  gcc 10.2.1，CUDA 12.8，Ampere SM86）上测量，与汇总表前面所有条目
+  （Apple Silicon）**不是同一台机器**——"vs 原始基线"一栏失去意义，
+  只有同场 A/B 可比。baseline.json（222.59 @ M 系芯片）保持不动，
+  本机跑 record.sh 会持续报漂移警告，属预期。
+- **优化栈**：x86-fp32-baseline（本机标量 ref）+ matvec cuda 参考变体
+- **是什么**：新增 `kernels/matvec/matvec_f32_cuda.cu`——matvec 的 CUDA
+  **参考版**。两个刻意"不优化"的设计：host 包装每次调用都
+  cudaMalloc + H2D 上传全部权重 + kernel + D2H + cudaFree（权重不常驻显存）；
+  device kernel 一行一个 thread、行内串行点积（无 shared memory / warp
+  归约）。目标不是快，是把 CUDA 接进现有 dispatch（`--matvec-impl cuda`
+  即可用，CMake 用 check_language(CUDA) 可选接入，无 nvcc 平台零影响），
+  并如实量出"朴素形态"的真实成本，给下一步优化提供基准。
+- **假设**：带宽类。A10 HBM 带宽 ~600 GB/s 远大于 CPU；decode 是纯权重
+  带宽瓶颈（~2 GB/token 流量），理论上 GPU 应大幅领先。但朴素包装每 token
+  要经 PCIe 重传 ~2 GB 权重——传输税会吃掉大部分理论收益，预期被显著稀释。
+- **结果**：decode 中位 **333.75 ms/token**（3 遍取中位，每遍 27 样本），p95 356.47
+- **vs 上一配置**：**1.75×（同场 A/B，本机 ref）**——对照（无额外参数 = 标量 ref）
+  中位 583.50（p95 588.56）→ 变体 333.75，同 binary 同场交错测量。
+  本机对照补充：acc4（跨平台最快 CPU 变体）单机单遍 269.21 ms/tok——
+  **cuda 参考版比本机最好的 CPU 标量变体还慢**，只快于裸 ref。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 0.67× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（55 单测全过，含新增 `matvec_cuda_matches_ref`：
+  常规形状 + grid-stride 覆盖的大 out_dim 形状；golden token 16 个逐位一致）
+- **瓶颈转移**：top op 仍是 `lm_head`、qkv_proj、o_proj（matvec 结构不变），
+  但时间构成变了：计算本身可忽略（A10 fp32 ~31 TFLOPS，2 GFLOP/token 是零头），
+  成本几乎全在**权重上传**（~2 GB/token，PCIe Gen4 有效 ~25 GB/s 量级 →
+  传输本身 ~80 ms/token 量级）+ 每调用一次的 cudaMalloc/cudaFree/kernel
+  启动（170 次/token，其余 ~250 ms 的大头）。下一刀：**权重常驻显存**
+  （decode 期权重不变，按 host 指针缓存 device 副本，把每 token 的
+  1.98 GB 上传降为 x 的几 KB + y 的回读），然后再谈 kernel 侧优化
+  （block-per-row + shared memory 归约，喂饱小矩阵）。
+- **意外 / 教训**：
+  1. **"GPU 一定快"在 batch=1 小模型上被证伪**——朴素 CUDA 变体输给本机
+     最好的 CPU 标量变体（333 vs 269 ms/tok）。输的原因不是 GPU 算力，
+     是传输税：每调用重传权重的包装形态把 PCIe 当成了主瓶颈。这正是
+     "先落参考版量真实成本"策略的价值——没有这个 333 的锚点，下一步
+     权重常驻的收益（预期一个量级）就无从归因。
+  2. **换机器 = 换尺子**：跨机器的"vs 基线"彻底失效（0.67× 是荒谬的，
+     x86 标量 ref 本来就比 M 系慢 2.6×），纪律上只认同场 A/B；汇总表里
+     机器切换必须显式标注（本条已标）。
+- **复现**：`./scripts/bench.sh cuda --extra-args "--matvec-impl cuda"`
 
 ---
 

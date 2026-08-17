@@ -6,6 +6,7 @@ build-*/
 
 # 模型权重 / 导出数据（体积大，不入库）
 models/
+.ms_cache/
 *.tqwen
 *.npz
 *.pt

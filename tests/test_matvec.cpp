@@ -679,3 +679,49 @@ TEST (matvec_neon_mt_bal_matches_ref) {
 
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
+
+TEST (matvec_cuda_matches_ref) {
+    // 正确性门禁：cuda 只在检测到 nvcc 的构建里注册（见
+    // kernels/CMakeLists.txt 的 check_language(CUDA)）；没有 CUDA 工具链的
+    // 平台（mac/Android/普通 CI）set 失败 -> skip，与 neon 系列在 x86 上
+    // 的行为对称，不是静默兜底假通过。
+    if (!set_matvec_impl_by_name("cuda")) {
+        std::printf("[skip] current build has no 'cuda' matvec (no CUDA toolchain)\n");
+        return;
+    }
+
+    // 1) 常规形状：out_dim/in_dim 都不是任何 2 的幂对齐边界，和其他变体
+    //    测试同款输入构造方式，误差量级参照 neon 系列（float 累加，5e-3）。
+    {
+        const int out_dim = 16, in_dim = 4103;
+        std::vector<float> w(out_dim * in_dim), x(in_dim);
+        for (int i = 0; i < out_dim * in_dim; ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    // 2) out_dim 远大于一个 block 的 thread 数（覆盖 kernel 里的
+    //    grid-stride loop：block 数量封顶后仍要循环覆盖所有行），
+    //    in_dim 较小（模拟 k/v_proj 这类小矩阵形状）。
+    {
+        const int out_dim = 2000, in_dim = 67;
+        std::vector<float> w(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        for (size_t i = 0; i < w.size(); ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+        for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+    }
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}
