@@ -77,9 +77,12 @@ if (TINYQWEN_HAS_CUDA)
     target_sources(tinyqwen_kernels PRIVATE
             # cuda = 参考版（每调用重传权重，量传输税的锚点）；
             # cuda_resident = 权重常驻显存（按 host 指针缓存 device 副本，
-            # kernel 与参考版逐字相同，隔离"常驻"这一个变量）。
+            # kernel 与参考版逐字相同，隔离"常驻"这一个变量）；
+            # cuda_resident_ws = cuda_resident + x/y 常驻 workspace（grow-only，
+            # 删掉每调用的 cudaMalloc/cudaFree，kernel 仍逐字不变）。
             matvec/matvec_f32_cuda.cu
-            matvec/matvec_f32_cuda_resident.cu)
+            matvec/matvec_f32_cuda_resident.cu
+            matvec/matvec_f32_cuda_resident_ws.cu)
     set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
     target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
 endif ()

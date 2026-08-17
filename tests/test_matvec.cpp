@@ -782,3 +782,38 @@ TEST (matvec_cuda_resident_matches_ref) {
 
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
+
+TEST (matvec_cuda_resident_ws_matches_ref) {
+    // 正确性门禁：cuda_resident_ws 只在 CUDA 构建注册；其他平台 skip。
+    // 在 cuda_resident 的缓存正确性之上，额外覆盖 workspace 的 grow-only
+    // 逻辑：
+    //   1. 小 shape 先跑（workspace 按小容量分配）；
+    //   2. 换成更大 shape（触发扩容重分配）；
+    //   3. 再换回小 shape（复用大容量缓冲跑小 shape，只读写前 n 个元素，
+    //      不能因为缓冲变大而读脏数据或写越界）。
+    if (!set_matvec_impl_by_name("cuda_resident_ws")) {
+        std::printf("[skip] current build has no 'cuda_resident_ws' matvec (no CUDA toolchain)\n");
+        return;
+    }
+
+    auto check = [](const int out_dim, const int in_dim, int reps) {
+        std::vector<float> w(static_cast<size_t>(out_dim) * in_dim), x(in_dim);
+        for (size_t i = 0; i < w.size(); ++i) {
+            w[i] = static_cast<float>((i * 37 % 29) - 14) * 0.125f;
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f32_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < reps; ++rep) {
+            matvec_f32(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    };
+
+    check(16, 4103, 4);    // 1) 小 out_dim，冷启动 + 缓存命中
+    check(2000, 4103, 2);  // 2) 大 out_dim，触发 d_y 扩容
+    check(8, 501, 4);      // 3) 换回小 shape，复用大缓冲
+    check(2000, 67, 2);    // 2') 大 out_dim + 小 in_dim（d_x 不扩容，d_y 已够）
+
+    EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
+}

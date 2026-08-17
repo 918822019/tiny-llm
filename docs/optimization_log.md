@@ -31,6 +31,7 @@
 | ops_neon | 2cdbdd0 | 6.35 | 6.87 | 35.08× | 1.05×（同场） | 非 matvec 五算子 NEON 化 + ops dispatch：argmax 10×/attention 2.3×/swiglu 3.1×/rmsnorm 2.5×，profile 合计省 ~0.48ms；非 matvec 开销 694→200µs |
 | cuda（⚠️ 换机器：x86_64 + A10） | 7fc4a2d | 333.75 | 356.47 | N/A（跨机器，基线是 M 系芯片） | 1.75×（同场 vs 本机 ref） | matvec CUDA 参考变体（每次调用重传权重）：打通 CUDA 路径，朴素形态如实记录 |
 | cuda_resident（x86_64 + A10） | dd58fd2 | 47.40 | 48.07 | N/A（跨机器，基线是 M 系芯片） | 12.30×（同场 vs 本机 ref）；7.04× vs 朴素 cuda | matvec 权重常驻显存（按 host 指针缓存 device 副本），砍掉每 token ~2GB 的 PCIe 重传；GPU 从此反超本机最好 CPU 变体 |
+| cuda_resident_ws（x86_64 + A10） | aa30aa5 | 46.05 | 46.52 | N/A（跨机器，基线是 M 系芯片） | 1.03×（vs cuda_resident，≈无效）；12.67×（同场 vs 本机 ref） | x/y 常驻 workspace（删每调用 alloc/free）——证伪归档：CUDA 池化小分配，瓶颈实为 kernel 非合并访存 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -694,6 +695,8 @@
   + 170 次 cudaDeviceSynchronize + 朴素 kernel 喂不带宽**。下一刀：
   ① x/y 用常驻 workspace，删掉每调用 alloc/free；② kernel 改 block-per-row
   + shared memory/warp 归约，把 HBM 带宽吃满（目标逼近 3–5 ms/tok）。
+  （后记：① 被 cuda_resident_ws 条目证伪——CUDA 分配器池化小缓冲，
+  alloc/free 不是大头；真正的瓶颈是 kernel 内非合并访存，见该条。）
 - **意外 / 教训**：
   1. **一步归因干净利落**：kernel 一个字没改，只把权重改成常驻，就拿到
      7.04×——精确兑现了 cuda 条目"下一刀砍传输税"的预判。这再次印证
@@ -704,6 +707,50 @@
      数据搬运路径的设计比算力选型更决定成败——与 CPU 侧 fp16 量化
      （流量减半）带来主升浪是同一个规律。
 - **复现**：`./scripts/bench.sh cuda_resident --extra-args "--matvec-impl cuda_resident"`
+
+---
+
+### cuda_resident_ws（2026-08-17）
+
+- **机器**：与 cuda / cuda_resident 条目同一台（x86_64 + NVIDIA A10）。
+  跨机器的"vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline（本机标量 ref）+ cuda_resident + x/y 常驻 workspace
+- **是什么**：新增 `kernels/matvec/matvec_f32_cuda_resident_ws.cu`。在
+  cuda_resident 之上再改一处：x/y 不再每次调用 cudaMalloc/cudaFree，改用
+  grow-only 常驻 workspace（只在遇到更大 shape 时扩容，decode 稳态零
+  分配）。权重缓存与 device kernel 仍然逐字不变——继续一次只动一个变量。
+- **假设**：cuda_resident 条目推断剩余大头是"每调用 680 次 cudaMalloc/
+  cudaFree（~170 次 matvec/token × 4）"，预期删掉后有明显收益。
+- **结果**：decode 中位 **46.05 ms/token**（3 遍取中位，每遍 27 样本），p95 46.52
+- **vs 上一配置**：**1.03×（vs cuda_resident：47.40 → 46.05，≈无效）**——
+  假设被证伪：CUDA 分配器对小缓冲做池化缓存，小块的每调用 alloc/free
+  远比预想便宜，省下的 ~1.35 ms/tok（约 3%）基本在噪声边缘。同场 A/B
+  对照（无额外参数 = 标量 ref）中位 583.27（p95 589.64）→ 变体 46.05，
+  即 vs 本机 ref 12.67×，同 binary 同场交错测量。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 4.83× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（57 单测全过，含新增
+  `matvec_cuda_resident_ws_matches_ref`：小 shape→大 shape→回到小 shape
+  交替，覆盖 workspace 冷启动/扩容/复用大缓冲跑小 shape 三条路径；
+  golden token 16 个逐位一致）
+- **瓶颈转移**：top op 不变（lm_head / qkv_proj / down_proj）。排除了
+  alloc/free 之后，46 ms/tok 的构成指向**朴素 kernel 的非合并访存**：
+  一行一个 thread 意味着同一 warp 的 32 个线程在读 32 条相隔
+  in_dim×4 字节的权重行——每步 warp 读 32 条分散 cache line 只用回
+  128 字节，HBM 有效利用率 ~3%，1.98GB/token 的权重读被放大成百倍
+  流量；外加每调用一次 cudaDeviceSynchronize。下一刀：**合并访存的
+  matvec kernel**（block-per-row：一个 block 算一行、线程沿 in_dim
+  连续读权重、shared memory/warp 归约求点积），把 HBM 带宽吃满，
+  目标逼近 3–5 ms/tok 的带宽地板。
+- **意外 / 教训**：
+  1. **归因猜测被测量打脸是常态，测了才知道**：上一条信誓旦旦"剩余大头
+     是 680 次 alloc/free"，实测只值 3%。教训：CUDA 运行时对小分配有
+     池化，想当然的成本模型不可靠——每个"下一刀"都要像本条一样落地实测，
+     证伪也是成果（它把矛头准确指向了 kernel 访存模式）。
+  2. **变体保留的价值**：cuda_resident_ws 虽然≈无效，但留在树里当
+     "排除项"——后人不用再猜 alloc/free 是不是瓶颈。与 neon_mt_bal
+     归档同款处理（实测收益≈0，归档保留，不删）。
+- **复现**：`./scripts/bench.sh cuda_resident_ws --extra-args "--matvec-impl cuda_resident_ws"`
 
 ---
 
