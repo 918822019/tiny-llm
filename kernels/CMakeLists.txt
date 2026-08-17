@@ -85,7 +85,10 @@ if (TINYQWEN_HAS_CUDA)
             matvec/matvec_f32_cuda_resident_ws.cu
             # cuda_resident_coal = cuda_resident + 合并访存 kernel（block-per-row
             # + warp shuffle 归约，warp 内连续读权重，吃满 HBM 带宽）。
-            matvec/matvec_f32_cuda_resident_coal.cu)
+            matvec/matvec_f32_cuda_resident_coal.cu
+            # f16 权重版 cuda_resident_coal（权重流量减半）；与 f32 同名注册，
+            # 按模型 dtype 解析（f16 模型 + --matvec-impl cuda_resident_coal 用本文件）。
+            matvec/matvec_f16_cuda_resident_coal.cu)
     set_target_properties(tinyqwen_kernels PROPERTIES CUDA_STANDARD 17)
     target_link_libraries(tinyqwen_kernels PUBLIC CUDA::cudart)
 endif ()

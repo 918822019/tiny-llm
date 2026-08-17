@@ -853,3 +853,38 @@ TEST (matvec_cuda_resident_coal_matches_ref) {
 
     EXPECT_TRUE(set_matvec_impl_by_name("ref")); // 恢复默认，避免影响其他测试
 }
+
+TEST (matvec_f16_cuda_resident_coal_matches_ref) {
+    // 正确性门禁：f16 cuda_resident_coal 只在 CUDA 构建注册；其他平台 skip。
+    // 对齐基准是 f16 族的 matvec_f16_ref（不是 f32 的）——权重已半精度量化。
+    // 权重取 0.125 的整数倍（half 可精确表示），变体与 f16_ref 的差只来自
+    // fp32 累加顺序，容差沿用 5e-3。边界覆盖同 f32 coal 版：in_dim 非 256
+    // 倍数、in_dim<256（高编号线程空转）、大 out_dim block-per-row。
+    if (!set_matvec_f16_impl_by_name("cuda_resident_coal")) {
+        std::printf("[skip] current build has no f16 'cuda_resident_coal' matvec (no CUDA toolchain)\n");
+        return;
+    }
+
+    auto check = [](const int out_dim, const int in_dim, int reps) {
+        std::vector<uint16_t> w(static_cast<size_t>(out_dim) * in_dim);
+        std::vector<float> x(in_dim);
+        for (int i = 0; i < static_cast<int>(w.size()); ++i) {
+            w[i] = float_to_half(static_cast<float>((i * 37 % 29) - 14) * 0.125f);
+        }
+        for (int i = 0; i < in_dim; ++i) x[i] = static_cast<float>((i * 13 % 17) - 8) * 0.125f;
+        std::vector<float> y_ref(out_dim), y_var(out_dim);
+        matvec_f16_ref(w.data(), x.data(), y_ref.data(), out_dim, in_dim);
+        for (int rep = 0; rep < reps; ++rep) {
+            matvec_f16(w.data(), x.data(), y_var.data(), out_dim, in_dim);
+            for (int o = 0; o < out_dim; ++o) EXPECT_NEAR(y_var[o], y_ref[o], 5e-3);
+        }
+    };
+
+    check(16, 4103, 4);    // in_dim % 256 != 0
+    check(8, 67, 4);       // in_dim < 256：多数线程空转
+    check(2000, 67, 2);    // 大 out_dim + 小 in_dim
+    check(3, 256, 4);      // in_dim 恰一个 block 步长
+    check(128, 896, 2);    // k/v_proj 真实形状
+
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("ref")); // 恢复默认
+}

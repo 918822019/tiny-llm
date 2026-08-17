@@ -33,6 +33,7 @@
 | cuda_resident（x86_64 + A10） | dd58fd2 | 47.40 | 48.07 | N/A（跨机器，基线是 M 系芯片） | 12.30×（同场 vs 本机 ref）；7.04× vs 朴素 cuda | matvec 权重常驻显存（按 host 指针缓存 device 副本），砍掉每 token ~2GB 的 PCIe 重传；GPU 从此反超本机最好 CPU 变体 |
 | cuda_resident_ws（x86_64 + A10） | aa30aa5 | 46.05 | 46.52 | N/A（跨机器，基线是 M 系芯片） | 1.03×（vs cuda_resident，≈无效）；12.67×（同场 vs 本机 ref） | x/y 常驻 workspace（删每调用 alloc/free）——证伪归档：CUDA 池化小分配，瓶颈实为 kernel 非合并访存 |
 | cuda_resident_coal（x86_64 + A10） | 7356481 | 9.16 | 9.81 | N/A（跨机器，基线是 M 系芯片） | 5.17×（vs cuda_resident）；63.94×（同场 vs 本机 ref） | matvec kernel 改合并访存（block-per-row + warp 归约），warp 读权重从 32 条分散 cache line → 1 条满线；CUDA 路线首次逼近带宽地板 |
+| f16_cuda_resident_coal（x86_64 + A10） | 3408267 | 7.68 | 8.14 | N/A（跨机器，基线是 M 系芯片） | 1.18×（vs f32_cuda_coal，同场） | 权重 fp16（流量减半）：理论 2× 被 Amdahl 稀释成 1.18×——时间大头已是固定开销而非带宽，诊断价值大于提速价值 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -807,6 +808,49 @@
      是**同一类坑**。教训：误差异常先查数据生成；`size_t` 减法永远警惕。
      kernel 本身一次就写对了。
 - **复现**：`./scripts/bench.sh cuda_resident_coal --extra-args "--matvec-impl cuda_resident_coal"`
+
+---
+
+### f16_cuda_resident_coal（2026-08-17）
+
+- **机器**：与 cuda 系列条目同一台（x86_64 + NVIDIA A10）。跨机器的
+  "vs 基线"无意义，只认同场 A/B 与本机对照。
+- **优化栈**：x86-fp32-baseline + cuda_resident_coal + 权重 fp16（weight-only）
+- **是什么**：新增 `kernels/matvec/matvec_f16_cuda_resident_coal.cu`——f32
+  cuda_resident_coal 的 fp16 权重版。host 包装、合并访存 kernel 的归约结构
+  全部照搬，唯一变化：权重按 `uint16_t` 加载、`__half2float` 转 fp32 再乘加。
+  与 f32 版**同名注册**（"cuda_resident_coal"），按模型 dtype 解析（对齐
+  CPU 侧 f16 族的做法）。配套导出 `model_f16.tqwen`（--dtype f16，942MB，
+  恰为 fp32 的一半）。
+- **假设**：减少搬运类。decode 是纯搬权重负载，权重 fp32→fp16 每 token
+  HBM 流量减半（1.98GB→0.99GB），带宽地板 ~3.3ms→~1.7ms，理论应接近 2×。
+- **结果**：decode 中位 **7.68 ms/token**（3 遍取中位，每遍 27 样本），p95 8.14
+- **vs 上一配置**：**1.18×（同场 A/B，vs f32_cuda_coal）**——对照
+  （model.tqwen + cuda_resident_coal，即 fp32 版）中位 9.05（p95 9.49）→
+  变体（model_f16.tqwen + 同名实现）7.68，同 binary 同场交错测量。
+  **远低于理论的 2×**——见教训 1。
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26）是 M 系芯片数字，
+  跨机器不可比，本次 vs 基线 = 28.98× 无意义（仅存档）。
+- **验证**：scripts/verify.sh（59 单测全过，含新增
+  `matvec_f16_cuda_resident_coal_matches_ref`：对齐 f16 族 matvec_f16_ref，
+  覆盖 in_dim 非 256 倍数 / in_dim<256 / 大 out_dim 等边界）；f16 golden
+  token 16 个逐位一致（canonical prompt，与 fp32 参考相同）。
+- **瓶颈转移**：top op 出现 `topk_argmax`（非 matvec 算子开始冒头，说明
+  matvec 占比进一步下降）。7.68 离 f16 带宽地板（~1.7ms）还有 ~4.5×，
+  但差的不是带宽——是**固定开销**：每调用 x/y alloc/free + kernel 启动 +
+  cudaDeviceSynchronize（~170 次/token），在 fp32 版就占了 ~5ms，fp16 只
+  减了权重读那部分。下一刀：**砍固定开销**——x/y 常驻 workspace（此时才
+  真正值钱，ws 条目埋的伏笔）+ 削同步/启动，或 CUDA Graph 一次提交整段
+  decode，目标把 fp32/f16 都推向各自带宽地板。
+- **意外 / 教训**：
+  1. **理论 2× 被 Amdahl 稀释成 1.18×——这本身就是诊断结果**：当时间大头
+     已从"带宽"转移到"固定开销"时，任何只减带宽的优化都只能作用于剩下的
+     小部分。fp16 的 1.18× 精确告诉我们：权重读只占总时间的 ~1/3，主矛盾
+     是开销。想吃到 fp16 的全部红利，必须先砍开销——顺序不能反。
+  2. **对齐基准要跟着 dtype 走**：f16 变体对齐的是 matvec_f16_ref（权重已
+     半精度量化），不是 f32 的 ref——跨族对齐没有意义。测试里用
+     float_to_half 构造 0.125 倍数权重（half 可精确表示），隔离量化噪声。
+- **复现**：`MODEL=model_f16.tqwen ./scripts/bench.sh f16_cuda_resident_coal --extra-args "--matvec-impl cuda_resident_coal"`
 
 ---
 
