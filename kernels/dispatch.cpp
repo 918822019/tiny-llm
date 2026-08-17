@@ -323,4 +323,71 @@ namespace tinyqwen {
         }
         return argmax_ref(logits, n);
     }
+
+    // ---- GPU decode engine 分发 ----
+    namespace {
+        // 一个 engine 实现的五个函数指针。
+        struct GpuDecodeImpl {
+            GpuDecodeCreateFn create = nullptr;
+            GpuDecodeStepFn step = nullptr;
+            GpuDecodeResetFn reset = nullptr;
+            GpuDecodeDestroyFn destroy = nullptr;
+            GpuDecodeLogitsFn logits = nullptr;
+        };
+
+        std::unordered_map<std::string, GpuDecodeImpl> &gpu_decode_registry() {
+            static std::unordered_map<std::string, GpuDecodeImpl> r;
+            return r;
+        }
+
+        // 当前选择。nullptr = 未选择，gpu_decode_create 返回 false（回退 CPU）。
+        const GpuDecodeImpl *g_gpu_current = nullptr;
+        std::string g_gpu_current_name; // 空 = 未选择
+    } // namespace
+
+    void register_gpu_decode_impl(const char *name, GpuDecodeCreateFn create,
+                                  GpuDecodeStepFn step, GpuDecodeResetFn reset,
+                                  GpuDecodeDestroyFn destroy, GpuDecodeLogitsFn logits) {
+        gpu_decode_registry()[name] = GpuDecodeImpl{create, step, reset, destroy, logits};
+    }
+
+    bool set_gpu_decode_impl_by_name(const char *name) {
+        const auto &r = gpu_decode_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false; // 未知名字：不改变当前选择
+        g_gpu_current = &it->second;
+        g_gpu_current_name = name;
+        return true;
+    }
+
+    const char *gpu_decode_impl_name() { return g_gpu_current_name.c_str(); }
+
+    const char *available_gpu_decode_impls() {
+        static std::string joined;
+        if (joined.empty()) {
+            std::vector<std::string> names;
+            for (const auto &kv : gpu_decode_registry()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i) joined += ", ";
+                joined += names[i];
+            }
+        }
+        return joined.c_str();
+    }
+
+    bool gpu_decode_available() { return !gpu_decode_registry().empty(); }
+
+    bool gpu_decode_create(const void *model_file, int max_seq_len, std::string *err,
+                           GpuDecodeEngine **out) {
+        if (!g_gpu_current || !g_gpu_current->create) return false; // 未选择 → 回退 CPU
+        return g_gpu_current->create(model_file, max_seq_len, err, out);
+    }
+
+    int gpu_decode_step(GpuDecodeEngine *e, int token_id) { return g_gpu_current->step(e, token_id); }
+    void gpu_decode_reset(GpuDecodeEngine *e) { g_gpu_current->reset(e); }
+    void gpu_decode_destroy(GpuDecodeEngine *e) { g_gpu_current->destroy(e); }
+    const float *gpu_decode_logits(const GpuDecodeEngine *e) {
+        return g_gpu_current->logits(e);
+    }
 } // namespace tinyqwen

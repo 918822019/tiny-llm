@@ -9,6 +9,8 @@
 // 一行宏登记，加变体不需要改 dispatch/main/conf。
 // 详见 docs/optimization.md。
 
+#include <string>
+
 #include "ref_ops.h"
 
 namespace tinyqwen {
@@ -131,6 +133,44 @@ namespace tinyqwen {
                           int head_dim, float scale, float *out);
     void swiglu(float *gate, const float *up, int n);
     int argmax(const float *logits, int n);
+
+    // ---- GPU decode engine 分发 ----
+    //
+    // 与上面"逐算子"分发不同：这是一个"整段 forward"级的可插拔入口。engine
+    // 把权重/激活/KV cache 全部常驻显存，decode_step 在单条 CUDA stream 上
+    // 串起整个前向，只有 token id 过 PCIe——消灭逐 matvec 的 CPU↔GPU 桥接。
+    //
+    // GpuDecodeEngine 是**不透明句柄**：这里只有前向声明，完整定义在 CUDA
+    // engine 的翻译单元里。runtime/ 只经由本头文件拿到指针、原样传回，
+    // 永远不解引用——因此 runtime 保持 CUDA-agnostic（不 include 任何 CUDA
+    // 头）。CPU forward 永远是兜底参考：没有 engine 注册/选中时一切照旧。
+    //
+    // model_file 以 const void* 传递（实为 const ModelFile*），避免本头文件
+    // 依赖 runtime 的 model_loader.h；engine 的 .cu 里再 cast 回去。
+    struct GpuDecodeEngine; // opaque
+
+    using GpuDecodeCreateFn = bool (*)(const void *model_file, int max_seq_len,
+                                       std::string *err, GpuDecodeEngine **out);
+    using GpuDecodeStepFn = int (*)(GpuDecodeEngine *e, int token_id);
+    using GpuDecodeResetFn = void (*)(GpuDecodeEngine *e);
+    using GpuDecodeDestroyFn = void (*)(GpuDecodeEngine *e);
+    using GpuDecodeLogitsFn = const float *(*)(const GpuDecodeEngine *e);
+
+    void register_gpu_decode_impl(const char *name, GpuDecodeCreateFn create,
+                                  GpuDecodeStepFn step, GpuDecodeResetFn reset,
+                                  GpuDecodeDestroyFn destroy, GpuDecodeLogitsFn logits);
+    bool set_gpu_decode_impl_by_name(const char *name);
+    const char *gpu_decode_impl_name(); // 未选择时为 ""
+    const char *available_gpu_decode_impls();
+
+    // 通用入口。create 在未选择实现时返回 false（调用方回退 CPU forward）。
+    bool gpu_decode_available();
+    bool gpu_decode_create(const void *model_file, int max_seq_len, std::string *err,
+                           GpuDecodeEngine **out);
+    int gpu_decode_step(GpuDecodeEngine *e, int token_id);
+    void gpu_decode_reset(GpuDecodeEngine *e);
+    void gpu_decode_destroy(GpuDecodeEngine *e);
+    const float *gpu_decode_logits(const GpuDecodeEngine *e); // device 指针（供 dump）
 } // namespace tinyqwen
 
 // 变体自注册宏：写在实现文件末尾、namespace tinyqwen 内部（fn 要用非限定名）。
@@ -185,3 +225,13 @@ namespace tinyqwen {
 #define TINYQWEN_ARGMAX_VARIANT(fn, name)                                            \
     [[maybe_unused]] static const bool tqwen_reg_argmax_##fn =                       \
             (tinyqwen::register_argmax_impl(name, fn), true)
+
+// GPU decode engine 的自注册宏：engine 的 .cu 文件末尾调用一次，登记
+// create/step/reset/destroy/logits 五个函数指针。仅 CUDA 构建会执行到这里；
+// 无 CUDA 时没有 engine 注册，gpu_decode_available() 为 false，自动走 CPU。
+#define TINYQWEN_GPU_DECODE_VARIANT(name_str, create_fn, step_fn, reset_fn,          \
+                                    destroy_fn, logits_fn)                            \
+    [[maybe_unused]] static const bool tqwen_reg_gpud_##create_fn =                  \
+            (tinyqwen::register_gpu_decode_impl(name_str, create_fn, step_fn,        \
+                                                reset_fn, destroy_fn, logits_fn),     \
+             true)

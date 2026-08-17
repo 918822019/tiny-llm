@@ -43,6 +43,7 @@ namespace {
         std::string config; // 配置文件路径（可选）
         std::string matvec_impl; // matvec 实现；空 = 未指定，交给配置/默认值
         std::string ops_impl; // 非 matvec 算子实现；空 = 未指定，交给配置/默认值
+        std::string engine; // decode engine；空 = CPU forward（默认），"cuda" = GPU 常驻
     };
 
     void usage(const char *prog) {
@@ -61,6 +62,8 @@ namespace {
                      "  --matvec-impl NAME      matvec kernel: ref (default; neon later)\n"
                      "  --ops-impl NAME         non-matvec ops (rmsnorm/rope/attention/swiglu/\n"
                      "                          argmax): ref (default) / neon\n"
+                     "  --engine NAME           decode engine: '' = CPU forward (default) / cuda\n"
+                     "                          (GPU-resident whole-forward; requires CUDA build)\n"
                      "  --verbose               model summary + per-token details\n",
                      prog);
     }
@@ -88,6 +91,7 @@ namespace {
             else if (a == "--config") out->config = value("--config");
             else if (a == "--matvec-impl") out->matvec_impl = value("--matvec-impl");
             else if (a == "--ops-impl") out->ops_impl = value("--ops-impl");
+            else if (a == "--engine") out->engine = value("--engine");
             else if (a == "--no-fuse-gate-up") out->no_fuse_gate_up = true;
             else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
             else if (a == "--verbose") out->verbose = true;
@@ -254,6 +258,45 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",
                  model->kv_cache().memory_bytes() / (1024.0 * 1024.0), args.max_seq_len);
 
+    // ---- 选择 decode engine（GPU-resident forward，opt-in）----
+    // 默认空 = CPU forward（参考路径）。--engine cuda 时把整段 forward 搬上
+    // GPU：权重/激活/KV 常驻显存，单 stream 跑完，只有 token id 过 PCIe。
+    // CPU 的 forward_token 原样保留作参考；engine 创建失败即报错（fail fast）。
+    std::string engine_name = args.engine;
+    if (engine_name.empty()) engine_name = config.get("engine", "");
+    tinyqwen::GpuDecodeEngine *engine = nullptr;
+    if (!engine_name.empty()) {
+        if (!tinyqwen::set_gpu_decode_impl_by_name(engine_name.c_str())) {
+            std::fprintf(stderr, "error: unknown engine '%s' (available: %s)\n",
+                         engine_name.c_str(), tinyqwen::available_gpu_decode_impls());
+            return 2;
+        }
+        // v1：engine 路径只支持 greedy，--topk / --dump-logits 暂不支持。
+        if (args.topk > 0 || !args.dump_logits.empty()) {
+            std::fprintf(stderr,
+                         "error: --topk / --dump-logits 在 --engine 下暂不支持（v1）\n");
+            return 2;
+        }
+        std::string eerr;
+        if (!tinyqwen::gpu_decode_create(&file, args.max_seq_len, &eerr, &engine)) {
+            std::fprintf(stderr, "error: gpu engine create failed: %s\n", eerr.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "[init] decode engine: %s (GPU-resident forward)\n",
+                     tinyqwen::gpu_decode_impl_name());
+    }
+
+    // engine 路径下由 main 驱动 profiler（forward_token 被绕过，不再自己记）。
+    // pos = 当前 KV 长度 = 已处理 token 数，与 forward_token 内部口径一致。
+    int engine_token_idx = 0;
+    const auto engine_step = [&](int token, bool is_prefill) -> int {
+        profiler.begin_token(engine_token_idx, engine_token_idx, is_prefill);
+        const int nxt = tinyqwen::gpu_decode_step(engine, token);
+        profiler.end_token();
+        ++engine_token_idx;
+        return nxt;
+    };
+
     // prompt 的 token ids（由 Python 侧 tools/tokenize_prompt.py 生成；
     // v1 按设计不在 C++ 里做 tokenizer）。
     std::vector<int> tokens =
@@ -308,8 +351,12 @@ int main(int argc, char **argv) {
         // 是否要让 forward 顺带返回 top-k：verbose 时需要；或者开了 --topk
         // 且这是最后一个 prompt token（要打印第一个生成 token 的分布）。
         const bool need_topk = args.verbose || (args.topk > 0 && last_prefill);
-        next = model->forward_token(tokens[i], need_topk ? &topk : nullptr, args.topk);
-        dump();
+        if (engine) {
+            next = engine_step(tokens[i], true); // GPU-resident forward
+        } else {
+            next = model->forward_token(tokens[i], need_topk ? &topk : nullptr, args.topk);
+            dump();
+        }
         if (args.verbose) {
             std::fprintf(stderr, "[prefill] %zu/%zu id=%d -> next=%d\n", i + 1, tokens.size(),
                          tokens[i], next);
@@ -330,14 +377,21 @@ int main(int argc, char **argv) {
             break;
         }
         if (step + 1 == args.max_new_tokens) break; // 最后一个 token 不用再前向
-        next = model->forward_token(next, args.topk > 0 ? &topk : nullptr, args.topk);
-        dump();
+        if (engine) {
+            next = engine_step(next, false); // GPU-resident forward
+        } else {
+            next = model->forward_token(next, args.topk > 0 ? &topk : nullptr, args.topk);
+            dump();
+        }
         if (args.topk > 0) print_topk(topk); // 下一个 gen token 的分布
     }
 
     std::printf("generated_ids:");
     for (int id: generated) std::printf(" %d", id);
     std::printf("\n");
+
+    // 释放 GPU engine（若有）。CPU 路径无操作。
+    if (engine) tinyqwen::gpu_decode_destroy(engine);
 
     if (!args.profile_out.empty()) {
         std::string werr;
