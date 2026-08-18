@@ -34,6 +34,7 @@ FORMAT_VERSION_MIN = 1
 ALIGN = 64
 DTYPE_F32 = 0
 DTYPE_F16 = 1  # 与 runtime/tiny_format.h 的 Dtype 枚举保持一致
+DTYPE_I4 = 3
 MAX_NAME = 64
 
 # 架构族（TinyHeaderV2Ext.model_type）。
@@ -208,8 +209,9 @@ def print_table_summary(out_path: str | Path) -> None:
         magic, version, dtype = fields[0], fields[1], fields[2]
         assert magic == MAGIC
         assert FORMAT_VERSION_MIN <= version <= FORMAT_VERSION, f"bad version {version}"
-        assert dtype in (DTYPE_F32, DTYPE_F16)
-        dtype_label = "f32" if dtype == DTYPE_F32 else "f16"
+        assert dtype in (DTYPE_F32, DTYPE_F16, DTYPE_I4)
+        # I4 文件是混合 dtype（大矩阵 i4、小向量 f32），逐 tensor 取自己的标签。
+        dtype_names = {DTYPE_F32: "f32", DTYPE_F16: "f16", DTYPE_I4: "i4"}
         # fields 下标: 0 magic, 1 version, 2 dtype, 3..12 十个 u32,
         #   13 eps, 14 theta, 15 tensor_count, 16 tensor_table_offset,
         #   17 data_offset, 18 total, 19 reserved
@@ -231,7 +233,8 @@ def print_table_summary(out_path: str | Path) -> None:
                 ENTRY_FMT, f.read(struct.calcsize(ENTRY_FMT)))
             name = name_b.rstrip(b"\x00").decode("ascii")
             shape = [s0, s1, s2, s3][:ndim]
-            print(f"{name:<56} {str(shape):<22} {dtype_label:<6} {off:>12} {nbytes:>14}")
+            label = dtype_names.get(t_dtype, f"?{t_dtype}")
+            print(f"{name:<56} {str(shape):<22} {label:<6} {off:>12} {nbytes:>14}")
 
 
 # ---- HF 模型收集 ------------------------------------------------------

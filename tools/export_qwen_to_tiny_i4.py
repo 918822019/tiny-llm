@@ -254,7 +254,9 @@ class LazyTensors:
         self._handles = []
         self._index = {}
         for st_file in sorted(model_dir.glob("*.safetensors")):
-            h = safe_open(str(st_file), framework="numpy")
+            # 用 torch 框架读：真实 Qwen 权重是 bf16，numpy 不认识 bf16；
+            # get() 里统一转成 fp32（与 export_qwen_to_tiny.py 同款做法）。
+            h = safe_open(str(st_file), framework="torch")
             for key in h.keys():
                 self._index[key] = h
             self._handles.append(h)
@@ -262,7 +264,7 @@ class LazyTensors:
     def get(self, key: str) -> np.ndarray:
         if key not in self._index:
             sys.exit(f"error: tensor '{key}' not found in safetensors")
-        return self._index[key].get_tensor(key)
+        return self._index[key].get_tensor(key).float().numpy()
 
 
 def main():
