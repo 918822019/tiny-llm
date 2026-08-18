@@ -15,7 +15,7 @@ BIN="$BUILD_DIR/runtime/tinyqwen"
 MODEL="${MODEL:-model.tqwen}"
 
 if [[ ! -f "$BIN" ]]; then
-  echo "error: 找不到 $BIN（先 scripts/build_android.sh）" >&2
+  echo "error: 找不到 ${BIN}（先 scripts/build_android.sh）" >&2
   exit 1
 fi
 if [[ ! -f "$MODEL" ]]; then

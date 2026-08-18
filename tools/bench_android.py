@@ -7,7 +7,9 @@
 特性：
 - 热门禁（thermal gate）：测量前等设备降温，消除热降频干扰
 - 绑核（core pinning）：taskset 绑大核，减少大小核迁移抖动
-- 同场 A/B：--extra-args 非空时自动启用，交错测量抗漂移
+- 同场 A/B：--extra-args 或 --control-model 非默认时自动启用，交错测量抗漂移
+- 跨模型 A/B：换 dtype 是换文件而非换 flag，用 --control-model 表达
+- 模型按文件名在设备上分开缓存，切 dtype 不触发整模型重传
 - 回归检测：自动对比 baseline，超阈值报警
 
 用法：
@@ -15,6 +17,9 @@
     python tools/bench_android.py --label neon-android --runs 3 --extra-args "--matvec-impl neon"
     python tools/bench_android.py --label neon-android --pin-cores all --no-thermal-gate
     python tools/bench_android.py --label neon-android --fail-on-regression
+    # i4 vs fp32 跨 dtype 同场对比
+    python tools/bench_android.py --label i4-android --runs 3 \
+        --model model_i4.tqwen --control-model model.tqwen
 """
 
 from __future__ import annotations
@@ -188,23 +193,37 @@ def device_env_info() -> dict:
 
 # ---------- push / run ----------
 
-def ensure_pushed(binary: str, model: str) -> None:
-    """确保 binary 和 model 已 push 到设备。模型按大小跳过重复 push。"""
-    adb_shell(f"mkdir -p {DEVICE_DIR}")
+def device_model_path(local_model: str) -> str:
+    """设备端模型路径：按本地文件名分开存，让 fp32/fp16/i4 在设备上共存。
+
+    早期版本所有模型都推到 model.tqwen，切一次 dtype 就要重传整个模型
+    （fp32 约 2GB）；更糟的是两个模型大小恰好相同时会静默测错模型。
+    """
+    return f"{DEVICE_DIR}/models/{os.path.basename(local_model)}"
+
+
+def ensure_binary_pushed(binary: str) -> None:
+    adb_shell(f"mkdir -p {DEVICE_DIR}/models")
     adb("push", binary, f"{DEVICE_DIR}/tinyqwen")
     adb_shell(f"chmod +x {DEVICE_DIR}/tinyqwen")
 
-    local_size = os.path.getsize(model)
-    remote_size = adb_shell(f"stat -c%s {DEVICE_DIR}/model.tqwen 2>/dev/null || echo 0")
+
+def ensure_model_pushed(local_model: str) -> str:
+    """确保模型已在设备上，返回设备端路径。大小一致则跳过 push。"""
+    remote = device_model_path(local_model)
+    local_size = os.path.getsize(local_model)
+    raw = adb_shell(f"stat -c%s {remote} 2>/dev/null || echo 0")
     try:
-        remote_size = int(remote_size.strip())
+        remote_size = int(raw.strip())
     except ValueError:
         remote_size = 0
+    name = os.path.basename(local_model)
     if local_size != remote_size:
-        print(f"  pushing model ({local_size} bytes)...")
-        adb("push", model, f"{DEVICE_DIR}/model.tqwen", capture=False)
+        print(f"  pushing {name} ({local_size} bytes)...")
+        adb("push", local_model, remote, capture=False)
     else:
-        print(f"  model already on device ({remote_size} bytes), skipping push")
+        print(f"  {name} already on device ({remote_size} bytes), skipping push")
+    return remote
 
 
 # 模块级状态：由 main() 设置，run_once_on_device 使用
@@ -213,7 +232,7 @@ _thermal_gate_enabled = True
 _thermal_max = THERMAL_MAX_DEFAULT
 
 
-def run_once_on_device(extra_args: list[str] | None = None) -> dict:
+def run_once_on_device(model_on_device: str, extra_args: list[str] | None = None) -> dict:
     """在设备上跑一次标准负载，拉回 profile JSON 并返回解析结果。"""
     if _thermal_gate_enabled:
         wait_for_thermal_cool(_thermal_max)
@@ -222,7 +241,7 @@ def run_once_on_device(extra_args: list[str] | None = None) -> dict:
     cmd_parts = [
         f"cd {DEVICE_DIR} &&",
         f"{_taskset_prefix}./tinyqwen",
-        f"--model {DEVICE_DIR}/model.tqwen",
+        f"--model {model_on_device}",
         f"--tokens {tokens_csv}",
         f"--max-new-tokens {bench.DECODE_TOKENS}",
         f"--max-seq-len {bench.MAX_SEQ_LEN}",
@@ -243,10 +262,11 @@ def run_once_on_device(extra_args: list[str] | None = None) -> dict:
     return profile
 
 
-def measure(runs: int, extra_args: list[str] | None = None) -> tuple[float, float, dict]:
+def measure(model_on_device: str, runs: int,
+            extra_args: list[str] | None = None) -> tuple[float, float, dict]:
     medians, p95s, last = [], [], None
     for r in range(runs):
-        prof = run_once_on_device(extra_args)
+        prof = run_once_on_device(model_on_device, extra_args)
         st = bench.summarize(prof)
         medians.append(st["decode_median_ms"])
         p95s.append(st["decode_p95_ms"])
@@ -256,13 +276,19 @@ def measure(runs: int, extra_args: list[str] | None = None) -> tuple[float, floa
     return statistics.median(medians), statistics.median(p95s), last
 
 
-def measure_ab(runs: int, variant_args: list[str]) -> tuple[float, float, float, float, dict]:
-    """同场 A/B：每遍先测对照（无额外参数 = ref）再测变体，交错抗热降频。"""
+def measure_ab(runs: int, variant_model: str, variant_args: list[str],
+               control_model: str,
+               control_args: list[str] | None = None) -> tuple[float, float, float, float, dict]:
+    """同场 A/B：每遍先测对照再测变体，交错抗热降频。
+
+    对照与变体可以是不同模型（fp32 vs i4 这类换 dtype 的对比不是换 flag
+    而是换文件），也可以是同一模型的不同 impl 参数。
+    """
     ctrl_meds, ctrl_p95s, var_meds, var_p95s = [], [], [], []
     last_var = None
     for r in range(runs):
-        cs = bench.summarize(run_once_on_device(None))
-        vs = bench.summarize(run_once_on_device(variant_args))
+        cs = bench.summarize(run_once_on_device(control_model, control_args))
+        vs = bench.summarize(run_once_on_device(variant_model, variant_args))
         ctrl_meds.append(cs["decode_median_ms"])
         ctrl_p95s.append(cs["decode_p95_ms"])
         var_meds.append(vs["decode_median_ms"])
@@ -287,6 +313,11 @@ def main() -> None:
     p.add_argument("--json", default=None, help="结果写 JSON 文件")
     p.add_argument("--extra-args", default="",
                    help="原样传给设备端 binary 的额外 CLI 参数")
+    p.add_argument("--control-model", default=None,
+                   help="同场 A/B 的对照模型（默认与 --model 相同）。指定为不同文件即可"
+                        "做跨 dtype 对比，例如 --model model_i4.tqwen --control-model model.tqwen")
+    p.add_argument("--control-args", default="",
+                   help="对照组的额外 CLI 参数（默认无，即 ref 配置）")
     # 热门禁
     p.add_argument("--thermal-max", type=int, default=THERMAL_MAX_DEFAULT,
                    help=f"热门禁温度阈值（millidegree Celsius，默认 {THERMAL_MAX_DEFAULT}）")
@@ -312,9 +343,14 @@ def main() -> None:
         sys.exit(f"error: binary not found: {binary}; run scripts/build_android.sh first")
     if not os.path.isfile(args.model):
         sys.exit(f"error: model not found: {args.model}")
+    control_model = args.control_model or args.model
+    if not os.path.isfile(control_model):
+        sys.exit(f"error: control model not found: {control_model}")
 
     extra = shlex.split(args.extra_args)
-    ab_mode = bool(extra)
+    control_extra = shlex.split(args.control_args)
+    cross_model = os.path.abspath(control_model) != os.path.abspath(args.model)
+    ab_mode = bool(extra) or cross_model
     runs = max(1, args.runs)
 
     # 配置热门禁
@@ -326,12 +362,18 @@ def main() -> None:
           f"decode={bench.DECODE_TOKENS} tok (丢弃预热 {bench.WARMUP})")
     if extra:
         print(f"[bench-android] 额外参数: {' '.join(extra)}（同场 A/B 模式）")
+    if cross_model:
+        print(f"[bench-android] 跨模型同场 A/B: 对照 {os.path.basename(control_model)} → "
+              f"变体 {os.path.basename(args.model)}")
     print(f"[bench-android] 热门禁: {'开' if _thermal_gate_enabled else '关'}"
           f"{'（阈值 ' + str(_thermal_max // 1000) + '°C）' if _thermal_gate_enabled else ''}"
           f"  绑核: {args.pin_cores}")
 
     print("[bench-android] pushing binary & model...")
-    ensure_pushed(binary, args.model)
+    ensure_binary_pushed(binary)
+    variant_on_device = ensure_model_pushed(args.model)
+    control_on_device = (ensure_model_pushed(control_model) if cross_model
+                         else variant_on_device)
 
     # 配置绑核
     _taskset_prefix = build_taskset_prefix(args.pin_cores)
@@ -341,10 +383,11 @@ def main() -> None:
           f"({dev_env.get('soc', '?')}) Android {dev_env.get('android_version', '?')}")
 
     if ab_mode:
-        ctrl_med, ctrl_p95, med, p95, last = measure_ab(runs, extra)
+        ctrl_med, ctrl_p95, med, p95, last = measure_ab(
+            runs, variant_on_device, extra, control_on_device, control_extra)
         ab_ratio = ctrl_med / med if med > 0 else float("inf")
     else:
-        med, p95, last = measure(runs, extra)
+        med, p95, last = measure(variant_on_device, runs, extra)
         ctrl_med = ctrl_p95 = ab_ratio = None
 
     host_env = bench.env_info()
@@ -361,17 +404,25 @@ def main() -> None:
         "host_env": host_env,
         "pin_cores": args.pin_cores,
         "thermal_gate": _thermal_gate_enabled,
+        "model": os.path.basename(args.model),
     }
     if extra:
         result["extra_args"] = extra
     if ab_mode:
         result["ab_control_median_ms"] = round(ctrl_med, 2)
         result["ab_ratio"] = round(ab_ratio, 2)
+    if cross_model:
+        result["ab_control_model"] = os.path.basename(control_model)
+    if control_extra:
+        result["ab_control_args"] = control_extra
 
     # 人类可读汇总
     print(f"\n  decode 延迟/token：median={med:.2f}ms  p95={p95:.2f}ms")
     if ab_mode:
         print(f"  同场 A/B：对照 {ctrl_med:.2f}ms → 变体 {med:.2f}ms = {ab_ratio:.2f}×")
+        if cross_model:
+            print(f"    对照模型 {os.path.basename(control_model)} → "
+                  f"变体模型 {os.path.basename(args.model)}")
     print(f"  样本量：每遍 {last['decode_samples']} 个稳态 decode token")
     print(f"  设备：{dev_env.get('device_model', '?')} / {dev_env.get('soc', '?')}")
     print(f"  commit：{host_env['git_commit']}")

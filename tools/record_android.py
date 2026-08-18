@@ -25,7 +25,8 @@ import record_optimization as rec  # noqa: E402
 
 
 def build_detail_android(label, commit, med, p95, runs, last, vs_prev_str,
-                         base_note, dev_env, extra_suffix="") -> str:
+                         base_note, dev_env, extra_suffix="", model_prefix="",
+                         verify_note="scripts/verify_android.sh（golden token 逐位对照）") -> str:
     today = datetime.date.today().isoformat()
     top_ops = "、".join(f"`{o['op']}`" for o in last["top_ops"][:3])
     device_str = f"{dev_env.get('device_model', '?')} / {dev_env.get('soc', '?')} / Android {dev_env.get('android_version', '?')}"
@@ -38,10 +39,10 @@ def build_detail_android(label, commit, med, p95, runs, last, vs_prev_str,
 - **结果**：decode 中位 **{med:.2f} ms/token**（{runs} 遍取中位，每遍 {last['decode_samples']} 样本），p95 {p95:.2f}
 - **vs 上一配置**：{vs_prev_str}
 - **基线参照**：{base_note}
-- **验证**：scripts/verify_android.sh（golden token 对照）
+- **验证**：{verify_note}
 - **瓶颈转移**：top op = {top_ops}，下一刀砍哪：<填>
 - **意外 / 教训**：<填——往往最值钱>
-- **复现**：`./scripts/bench_android.sh {label}{extra_suffix}`
+- **复现**：`{model_prefix}./scripts/bench_android.sh {label}{extra_suffix}`
 
 ---
 
@@ -59,39 +60,57 @@ def main() -> None:
     ap.add_argument("--log", default="docs/optimization_log.md")
     ap.add_argument("--extra-args", default="",
                     help="原样传给设备端 binary 的额外 CLI 参数")
+    ap.add_argument("--control-model", default=None,
+                    help="同场 A/B 的对照模型（默认与 --model 相同）。指定为不同文件即可"
+                         "做跨 dtype 对比，例如 --model model_i4.tqwen --control-model model.tqwen")
     args = ap.parse_args()
 
-    extra = shlex.split(args.extra_args)
-    ab_mode = bool(extra)
-    extra_suffix = f' --extra-args "{args.extra_args.strip()}"' if extra else ""
-
     import os
+    extra = shlex.split(args.extra_args)
+    control_model = args.control_model or args.model
+    cross_model = os.path.abspath(control_model) != os.path.abspath(args.model)
+    ab_mode = bool(extra) or cross_model
+    extra_suffix = f' --extra-args "{args.extra_args.strip()}"' if extra else ""
+    if cross_model:
+        extra_suffix += f" --control-model {control_model}"
+
     build_dir = os.environ.get("BUILD_DIR", bench_android.BUILD_DIR_DEFAULT)
     binary = args.binary or f"{build_dir}/runtime/tinyqwen"
     if not os.path.isfile(binary):
         sys.exit(f"error: binary not found: {binary}; run scripts/build_android.sh first")
     if not os.path.isfile(args.model):
         sys.exit(f"error: model not found: {args.model}")
+    if not os.path.isfile(control_model):
+        sys.exit(f"error: control model not found: {control_model}")
 
     print(f"[record-android] label={args.label} runs={args.runs}"
-          + (f"  额外参数: {' '.join(extra)}（同场 A/B 模式）" if ab_mode else ""))
+          + (f"  额外参数: {' '.join(extra)}（同场 A/B 模式）" if extra else "")
+          + (f"  跨模型 A/B: {os.path.basename(control_model)} → "
+             f"{os.path.basename(args.model)}" if cross_model else ""))
 
     print("[record-android] pushing binary & model...")
-    bench_android.ensure_pushed(binary, args.model)
+    bench_android.ensure_binary_pushed(binary)
+    variant_on_device = bench_android.ensure_model_pushed(args.model)
+    control_on_device = (bench_android.ensure_model_pushed(control_model) if cross_model
+                         else variant_on_device)
 
     dev_env = bench_android.device_env_info()
     print(f"[record-android] device: {dev_env.get('device_model', '?')} "
           f"({dev_env.get('soc', '?')}) Android {dev_env.get('android_version', '?')}")
 
     if ab_mode:
-        ctrl_med, ctrl_p95, med, p95, last = bench_android.measure_ab(args.runs, extra)
+        ctrl_med, ctrl_p95, med, p95, last = bench_android.measure_ab(
+            args.runs, variant_on_device, extra, control_on_device)
         ab_ratio = ctrl_med / med if med > 0 else float("inf")
-        vs_prev_str = (f"**{ab_ratio:.2f}×（同场 A/B）**——对照（无额外参数，当前即 ref）"
+        control_desc = (f"对照模型 {os.path.basename(control_model)} " if cross_model
+                        else "对照（无额外参数，当前即 ref）")
+        vs_prev_str = (f"**{ab_ratio:.2f}×（同场 A/B）**——{control_desc}"
                        f"中位 {ctrl_med:.2f}（p95 {ctrl_p95:.2f}）→ 变体 {med:.2f}，"
                        f"同 binary 同场交错测量")
         vs_prev_col = f"{ab_ratio:.2f}×（同场）"
     else:
-        med, p95, last = bench_android.measure(args.runs, extra if extra else None)
+        med, p95, last = bench_android.measure(variant_on_device, args.runs,
+                                               extra if extra else None)
         vs_prev_str = None
         vs_prev_col = "—"
 
@@ -134,8 +153,14 @@ def main() -> None:
     label_with_device = f"{args.label}（Android）"
     row = rec.build_table_row(label_with_device, commit, med, p95, vs_base_str,
                               "<填：一句话归因>", vs_prev_col)
+    model_prefix = ("" if os.path.basename(args.model) == "model.tqwen"
+                    else f"MODEL={args.model} ")
+    verify_note = ("scripts/verify_android.sh（量化容差口径，token diff 上限 2）"
+                   if "_i4" in os.path.basename(args.model)
+                   else "scripts/verify_android.sh（golden token 逐位对照）")
     detail = build_detail_android(args.label, commit, med, p95, args.runs, last,
-                                  vs_prev_str, base_note, dev_env, extra_suffix)
+                                  vs_prev_str, base_note, dev_env, extra_suffix,
+                                  model_prefix, verify_note)
     text = rec.insert_table_row(text, rec.TABLE_MARKER, row)
     text = rec.insert_before(text, rec.DETAIL_MARKER, detail)
     log_path.write_text(text)

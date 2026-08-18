@@ -5,6 +5,9 @@
 #   例：./scripts/record_android.sh android-baseline
 #       ./scripts/record_android.sh neon-android --extra-args "--matvec-impl neon"
 #       ./scripts/record_android.sh neon-tune --skip-verify --extra-args "--matvec-impl neon"
+#       # i4 vs fp32 跨 dtype 同场对比（MODEL 同时作用于门禁和测速）
+#       MODEL=model_i4.tqwen ./scripts/record_android.sh i4-android \
+#           --control-model model.tqwen
 #
 # 流程：
 #   1. scripts/verify_android.sh   正确性门禁（不过就中止，不测速）
@@ -15,6 +18,8 @@ cd "$(dirname "$0")/.."
 
 LABEL="${1:?usage: record_android.sh <label> [--skip-verify]   例如 record_android.sh android-baseline}"
 shift
+
+MODEL="${MODEL:-model.tqwen}"
 
 SKIP_VERIFY=false
 PASS_ARGS=()
@@ -30,12 +35,12 @@ if [[ "$SKIP_VERIFY" == "true" ]]; then
     echo "=== [1/2] 正确性门禁（Android）：跳过（--skip-verify）==="
 else
     echo "=== [1/2] 正确性门禁（Android）==="
-    ./scripts/verify_android.sh
+    MODEL="$MODEL" ./scripts/verify_android.sh
 fi
 
 echo ""
 echo "=== [2/2] 稳定测速 + 写优化日志（Android）==="
-python3 tools/record_android.py --label "$LABEL" --runs 3 \
+python3 tools/record_android.py --label "$LABEL" --runs 3 --model "$MODEL" \
         ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 
 echo ""

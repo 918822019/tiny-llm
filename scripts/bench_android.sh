@@ -4,6 +4,9 @@
 #   ./scripts/bench_android.sh <label> [--extra-args "..."]
 #   例：./scripts/bench_android.sh android-baseline
 #       ./scripts/bench_android.sh neon-android --extra-args "--matvec-impl neon"
+#       # i4 vs fp32 跨 dtype 同场对比
+#       MODEL=model_i4.tqwen ./scripts/bench_android.sh i4-android \
+#           --control-model model.tqwen
 #
 # label 是这次测量的名字。额外参数原样透传给设备端 runtime。
 # 测量方法论与纪律：docs/optimization.md §6。
@@ -18,11 +21,11 @@ BUILD_DIR="${BUILD_DIR:-build-android}"
 BIN="$BUILD_DIR/runtime/tinyqwen"
 
 if [[ ! -f "$BIN" ]]; then
-  echo "error: 找不到 $BIN（先 scripts/build_android.sh）" >&2
+  echo "error: 找不到 ${BIN}（先 scripts/build_android.sh）" >&2
   exit 1
 fi
 if [[ ! -f "$MODEL" ]]; then
-  echo "error: 找不到模型 $MODEL（先用 tools/export_qwen_to_tiny.py 导出）" >&2
+  echo "error: 找不到模型 ${MODEL}（先用 tools/export_qwen_to_tiny.py 导出）" >&2
   exit 1
 fi
 
