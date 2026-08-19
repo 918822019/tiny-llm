@@ -51,9 +51,16 @@ add_library(tinyqwen_kernels OBJECT
         argmax/argmax_ref.cpp
         # argmax NEON 变体（两遍法：NEON 求 max + NEON 找首个相等下标，与 ref 逐位一致；仅 aarch64）。
         argmax/argmax_neon.cpp
-        # INT4 weight-only：非对称 uint4 per-group(128) 量化参考实现（正确性锚）。
+        # INT4 weight-only：非对称 uint4 per-group 量化（正确性锚 ref + NEON + 多线程）。
         matvec/matvec_i4_ref.cpp
         matvec/matvec_i4_neon.cpp
+        matvec/matvec_i4_neon_mt.cpp
+        # W4A8 SDOT：权重解包 int8 + 激活 int8 对称量化 + SDOT 整数点积（armv8.2
+        # dotprod；把 unpack 指令/字节从 ~3.5 打到 ~0.9，目标逼近带宽墙）。
+        matvec/matvec_i4_sdot.cpp
+        # SDOT v2：预计算 scale/zero 为 f32 数组（消 per-group memcpy+half_to_float）
+        # + 2-row 并行内循环（2 条独立 SDOT 链 + 共享激活加载，提高 ILP）。
+        matvec/matvec_i4_sdot2.cpp
         matvec/matmul_ref.cpp
         matvec/matmul_i4_ref.cpp
         # Qwen3.5 Gated DeltaNet（GDN）算子：l2norm / causal conv1d 单步 /
@@ -67,6 +74,16 @@ add_library(tinyqwen_kernels OBJECT
         dispatch.cpp
 )
 target_include_directories(tinyqwen_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# SDOT kernel 需要 armv8.2 dotprod。只给这一个源文件开 +dotprod，不动全局 arch。
+# Apple Silicon 与 Android arm64 都支持；源码里另有 __ARM_FEATURE_DOTPROD 守卫，
+# 平台不开此 flag 时该文件自动编译为空。
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set_source_files_properties(matvec/matvec_i4_sdot.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+    set_source_files_properties(matvec/matvec_i4_sdot2.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+endif ()
 
 # neon_mt 用 std::thread 建常驻线程池。OBJECT 库的 PUBLIC 链接需求会传播给
 # 所有链 tinyqwen_kernels 的目标（runtime/tests），无需各处重复写。
