@@ -1,0 +1,131 @@
+/* tinyqwen 前端共享基础版式 —— body / header / nav / card / table / form / badge / legend / tooltip
+   被 web_console(console/index.html) 和 viz.html(内联) 共同引用。 */
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: var(--font-sans);
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--font-size-base);
+  line-height: 1.5;
+}
+
+main { padding: var(--gap-lg); max-width: 1200px; margin: 0 auto; }
+
+/* 卡片 */
+.card, .chart {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--gap);
+  margin-bottom: var(--gap);
+  box-shadow: var(--shadow-card);
+}
+.card h2, .chart h2 {
+  font-size: var(--font-size-lg);
+  margin: 0 0 var(--gap-sm);
+}
+h1 { font-size: var(--font-size-xl); margin: 0; }
+h2 { font-size: var(--font-size-lg); margin-top: var(--gap-xl);
+     border-bottom: 1px solid var(--border); padding-bottom: var(--gap-xs); }
+
+/* 元数据行 */
+.meta { color: var(--muted); font-size: var(--font-size-sm); margin-bottom: var(--gap-sm); }
+.kv { font-size: var(--font-size-sm); color: var(--muted); margin: 3px 0; }
+.kv b { color: var(--text); }
+.hint { color: var(--muted-3); font-size: var(--font-size-xs); margin-top: var(--gap-xs); }
+
+/* 表格 */
+table { border-collapse: collapse; width: 100%; font-size: var(--font-size-sm); }
+th, td { border-bottom: 1px solid var(--border-soft); padding: var(--gap-xs) var(--gap-sm); text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+td.num, .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--font-num); }
+
+/* 表单 */
+form .row { display: flex; gap: var(--gap); margin-bottom: var(--gap-sm); flex-wrap: wrap; }
+form label { font-size: var(--font-size-sm); color: var(--muted); display: flex; flex-direction: column; gap: var(--gap-xs); }
+input, select {
+  padding: var(--gap-xs) var(--gap-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  min-width: 120px;
+  background: var(--surface);
+  color: var(--text);
+}
+input.wide { min-width: 420px; }
+
+/* 按钮 */
+button {
+  padding: var(--gap-xs) var(--gap);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  border: none;
+  background: none;
+}
+button.primary { background: var(--primary); color: #fff; }
+button.ghost { background: var(--surface); border: 1px solid var(--border); }
+button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 徽章 */
+.badge { display: inline-block; padding: 1px var(--gap-sm); border-radius: 10px; font-size: var(--font-size-xs); }
+.badge.ok, .badge.done { background: var(--ok-soft); color: var(--ok-fg); }
+.badge.warn, .badge.starting { background: var(--warn-soft); color: var(--warn-fg); }
+.badge.fail, .badge.failed { background: var(--fail-soft); color: var(--fail-fg); }
+.badge.running { background: var(--primary-soft); color: var(--primary); }
+.badge.log, .badge.seed, .badge.bench, .badge.record { background: var(--border-soft); color: var(--muted); }
+.badge.dataset { background: var(--c-dataset-soft); color: var(--c-dataset); }
+
+/* 图例 */
+.legend { display: flex; flex-wrap: wrap; gap: var(--gap); font-size: var(--font-size-xs); margin: var(--gap-xs) 0; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+
+/* Tooltip (浮于 SVG 上方) */
+#tooltip {
+  position: fixed; pointer-events: none;
+  background: var(--tooltip-bg); color: var(--tooltip-fg);
+  padding: var(--gap-xs) var(--gap-sm);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  display: none; z-index: 99; white-space: pre;
+}
+
+/* Toast (错误提示) */
+#toast {
+  position: fixed; top: var(--gap); right: var(--gap);
+  background: var(--fail); color: #fff;
+  padding: var(--gap-sm) var(--gap);
+  border-radius: var(--radius-sm);
+  display: none; z-index: 99; font-size: var(--font-size-sm);
+}
+
+/* 日志终端 */
+pre.log {
+  background: var(--log-bg); color: var(--log-fg);
+  padding: var(--gap);
+  border-radius: var(--radius);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: var(--font-num);
+}
+
+/* SVG 文本 */
+text { font-size: 11px; }
+
+/* 焦点键盘可达 */
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 响应式 */
+@media (max-width: 768px) {
+  main { padding: var(--gap); }
+  form .row { flex-direction: column; }
+  input.wide { min-width: 100%; }
+}

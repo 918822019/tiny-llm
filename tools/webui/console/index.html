@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinyqwen 端侧测试控制台</title>
+<link rel="stylesheet" href="assets/tokens.css">
+<link rel="stylesheet" href="assets/base.css">
+<link rel="stylesheet" href="assets/console/console.css">
+</head>
+<body>
+<header>
+  <h1>tinyqwen 端侧测试控制台</h1>
+  <span class="sub">Android · batch=1 · token-by-token</span>
+  <nav role="tablist">
+    <button data-tab="status" role="tab" aria-selected="true" class="active">设备状态</button>
+    <button data-tab="run" role="tab" aria-selected="false">发起测试</button>
+    <button data-tab="jobs" role="tab" aria-selected="false">任务与日志</button>
+    <button data-tab="history" role="tab" aria-selected="false">历史与趋势</button>
+  </nav>
+</header>
+<!-- 固定摘要条:设备+基线+当前任务,任何 tab 下可见 -->
+<div id="summary-bar" class="summary-bar"></div>
+<main>
+  <section id="tab-status" role="tabpanel"></section>
+  <section id="tab-run" role="tabpanel" style="display:none"></section>
+  <section id="tab-jobs" role="tabpanel" style="display:none"></section>
+  <section id="tab-history" role="tabpanel" style="display:none"></section>
+</main>
+<div id="tooltip"></div>
+<div id="toast"></div>
+
+<script src="assets/util.js"></script>
+<script src="assets/chart.js"></script>
+<script src="assets/palette.js"></script>
+<script src="assets/console/console.js"></script>
+</body>
+</html>

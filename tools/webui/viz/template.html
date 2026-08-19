@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinyqwen 性能可视化</title>
+<link rel="stylesheet" href="assets/tokens.css">
+<link rel="stylesheet" href="assets/base.css">
+<link rel="stylesheet" href="assets/viz/viz.css">
+</head>
+<body>
+<h1>tinyqwen 性能可视化</h1>
+<div class="meta">__META__</div>
+<div id="tooltip"></div>
+__SECTIONS__
+<script src="assets/util.js"></script>
+<script src="assets/chart.js"></script>
+<script src="assets/palette.js"></script>
+<script src="assets/viz/viz.js"></script>
+<script>
+"use strict";
+const FLAME = __FLAME_DATA__;
+const TOKENS = __TOKENS_DATA__;
+const DONUT = __DONUT_DATA__;
+const TREND = __TREND_DATA__;
+const WARMUP = __WARMUP__;
+
+document.addEventListener("DOMContentLoaded", () => {
+  if (FLAME) renderFlame("flame", FLAME, FLAME.value);
+  if (TOKENS && TOKENS.length) renderTimeline("timeline", TOKENS, WARMUP);
+  if (DONUT) renderDonut("donut", DONUT);
+  if (TREND && TREND.length) renderTrend("trend", TREND, true);
+  let rt;
+  window.addEventListener("resize", () => {
+    clearTimeout(rt);
+    rt = setTimeout(() => {
+      if (FLAME) renderFlame("flame", FLAME, FLAME.value);
+      if (TOKENS && TOKENS.length) renderTimeline("timeline", TOKENS, WARMUP);
+      if (DONUT) renderDonut("donut", DONUT);
+      if (TREND && TREND.length) renderTrend("trend", TREND, window._trendLogScale !== undefined ? window._trendLogScale : true);
+    }, 200);
+  });
+});
+</script>
+</body>
+</html>

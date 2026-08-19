@@ -1,0 +1,23 @@
+/* viz.html 专用补充样式 */
+
+.chart { overflow-x: auto; }
+
+.flame-rect { cursor: pointer; stroke: var(--surface); stroke-width: 1; }
+.flame-rect:hover { stroke: var(--text); }
+
+/* 面包屑导航 */
+.flame-breadcrumb {
+  display: flex; gap: var(--gap-xs); align-items: center;
+  font-size: var(--font-size-xs); color: var(--muted);
+  margin-bottom: var(--gap-xs);
+}
+.flame-breadcrumb a {
+  cursor: pointer; color: var(--primary); text-decoration: none;
+}
+.flame-breadcrumb a:hover { text-decoration: underline; }
+.flame-breadcrumb span.sep { color: var(--muted-3); }
+
+/* 趋势图 log/linear 切换按钮 */
+.trend-controls { display: flex; gap: var(--gap-sm); margin-bottom: var(--gap-sm); }
+.trend-controls button { padding: 2px 10px; font-size: var(--font-size-xs); }
+.trend-controls button.active { background: var(--primary); color: #fff; }

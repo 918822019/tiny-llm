@@ -1,0 +1,103 @@
+/* tinyqwen 前端共享设计 token —— 浅色(默认) + 深色(prefers-color-scheme)
+   两边前端(web_console / viz.html)共用,改一处两边同步变。 */
+
+:root {
+  /* 表面与文字 */
+  --bg: #fafafa;
+  --surface: #fff;
+  --surface-2: #f5f5f5;
+  --border: #e0e0e0;
+  --border-soft: #eee;
+  --text: #222;
+  --muted: #666;
+  --muted-2: #888;
+  --muted-3: #999;
+
+  /* 品牌与语义 */
+  --primary: #2b6cb0;
+  --primary-soft: #dbeafe;
+  --ok: #3aa06b;
+  --ok-soft: #e2f4e8;
+  --ok-fg: #1e7a46;
+  --warn: #d9a13b;
+  --warn-soft: #fbf0d8;
+  --warn-fg: #9a6d12;
+  --fail: #d05252;
+  --fail-soft: #fbe3e3;
+  --fail-fg: #b03030;
+
+  /* Op 类别色板 (Tableau-10 衍生) */
+  --c-matvec: #4e79a7;
+  --c-norm: #59a14f;
+  --c-attention: #f28e2b;
+  --c-activation: #e15759;
+  --c-embed: #b07aa1;
+  --c-lmhead: #76b7b2;
+  --c-topk: #edc948;
+  --c-other: #bab0ac;
+
+  /* 精度/状态色板 */
+  --c-fp16: #3b78d8;
+  --c-i4: #e8843c;
+  --c-dataset: #5e48a8;
+  --c-dataset-soft: #ece7f6;
+  --c-baseline: #3aa06b;
+  --c-fp32: #888;
+
+  /* 间距 */
+  --gap-xs: 4px;
+  --gap-sm: 6px;
+  --gap: 12px;
+  --gap-lg: 20px;
+  --gap-xl: 24px;
+
+  /* 圆角与阴影 */
+  --radius: 8px;
+  --radius-sm: 6px;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04);
+
+  /* 字体 */
+  --font-sans: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  --font-num: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-size-base: 14px;
+  --font-size-sm: 13px;
+  --font-size-xs: 12px;
+  --font-size-lg: 16px;
+  --font-size-xl: 18px;
+
+  /* 日志终端 */
+  --log-bg: #1e1e1e;
+  --log-fg: #d4d4d4;
+  --tooltip-bg: rgba(0, 0, 0, 0.85);
+  --tooltip-fg: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --surface: #1e2128;
+    --surface-2: #252932;
+    --border: #2c3038;
+    --border-soft: #333842;
+    --text: #e8ebf0;
+    --muted: #9aa3af;
+    --muted-2: #7a838f;
+    --muted-3: #5f6770;
+
+    --primary-soft: #1e3a5f;
+    --ok-soft: #1a3d2a;
+    --ok-fg: #5cb88a;
+    --warn-soft: #3d341a;
+    --warn-fg: #d4ab5c;
+    --fail-soft: #3d1f1f;
+    --fail-fg: #e58080;
+
+    --c-dataset-soft: #2a2540;
+
+    --log-bg: #0d0e12;
+    --log-fg: #c8ccd4;
+    --tooltip-bg: rgba(255, 255, 255, 0.92);
+    --tooltip-fg: #16181d;
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+}
