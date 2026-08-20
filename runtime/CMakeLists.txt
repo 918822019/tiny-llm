@@ -18,6 +18,11 @@ add_library(tinyqwen_runtime OBJECT
         qwen_forward_prefill.cpp
         ../quantization/quant.cpp
 )
+
+# CUDA 后端（仅 CUDA 构建编译）
+if (TINYQWEN_HAS_CUDA)
+    target_sources(tinyqwen_runtime PRIVATE backend_cuda.cpp)
+endif ()
 target_include_directories(tinyqwen_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(tinyqwen_runtime PUBLIC tinyqwen_kernels)
 

@@ -17,6 +17,11 @@ add_executable(tinyqwen_tests
         test_backend.cpp
         test_quantization.cpp
 )
+
+# CUDA 后端测试（仅 CUDA 构建编译）
+if (TINYQWEN_HAS_CUDA)
+    target_sources(tinyqwen_tests PRIVATE test_backend_cuda.cpp)
+endif ()
 # GPU decode engine 的算子对齐测试只在 CUDA 构建编译（引用了 device 指针
 # 启动器，链接 kernels 的 CUDA OBJECT）；无 CUDA 平台不受影响。
 if (TINYQWEN_HAS_CUDA)

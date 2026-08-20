@@ -21,11 +21,16 @@
 #include <string>
 #include <vector>
 
+#include "backend_cpu.h"
 #include "config.h"
 #include "dispatch.h"
 #include "model_loader.h"
 #include "profiler.h"
 #include "qwen_model.h"
+
+#ifdef TINYQWEN_HAS_CUDA
+#include "backend_cuda.h"
+#endif
 
 namespace {
     struct Args {
@@ -51,6 +56,7 @@ namespace {
         std::string matvec_impl; // matvec 实现；空 = 未指定，交给配置/默认值
         std::string ops_impl; // 非 matvec 算子实现；空 = 未指定，交给配置/默认值
         std::string engine; // decode engine；空 = CPU forward（默认），"cuda" = GPU 常驻
+        std::string backend; // 计算后端；空 = CPU（默认），"cuda" = CUDA 后端
     };
 
     void usage(const char *prog) {
@@ -77,6 +83,8 @@ namespace {
                      "                          argmax): ref (default) / neon\n"
                      "  --engine NAME           decode engine: '' = CPU forward (default) / cuda\n"
                      "                          (GPU-resident whole-forward; requires CUDA build)\n"
+                     "  --backend NAME          compute backend: '' = CPU (default) / cuda\n"
+                     "                          (per-operator CUDA; requires CUDA build)\n"
                      "  --verbose               model summary + per-token details\n",
                      prog);
     }
@@ -107,6 +115,7 @@ namespace {
             else if (a == "--matvec-impl") out->matvec_impl = value("--matvec-impl");
             else if (a == "--ops-impl") out->ops_impl = value("--ops-impl");
             else if (a == "--engine") out->engine = value("--engine");
+            else if (a == "--backend") out->backend = value("--backend");
             else if (a == "--no-fuse-gate-up") out->no_fuse_gate_up = true;
             else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
             else if (a == "--verbose") out->verbose = true;
@@ -348,8 +357,25 @@ int main(int argc, char **argv) {
                       is_f16 ? "f16w_fp32a" : "fp32");
 
     // ---- 建模：校验权重、分配 KV cache 和 workspace ----
+    // 创建后端（默认 CPU，可选 CUDA）
+    std::unique_ptr<tinyqwen::IBackend> backend;
+    if (args.backend == "cuda") {
+#ifdef TINYQWEN_HAS_CUDA
+        backend = tinyqwen::create_cuda_backend();
+        std::fprintf(stderr, "[init] backend: CUDA\n");
+#else
+        std::fprintf(stderr, "error: --backend cuda requires CUDA build\n");
+        return 1;
+#endif
+    } else {
+        backend = tinyqwen::create_cpu_backend();
+        if (!args.backend.empty()) {
+            std::fprintf(stderr, "[init] backend: CPU (default)\n");
+        }
+    }
+
     std::unique_ptr<tinyqwen::QwenModel> model;
-    if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model)) {
+    if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model, std::move(backend))) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
