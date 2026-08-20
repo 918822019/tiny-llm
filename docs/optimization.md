@@ -21,11 +21,11 @@
 
 术语约定（全仓库统一，避免同物异名）：
 
-| 术语 | 同义词（旧文档可能出现） | 含义 |
-|---|---|---|
-| 参考实现 | `_ref` / base / 标准答案 / reference | 正确性基准 + 兜底，永不改 |
-| 变体 | variant / 优化版 / 改进版 / 改进位 | 优化实现，只增不删 |
-| 基线 | baseline / fp32-baseline | `benchmarks/baseline.json` 记录的参照配置 |
+| 术语   | 同义词（旧文档可能出现）                     | 含义                                 |
+|------|----------------------------------|------------------------------------|
+| 参考实现 | `_ref` / base / 标准答案 / reference | 正确性基准 + 兜底，永不改                     |
+| 变体   | variant / 优化版 / 改进版 / 改进位        | 优化实现，只增不删                          |
+| 基线   | baseline / fp32-baseline         | `benchmarks/baseline.json` 记录的参照配置 |
 
 ## 2. 目录与命名约定
 
@@ -167,12 +167,12 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()     
 
 ### 6.6 解释"为什么提升"：归因四分类
 
-| 类别   | 例子                                  |
-|------|-------------------------------------|
-| 减少搬运 | INT4 量化让权重体积 /8，decode 是带宽瓶颈，少搬数据就快 |
+| 类别   | 例子                                    |
+|------|---------------------------------------|
+| 减少搬运 | INT4 量化让权重体积 /8，decode 是带宽瓶颈，少搬数据就快   |
 | 减少计算 | double 累加改 float（fp64 慢指令）、在线 softmax |
-| 并行   | 多线程把 matvec 切到多个核                   |
-| 指令效率 | NEON 一条指令算 4 个 float                |
+| 并行   | 多线程把 matvec 切到多个核                     |
+| 指令效率 | NEON 一条指令算 4 个 float                  |
 
 找原因看 bench 输出的 **top op**：fp32 基线里 `lm_head` 和 `down_proj` 是大头，
 说明 matvec 是主攻方向。top op 是指南针——每加一个优化重新 profile，
@@ -209,35 +209,37 @@ qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()     
 
 ### 本地（macOS / Linux）
 
-| 脚本 / 工具 | 职责 | 关键行为 |
-|---|---|---|
-| `scripts/verify.sh` | 正确性门禁 | build + 单测 + golden token 对照，失败即中止 |
-| `scripts/bench.sh <label> [额外参数]` | 快速单遍测速 | 开发迭代用；额外参数透传给 runtime |
-| `scripts/record.sh <label> [--skip-verify] [--extra-args "..."]` | 正式记录 | 门禁 + 3 遍测速 + 自动写日志；带 extra-args 自动同场 A/B |
-| `scripts/set_baseline.sh <label>` | 确立/更新基线 | 写 `benchmarks/baseline.json` |
-| `scripts/commit_opt.sh <label> "总结"` | 规范化提交 | 代码+日志一个 commit；日志最新小节有 `<填...>` 占位会拒绝提交 |
-| `tools/bench.py` | 底层测速 | 固定负载、丢预热、`--runs` 多遍取中位、自动记 commit |
-| `tools/record_optimization.py` | 底层记录 | A/B、漂移警告、写 optimization_log.md |
+| 脚本 / 工具                                                          | 职责      | 关键行为                                     |
+|------------------------------------------------------------------|---------|------------------------------------------|
+| `scripts/verify.sh`                                              | 正确性门禁   | build + 单测 + golden token 对照，失败即中止       |
+| `scripts/bench.sh <label> [额外参数]`                                | 快速单遍测速  | 开发迭代用；额外参数透传给 runtime                    |
+| `scripts/record.sh <label> [--skip-verify] [--extra-args "..."]` | 正式记录    | 门禁 + 3 遍测速 + 自动写日志；带 extra-args 自动同场 A/B |
+| `scripts/set_baseline.sh <label>`                                | 确立/更新基线 | 写 `benchmarks/baseline.json`             |
+| `scripts/commit_opt.sh <label> "总结"`                             | 规范化提交   | 代码+日志一个 commit；日志最新小节有 `<填...>` 占位会拒绝提交  |
+| `tools/bench.py`                                                 | 底层测速    | 固定负载、丢预热、`--runs` 多遍取中位、自动记 commit       |
+| `tools/record_optimization.py`                                   | 底层记录    | A/B、漂移警告、写 optimization_log.md           |
 
 ### Android 端侧
 
-| 脚本 / 工具 | 职责 | 关键行为 |
-|---|---|---|
-| `scripts/build_android.sh` | NDK 交叉编译 | arm64-v8a, android-28, Release |
-| `scripts/verify_android.sh` | 正确性门禁 | push + golden token 对照，与本地同一 GOLDEN |
-| `scripts/bench_android.sh <label> [--extra-args "..."]` | 快速设备测速 | 热门禁 + 绑核 + 标准负载 + 回归检测 |
-| `scripts/record_android.sh <label> [--skip-verify] [--extra-args "..."]` | 正式记录 | 门禁 + 3 遍测速 + 自动写日志；带 extra-args 自动同场 A/B |
-| `scripts/set_baseline_android.sh <label>` | 确立/更新 Android 基线 | 写 `benchmarks/baseline_android.json` |
-| `scripts/run_android.sh` | 手工运行 | push + 单次运行（调试用，非 pipeline） |
-| `tools/bench_android.py` | 底层设备测速 | 热门禁 + 绑核 + adb 执行 + 统计 + 回归检测 |
-| `tools/record_android.py` | 底层记录 | A/B、漂移警告、写 optimization_log.md（标注 Android） |
+| 脚本 / 工具                                                                  | 职责               | 关键行为                                                                 |
+|--------------------------------------------------------------------------|------------------|----------------------------------------------------------------------|
+| `scripts/build_android.sh`                                               | NDK 交叉编译         | arm64-v8a, android-28, Release                                       |
+| `scripts/verify_android.sh`                                              | 正确性门禁            | push + golden token 对照，与本地同一 GOLDEN                                  |
+| `scripts/bench_android.sh <label> [--extra-args "..."]`                  | 快速设备测速           | 热门禁 + 绑核 + 资源采样 + 标准负载 + 回归检测                                        |
+| `scripts/record_android.sh <label> [--skip-verify] [--extra-args "..."]` | 正式记录             | 门禁 + 3 遍测速 + 自动写日志（含端侧资源行）；带 extra-args 自动同场 A/B                     |
+| `scripts/set_baseline_android.sh <label>`                                | 确立/更新 Android 基线 | 写 `benchmarks/baseline_android.json`（含 peak RSS / KV cache 参照）       |
+| `scripts/run_android.sh`                                                 | 手工运行             | push + 单次运行（调试用，非 pipeline）                                          |
+| `tools/bench_android.py`                                                 | 底层设备测速           | 热门禁 + 绑核 + 资源采样（RSS/实时频率）+ PMU 带宽（`--pmu`）+ adb 执行 + 统计 + 回归检测       |
+| `tools/record_android.py`                                                | 底层记录             | A/B、漂移警告、写 optimization_log.md（标注 Android）                           |
+| `tools/tokenize_batch.py`                                                | 数据集批量化           | 数据集 → JSONL（确定性取前 N、长度过滤），供批量模式                                      |
+| `tools/bench_dataset.py`                                                 | 数据集负载测速          | runtime 批量模式：真实 prompt 的 TTFT 分桶 + TOPT 分布 + 资源曲线；与 canonical 不可直接互比 |
 
 ### 通用工具
 
-| 工具 | 职责 | 关键行为 |
-|---|---|---|
-| `tools/profile_diff.py <before> <after>` | Profile 对比 | op 级 delta + 分类汇总 + top 改善/回退 |
-| `tools/visualize.py all <profile.json>` | 可视化 | 火焰图 + token 时序 + op 占比 + 优化历史趋势，独立 HTML 零依赖 |
+| 工具                                       | 职责         | 关键行为                                        |
+|------------------------------------------|------------|---------------------------------------------|
+| `tools/profile_diff.py <before> <after>` | Profile 对比 | op 级 delta + 分类汇总 + top 改善/回退               |
+| `tools/visualize.py all <profile.json>`  | 可视化        | 火焰图 + token 时序 + op 占比 + 优化历史趋势，独立 HTML 零依赖 |
 
 ## 9. 当前状态
 

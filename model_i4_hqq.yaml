@@ -1,0 +1,38 @@
+# Model registry: model_i4_hqq.tqwen（Qwen2.5-0.5B i4 HQQ@64，lm_head fp32）
+name: model_i4_hqq
+architecture: qwen2.5
+source: Qwen/Qwen2.5-0.5B
+dtype: i4
+file: model_i4_hqq.tqwen
+size_mb: 711.6
+
+params:
+  n_layers: 24
+  hidden_size: 896
+  intermediate_size: 4864
+  n_heads: 14
+  n_kv_heads: 2
+  head_dim: 64
+  vocab_size: 151936
+  tied_embeddings: true
+
+quantization:
+  method: hqq
+  group_size: 64
+  lm_head_quantized: false
+  note: HQQ MSE 最优（vs RTN -28% MSE），lm_head 仍 fp32（tied embed 共享）
+
+recipe:
+  matvec_impl: neon_mt
+  ops_impl: neon
+  note: i4 HQQ + neon_mt 多线程（lm_head f32 联动），Mac 甜蜜点 8 线程
+
+benchmark:
+  android:
+    topt_ms: 44.72
+    ttft_ms: 1078.09
+    peak_rss_mb: 791.4
+    pmu_dram_bw_gbps: 6.02
+    device: PLK110
+    commit: 54d05f4+
+    note: 比 f16 满栈(17-21)慢 2.1×——i4 unpack 算力瓶颈（~3GB/s/核）

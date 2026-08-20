@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "backend.h"
 #include "gdn_state.h"
 #include "kv_cache.h"
 #include "model_loader.h"
@@ -35,8 +36,10 @@ namespace tinyqwen {
     public:
         // 工厂函数：校验所有需要的 tensor 都在、形状对，然后初始化 KV cache 和 buffer。
         // max_seq_len：运行时 KV 容量上限，必须 <= 文件头里的 max_seq_len。
+        // backend：计算后端（CPU/CUDA/...），如果为空则默认创建 CPU 后端。
         static bool create(const ModelFile &file, int max_seq_len, Profiler &profiler,
-                           std::string *err, std::unique_ptr<QwenModel> *out);
+                           std::string *err, std::unique_ptr<QwenModel> *out,
+                           std::unique_ptr<IBackend> backend = nullptr);
 
         // 在当前位置（== kv_cache().seq_len()）上前向一个 token。
         // 返回 greedy 的下一个 token id；可选同时填 top-k logits。
@@ -121,6 +124,7 @@ namespace tinyqwen {
 
         ModelConfig cfg_{};
         Profiler *profiler_ = nullptr;
+        std::unique_ptr<IBackend> backend_; // 计算后端（CPU/CUDA/...）
         bool fuse_gate_up_ = true;
         bool fuse_qkv_ = true;
         int prompt_len_ = 0;

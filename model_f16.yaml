@@ -1,0 +1,37 @@
+# Model registry: model_f16.tqwen（Qwen2.5-0.5B f16 满栈）
+name: model_f16
+architecture: qwen2.5
+source: Qwen/Qwen2.5-0.5B
+dtype: f16
+file: model_f16.tqwen
+size_mb: 942.3
+
+params:
+  n_layers: 24
+  hidden_size: 896
+  intermediate_size: 4864
+  n_heads: 14
+  n_kv_heads: 2
+  head_dim: 64
+  vocab_size: 151936
+  tied_embeddings: true
+
+quantization:
+  method: none
+  group_size: null
+  lm_head_quantized: false
+
+recipe:
+  matvec_impl: neon_mt_kv_nt
+  ops_impl: neon
+  note: f16 满栈（NEON + 线程池 + k/v 融合 + LDNP），已抵达带宽墙
+
+benchmark:
+  android:
+    topt_ms: 17.05
+    ttft_ms: 96.21
+    peak_rss_mb: 949.1
+    pmu_dram_bw_gbps: 29.6
+    device: PLK110
+    commit: 54d05f4
+    note: 跨模型同场 A/B 满血值（凉 17.05 / 热 21.16，带宽瓶颈随温度漂）

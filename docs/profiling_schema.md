@@ -35,14 +35,15 @@
 
 字段语义：
 
-| 字段                                   | 说明                                                                   |
-|--------------------------------------|----------------------------------------------------------------------|
-| `prompt_tokens` / `generated_tokens` | `is_prefill` 为 true / false 的 token 数                                |
-| `total_ms`                           | 所有 token latency 之和（不含加载模型）                                          |
-| `first_token_ms`                     | prefill 阶段总耗时（token-by-token prefill 下 = 各 prefill token 之和，近似 TTFT） |
-| `decode_avg_ms`                      | decode 阶段平均每 token 耗时                                                |
-| `tokens[].ops`                       | 该 token 内按执行顺序记录的 op 耗时；op 命名如 `layer_3.q_proj`、`lm_head`            |
-| `op_totals`                          | 跨 token 聚合，用于看 op 占比                                                 |
+| 字段                 | 说明                                                                                                      |
+|--------------------|---------------------------------------------------------------------------------------------------------|
+| `prompt_tokens`    | prompt 长度（runtime 用 `set_counts` 显式声明；批量 prefill 下只有一条记录，≠ 记录数）                                         |
+| `generated_tokens` | 实际生成的 token 数（= decode 步数 + 1：最后一个 token 不再 forward）                                                    |
+| `total_ms`         | 所有 token latency 之和（不含加载模型；批量 prefill 计入整批那条记录）                                                         |
+| `first_token_ms`   | TTFT：prefill 记录耗时之和。批量 prefill（默认 CPU 路径）= 整批记录的耗时；逐 token 路径（verbose / GPU engine）= 各 prefill token 之和 |
+| `decode_avg_ms`    | decode 阶段平均每 token 耗时                                                                                   |
+| `tokens[].ops`     | 该 token 内按执行顺序记录的 op 耗时；op 命名如 `layer_3.q_proj`、`lm_head`                                               |
+| `op_totals`        | 跨 token 聚合，用于看 op 占比                                                                                    |
 
 注意事项：
 

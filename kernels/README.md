@@ -20,12 +20,12 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
 
 命名示例：
 
-| 文件                                 | 含义                     |
-|------------------------------------|------------------------|
-| `matvec/matvec_f32_ref.cpp`        | fp32 参考实现（base）        |
-| `matvec/matvec_f32_neon.cpp`       | fp32 + NEON SIMD（以后加）  |
-| `matvec/matvec_f32_neon_mt.cpp`    | fp32 + NEON + 多线程（以后加） |
-| `matvec/matvec_i8_neon.cpp`        | INT8 量化 + NEON（以后加）    |
+| 文件                              | 含义                     |
+|---------------------------------|------------------------|
+| `matvec/matvec_f32_ref.cpp`     | fp32 参考实现（base）        |
+| `matvec/matvec_f32_neon.cpp`    | fp32 + NEON SIMD（以后加）  |
+| `matvec/matvec_f32_neon_mt.cpp` | fp32 + NEON + 多线程（以后加） |
+| `matvec/matvec_i8_neon.cpp`     | INT8 量化 + NEON（以后加）    |
 
 ## 当前状态
 

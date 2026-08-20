@@ -1,0 +1,47 @@
+# Model registry: model_qwen35_f16.tqwen（Qwen3.5-0.8B f16 混合架构）
+name: model_qwen35_f16
+architecture: qwen3.5
+source: Qwen/Qwen3.5-0.8B
+dtype: f16
+file: model_qwen35_f16.tqwen
+size_mb: 1435.1
+
+params:
+  n_layers: 24
+  hidden_size: 1024
+  intermediate_size: 3584
+  n_heads: 8
+  n_kv_heads: 2
+  head_dim: 256
+  vocab_size: 248320
+  tied_embeddings: true
+  model_type: qwen3_5
+  full_attention_interval: 4
+  attn_output_gate: true
+
+gdn:
+  linear_num_qk_heads: 16
+  linear_num_v_heads: 16
+  linear_qk_head_dim: 128
+  linear_v_head_dim: 128
+  linear_conv_kernel_dim: 4
+  gdn_state_mb: 19.3
+
+quantization:
+  method: none
+  group_size: null
+  lm_head_quantized: false
+
+recipe:
+  matvec_impl: neon_mt_kv_nt
+  ops_impl: neon
+  note: GDN + full attn 混合架构 f16 满栈
+
+benchmark:
+  android:
+    topt_ms: 35.29
+    ttft_ms: 231.29
+    peak_rss_mb: 1463.7
+    device: PLK110
+    commit: 54d05f4+
+    note: lm_head 主导（508MB f16，占 49%）；GDN 层高效 ~0.6ms/tok/层

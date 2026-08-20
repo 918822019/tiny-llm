@@ -49,6 +49,7 @@
 | i4-sdot_mt-android（Android，W4A8 SDOT） | 54d05f4+ | 22.35 | 22.50 | 31.1×（vs android-fp16-ref-baseline 695.52） | 2.00×（同场 vs i4 neon_mt 44.59） | **W4A8 SDOT**：权重解包 int8 + 激活 int8 对称量化 + SDOT 整数点积（vdotq_s32），unpack 指令/字节 3.5→~0.9。i4 从慢 f16 2.1× 收窄到 ~1.2-1.3×。**跨模型同场 A/B：i4 22.35 vs f16 满血 17.05 = 0.76×**（f16 带宽瓶颈随温度漂 17~21，i4 算力瓶颈稳定 22.3）——i4 优势是内存与热稳定，非绝对速度 |
 | qwen35-f16-neon-android（Android，Qwen3.5-0.8B） | 54d05f4+ | 35.29 | 37.69 | —（跨模型，vs Qwen2.5-0.5B f16 ~17-21 = 慢 ~1.7-2×） | 30.19×（同场 vs qwen35 ref 1063） | Qwen3.5-0.8B 混合架构（GDN+full attn）f16 满栈首测。**lm_head 主导**：552.94ms/32=17.3ms/tok 占 49%（Qwen3.5 词表 248320→lm_head 508MB f16）。GDN 层高效 ~0.6ms/tok/层（O(1) seq）。peak RSS 1463MB（权重 1435 + GDN state 19.3 + KV 1.5） |
 | i4-sdot2_mt（macOS，预计算+2-row） | 本次 | **3.67** | 4.79 | —（i4 阶梯内部对比） | **1.72×**（同场 vs sdot_mt 6.31，3轮中位） | **i4 首次反超 f16**：预计算 scale/zero 为 f32（消 per-group memcpy+half_to_float，省 ~39M inst/token ~10%）+ 2-row 并行内循环（2 条独立 SDOT 链 + 共享激活加载，ILP 翻倍）。同场 i4 sdot2 3.58 vs f16 满栈 5.68 = **1.59× i4 更快** |
+| backend_refactor | 5ed1b54 | 234.96 | 263.50 | 0.95× | — | <填：一句话归因> |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ---
@@ -1663,6 +1664,21 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
      不到 8%。首 token 有一次性 precompute 成本（~25ms），后续 token 零开销。
 - **复现**：
   `./build/runtime/tinyqwen --model model_i4_hqq_lmh.tqwen --tokens 105538,59975,100132 --max-new-tokens 32 --matvec-impl sdot2_mt --ops-impl neon`
+
+### backend_refactor（2026-08-20）
+
+- **优化栈**：<基线 + 本次优化，如 fp32-baseline + XXX>
+- **是什么**：<本次改了哪个 kernel / 数据结构 / 调度，一两句话>
+- **假设**：<为什么预期会快：带宽 / 计算 / 并行 / 指令 哪一类>
+- **结果**：TTFT **577.57 ms**（prefill 3 tok）；TOPT 中位 **234.96 ms/token**（3 遍取中位；decode 共 32 tok，丢预热，稳态样本 27），p95 263.50；forward 总耗时 7965.0 ms
+- **vs 上一配置**：<填：vs 上一配置>（vs 基线 0.95×）
+- **基线参照**：fp32-baseline（222.59 ms/tok @ 40b8e26），本次 vs 基线 = 0.95×
+- **验证**：scripts/verify.sh（单测 + golden token 对照）
+- **瓶颈转移**：top op = `lm_head`、`layer_4.gate_up_proj`、`layer_3.gate_up_proj`，下一刀砍哪：<填>
+- **意外 / 教训**：<填——往往最值钱>
+- **复现**：`./scripts/bench.sh backend_refactor`
+
+---
 
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--

@@ -65,6 +65,11 @@ namespace tinyqwen {
         stat.total_ms += ms;
     }
 
+    void Profiler::set_counts(uint64_t prompt_tokens, uint64_t generated_tokens) {
+        prompt_tokens_ = prompt_tokens;
+        generated_tokens_ = generated_tokens;
+    }
+
     namespace {
         // 手写 JSON 需要的最小转义。
         std::string json_escape(const std::string &s) {
@@ -113,6 +118,11 @@ namespace tinyqwen {
             }
         }
 
+        // 显式计数优先（set_counts）：批量 prefill / decode 步数与生成数的
+        // 口径差异见 profiler.h 的说明。
+        const uint64_t out_prompt = prompt_tokens_.value_or(n_prefill);
+        const uint64_t out_generated = generated_tokens_.value_or(n_decode);
+
         FILE *f = std::fopen(path.c_str(), "w");
         if (!f) {
             if (err) *err = "cannot open for write: " + path;
@@ -120,14 +130,16 @@ namespace tinyqwen {
         }
 
         // 手写 JSON（不引第三方库）。字段语义：
-        //   first_token_ms = prefill token 耗时之和（token-by-token prefill 下
-        //                    近似 TTFT）；decode_avg_ms 只统计 decode token。
+        //   first_token_ms = TTFT：prefill 记录耗时之和。批量 prefill 下就是
+        //                    那条整批记录的耗时（真 TTFT）；token-by-token 路径
+        //                    （verbose / GPU engine）下是各 prefill token 之和。
+        //   decode_avg_ms  只统计 decode token。
         std::fprintf(f, "{\n");
         std::fprintf(f, "  \"model\": \"%s\",\n", json_escape(model_).c_str());
         std::fprintf(f, "  \"backend\": \"%s\",\n", json_escape(backend_).c_str());
         std::fprintf(f, "  \"precision\": \"%s\",\n", json_escape(precision_).c_str());
-        std::fprintf(f, "  \"prompt_tokens\": %llu,\n", (unsigned long long) n_prefill);
-        std::fprintf(f, "  \"generated_tokens\": %llu,\n", (unsigned long long) n_decode);
+        std::fprintf(f, "  \"prompt_tokens\": %llu,\n", (unsigned long long) out_prompt);
+        std::fprintf(f, "  \"generated_tokens\": %llu,\n", (unsigned long long) out_generated);
         std::fprintf(f, "  \"total_ms\": %.4f,\n", total_ms);
         std::fprintf(f, "  \"first_token_ms\": %.4f,\n", prefill_ms);
         std::fprintf(f, "  \"decode_avg_ms\": %.4f,\n", n_decode ? decode_ms / n_decode : 0.0);

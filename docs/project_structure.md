@@ -45,18 +45,18 @@ tinyqwen/
 
 ## 文档索引
 
-| 文档                                        | 内容                                 |
-|-------------------------------------------|------------------------------------|
-| `infra_primer.md`                         | infra 新手导读：内存/对齐/字节序/KV cache/RAII |
-| `optimization.md`                         | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律） |
-| `optimization_log.md`                     | 优化日志：每次改了什么/提升多少/为什么               |
-| `weight_format.md`                        | .tqwen 二进制格式规范                     |
-| `qwen_forward.md`                         | Qwen forward 数学定义与 shape 约定        |
-| `profiling_schema.md`                     | profiler JSON 输出 schema            |
-| `pytorch_alignment.md`                    | C++ 与 PyTorch 对齐流程                 |
-| `android.md`                                | Android 端侧：NDK 编译 / adb 运行 / 常见坑   |
-| `known_limitations.md`                    | v1 已知限制                            |
-| `project_structure.md`                    | 本文件                                |
+| 文档                     | 内容                                      |
+|------------------------|-----------------------------------------|
+| `infra_primer.md`      | infra 新手导读：内存/对齐/字节序/KV cache/RAII      |
+| `optimization.md`      | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律） |
+| `optimization_log.md`  | 优化日志：每次改了什么/提升多少/为什么                    |
+| `weight_format.md`     | .tqwen 二进制格式规范                          |
+| `qwen_forward.md`      | Qwen forward 数学定义与 shape 约定             |
+| `profiling_schema.md`  | profiler JSON 输出 schema                 |
+| `pytorch_alignment.md` | C++ 与 PyTorch 对齐流程                      |
+| `android.md`           | Android 端侧：NDK 编译 / adb 运行 / 常见坑        |
+| `known_limitations.md` | v1 已知限制                                 |
+| `project_structure.md` | 本文件                                     |
 
 ## 依赖方向
 

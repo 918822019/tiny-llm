@@ -1,0 +1,38 @@
+# Model registry: model_i4_hqq_lmh.tqwen（Qwen2.5-0.5B i4 HQQ@64 + lm_head i4）
+name: model_i4_hqq_lmh
+architecture: qwen2.5
+source: Qwen/Qwen2.5-0.5B
+dtype: i4
+file: model_i4_hqq_lmh.tqwen
+size_mb: 784.6
+
+params:
+  n_layers: 24
+  hidden_size: 896
+  intermediate_size: 4864
+  n_heads: 14
+  n_kv_heads: 2
+  head_dim: 64
+  vocab_size: 151936
+  tied_embeddings: true
+
+quantization:
+  method: hqq
+  group_size: 64
+  lm_head_quantized: true
+  note: tied 模型导出独立 lm_head i4 副本（embed 保持 fp32 lookup），流量 544→70MB/token
+
+recipe:
+  matvec_impl: sdot_mt
+  ops_impl: neon
+  note: W4A8 SDOT（激活 int8 + SDOT 整数点积），i4 最佳配方
+
+benchmark:
+  android:
+    topt_ms: 22.35
+    ttft_ms: 1119.19
+    peak_rss_mb: 791.3
+    pmu_dram_bw_gbps: null
+    device: PLK110
+    commit: 54d05f4+
+    note: vs f16 满血 17.05 = 0.76×（追平过热 f16 21.16）；i4 的价值是内存+热稳定

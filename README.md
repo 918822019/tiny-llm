@@ -7,16 +7,19 @@
 > **当前状态**
 > - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，生成 token 与 HuggingFace 逐位一致；
 > - ✅ **已支持 Qwen3.5-0.8B 混合架构**（Gated DeltaNet + full attention 3:1）：
->   v2 格式、GDN 递归/conv 状态、partial RoPE、QK-norm、输出门。已在 macOS 用真实
->   Qwen3.5-0.8B 端到端生成连贯文本；随机权重小模型与 HF eager 对齐 max_abs_err ≈ 1e-6
->   （`tools/align_fake_qwen35_model.py`）；
+    > v2 格式、GDN 递归/conv 状态、partial RoPE、QK-norm、输出门。已在 macOS 用真实
+    > Qwen3.5-0.8B 端到端生成连贯文本；随机权重小模型与 HF eager 对齐 max_abs_err ≈ 1e-6
+    > （`tools/align_fake_qwen35_model.py`）；
 > - 性能：fp32 标量基线 230 ms/token → **fp16 满栈 + 全融合 ≈ 6.3 ms/token（36×）**。
->   已抵达带宽墙，fp16 路线正式关闭（结论与账本见 `docs/optimization_log.md`）；
+    > 已抵达带宽墙，fp16 路线正式关闭（结论与账本见 `docs/optimization_log.md`）；
 > - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、两套 kernel 分发层
->   （matvec / 非 matvec ops，变体自注册 + 未注册兜底 ref）、key=value 配置、
->   归因阶梯方法论；
-> - 下一步（要打破假设才有空间）：int4 量化（流量÷4）/ batched prefill /
->   speculative decoding——均超出 v1"不降 bit、batch=1"的边界，见日志关闭小节。
+    > （matvec / 非 matvec ops，变体自注册 + 未注册兜底 ref）、key=value 配置、
+    > 归因阶梯方法论、端侧资源采样（进程 RSS/峰值内存、各核实实时频率、KV cache 口径，
+    > 见 `docs/android.md` §6）；
+> - **INT4 已落地**：HQQ 量化导出（group=64）+ i4 kernel，精度 MSE 比 RTN 低 28%；
+    > 但当前 TOPT 73ms 比 f16 满栈（21ms）**慢**——i4 kernel 单线程 + tied lm_head
+    > 仍 fp32（PMU 实测流量仅降 25% 而非 ÷4）。下一步：i4 多线程 kernel + lm_head
+    > 量化 → batched prefill / speculative decoding，见 `docs/optimization_log.md`。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
 
@@ -142,20 +145,20 @@ python tools/visualize.py all profile.json -o viz.html && open viz.html
 tinyqwen --model <model.tqwen> [options]
 ```
 
-| 参数                   | 默认     | 说明                                          |
-|----------------------|--------|---------------------------------------------|
-| `--model PATH`       | 必填     | .tqwen 权重文件                                 |
-| `--tokens CSV`       | 二选一    | 逗号分隔的 token ids                             |
-| `--tokens-json PATH` | 二选一    | `tokenize_prompt.py` 输出的 JSON               |
-| `--max-new-tokens N` | 16     | 最多生成 token 数                                |
-| `--max-seq-len N`    | 1024   | KV cache 容量上限，不得超过 header max_seq_len       |
-| `--topk K`           | 0      | 输出 top-k logits 行（0 = 关闭）                   |
-| `--dump-logits PATH` | 无      | 每次 forward 后写全量 logits（fp32 binary，按位置顺序逐行） |
-| `--profile-out PATH` | 无      | profiler JSON 输出                            |
-| `--eos ID`           | 151645 | stop token，-1 禁用                            |
-| `--config PATH`      | 无      | key=value 配置文件（见下；CLI 开关优先于它）               |
+| 参数                   | 默认     | 说明                                                              |
+|----------------------|--------|-----------------------------------------------------------------|
+| `--model PATH`       | 必填     | .tqwen 权重文件                                                     |
+| `--tokens CSV`       | 二选一    | 逗号分隔的 token ids                                                 |
+| `--tokens-json PATH` | 二选一    | `tokenize_prompt.py` 输出的 JSON                                   |
+| `--max-new-tokens N` | 16     | 最多生成 token 数                                                    |
+| `--max-seq-len N`    | 1024   | KV cache 容量上限，不得超过 header max_seq_len                           |
+| `--topk K`           | 0      | 输出 top-k logits 行（0 = 关闭）                                       |
+| `--dump-logits PATH` | 无      | 每次 forward 后写全量 logits（fp32 binary，按位置顺序逐行）                     |
+| `--profile-out PATH` | 无      | profiler JSON 输出                                                |
+| `--eos ID`           | 151645 | stop token，-1 禁用                                                |
+| `--config PATH`      | 无      | key=value 配置文件（见下；CLI 开关优先于它）                                   |
 | `--matvec-impl NAME` | ref    | matvec kernel 实现：任意已注册名（当前 `ref` / `double_2_float`），未知值报错并列出可用 |
-| `--verbose`          | 关      | 模型 summary + prefill 细节（stderr）             |
+| `--verbose`          | 关      | 模型 summary + prefill 细节（stderr）                                 |
 
 ### 配置文件
 
@@ -185,20 +188,20 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 
 ## 文档
 
-| 文档                            | 内容                                             |
-|-------------------------------|------------------------------------------------|
-| `docs/infra_primer.md`        | **infra 新手导读**：内存布局/对齐/字节序/KV cache/RAII 等概念   |
-| `docs/optimization.md`        | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律）        |
-| `docs/optimization_log.md`    | **优化日志**：每次优化改了什么/提升多少/为什么                     |
-| `docs/weight_format.md`       | tiny binary format（header / tensor table / 对齐） |
-| `docs/qwen_forward.md`        | Qwen forward 数学定义与 shape 约定                    |
-| `docs/profiling_schema.md`    | profiler JSON 输出 schema                        |
-| `docs/pytorch_alignment.md`   | C++ 与 PyTorch reference 对齐流程                   |
-| `docs/android.md`             | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
-| `docs/project_structure.md`   | 目录职责说明                                         |
-| `docs/known_limitations.md`   | v1 已知限制                                        |
-| `kernels/README.md`           | kernels/ 导读：文件约定、已注册实现、_ref 的意义                |
-| `runtime/README.md`           | runtime/ 角色地图、数据流、阅读顺序                         |
+| 文档                          | 内容                                             |
+|-----------------------------|------------------------------------------------|
+| `docs/infra_primer.md`      | **infra 新手导读**：内存布局/对齐/字节序/KV cache/RAII 等概念   |
+| `docs/optimization.md`      | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律）        |
+| `docs/optimization_log.md`  | **优化日志**：每次优化改了什么/提升多少/为什么                     |
+| `docs/weight_format.md`     | tiny binary format（header / tensor table / 对齐） |
+| `docs/qwen_forward.md`      | Qwen forward 数学定义与 shape 约定                    |
+| `docs/profiling_schema.md`  | profiler JSON 输出 schema                        |
+| `docs/pytorch_alignment.md` | C++ 与 PyTorch reference 对齐流程                   |
+| `docs/android.md`           | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
+| `docs/project_structure.md` | 目录职责说明                                         |
+| `docs/known_limitations.md` | v1 已知限制                                        |
+| `kernels/README.md`         | kernels/ 导读：文件约定、已注册实现、_ref 的意义                |
+| `runtime/README.md`         | runtime/ 角色地图、数据流、阅读顺序                         |
 
 按角色的阅读路线：
 

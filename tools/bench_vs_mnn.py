@@ -173,7 +173,7 @@ def print_comparison(results: list[dict]) -> None:
 
     # 表头
     print(f"\n  {'配置':<28} {'量化':>5} {'ms/tok':>8} {'tok/s':>7} {'wall(s)':>8}  备注")
-    print(f"  {'-'*28} {'-'*5} {'-'*8} {'-'*7} {'-'*8}  {'-'*16}")
+    print(f"  {'-' * 28} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 8}  {'-' * 16}")
 
     for r in results:
         if r is None:
@@ -219,10 +219,10 @@ def main():
         print("[MNN 3.6.1.2] int4 量化, 4 threads ...")
         mnn_results = []
         for i in range(runs):
-            r = run_mnn(f"MNN int4 (run {i+1})")
+            r = run_mnn(f"MNN int4 (run {i + 1})")
             if r:
                 mnn_results.append(r)
-                print(f"  run {i+1}/{runs}: {r['wall_s']:.2f}s, ~{r['tok_per_sec_overall']:.1f} tok/s "
+                print(f"  run {i + 1}/{runs}: {r['wall_s']:.2f}s, ~{r['tok_per_sec_overall']:.1f} tok/s "
                       f"({r['output_chars']} chars → est {r['est_tokens']} tok)")
 
         if mnn_results:
@@ -244,16 +244,16 @@ def main():
 
         if args.tinyqwen_impl and args.tinyqwen_impl not in ("ref", "neon_mt_kv_nt"):
             configs.append((f"tinyqwen fp32 {args.tinyqwen_impl}",
-                           "model.tqwen", args.tinyqwen_impl, "neon"))
+                            "model.tqwen", args.tinyqwen_impl, "neon"))
 
         for label, model, impl, ops in configs:
             print(f"[{label}] ...")
             medians = []
             for i in range(runs):
-                r = run_tinyqwen(f"{label} (run {i+1})", model, impl, ops)
+                r = run_tinyqwen(f"{label} (run {i + 1})", model, impl, ops)
                 if r:
                     medians.append(r)
-                    print(f"  run {i+1}/{runs}: median={r['decode_median_ms']:.2f} ms/tok, "
+                    print(f"  run {i + 1}/{runs}: median={r['decode_median_ms']:.2f} ms/tok, "
                           f"{r['tok_per_sec']:.1f} tok/s")
                 else:
                     break

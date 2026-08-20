@@ -91,7 +91,7 @@ def build_detail(label, commit, med, p95, runs, last, vs_prev_str, base_note,
 - **优化栈**：<基线 + 本次优化，如 fp32-baseline + XXX>
 - **是什么**：<本次改了哪个 kernel / 数据结构 / 调度，一两句话>
 - **假设**：<为什么预期会快：带宽 / 计算 / 并行 / 指令 哪一类>
-- **结果**：decode 中位 **{med:.2f} ms/token**（{runs} 遍取中位，每遍 {last['decode_samples']} 样本），p95 {p95:.2f}
+- **结果**：TTFT **{last['ttft_ms']:.2f} ms**（prefill {last['prefill_tokens']} tok）；TOPT 中位 **{med:.2f} ms/token**（{runs} 遍取中位；decode 共 {last['generated_tokens']} tok，丢预热，稳态样本 {last['decode_samples']}），p95 {p95:.2f}；forward 总耗时 {last.get('total_ms') or 0:.1f} ms
 - **vs 上一配置**：{vs_prev_str}
 - **基线参照**：{base_note}
 - **验证**：scripts/verify.sh（单测 + golden token 对照）

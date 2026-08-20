@@ -102,7 +102,7 @@ def build_hf_state(seed: int) -> "dict[str, np.ndarray]":
         if _is_zero_centered_norm(name):
             arr = np.zeros(shape, np.float32)  # (1+0)=1，中性
         elif name.endswith("linear_attn.norm.weight"):
-            arr = np.ones(shape, np.float32)   # RMSNormGated，标准缩放
+            arr = np.ones(shape, np.float32)  # RMSNormGated，标准缩放
         elif name.endswith("linear_attn.A_log"):
             arr = np.log(rng.uniform(0.5, 2.0, shape)).astype(np.float32)
         elif name.endswith("linear_attn.dt_bias"):

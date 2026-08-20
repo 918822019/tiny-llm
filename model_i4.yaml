@@ -1,0 +1,37 @@
+# Model registry: model_i4.tqwen（Qwen2.5-0.5B i4 RTN@128，lm_head fp32）
+name: model_i4
+architecture: qwen2.5
+source: Qwen/Qwen2.5-0.5B
+dtype: i4
+file: model_i4.tqwen
+size_mb: 700.6
+
+params:
+  n_layers: 24
+  hidden_size: 896
+  intermediate_size: 4864
+  n_heads: 14
+  n_kv_heads: 2
+  head_dim: 64
+  vocab_size: 151936
+  tied_embeddings: true
+
+quantization:
+  method: rtn
+  group_size: 128
+  lm_head_quantized: false
+  note: min-max 非对称 RTN（wip 初始版，verify 脚本有 bug 已修）
+
+recipe:
+  matvec_impl: neon
+  ops_impl: neon
+  note: RTN 量化对照（已被 HQQ 版取代，保留作回归基线）
+
+benchmark:
+  android:
+    topt_ms: 73.31
+    ttft_ms: 1223.46
+    peak_rss_mb: 718.4
+    device: PLK110
+    commit: 54d05f4+
+    note: i4 neon 单线程（lm_head fp32，占 26.6% 时间）

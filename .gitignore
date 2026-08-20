@@ -19,6 +19,12 @@ prompt_tokens.json
 viz.html
 *_viz.html
 benchmarks/.baseline*.json
+# 测量产生的本地数据（逐设备/逐次增长，不入库）：
+# 历史 jsonl、数据集 batch 输入、资源时序曲线、控制台任务日志
+benchmarks/*.jsonl
+benchmarks/*.meta.json
+benchmarks/series/
+benchmarks/jobs/
 
 # Python / 编辑器 / 系统
 __pycache__/

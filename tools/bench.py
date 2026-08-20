@@ -115,7 +115,19 @@ def summarize(profile: dict) -> dict:
         "decode_min_ms": min(steady),
         "decode_p95_ms": percentile(steady, 95),
         "prefill_total_ms": sum(prefill_ms),
-        "prefill_tokens": len(prefill_ms),
+        # 批量 prefill 下整个 prompt 只有一条记录，真实长度以 profile 的
+        # prompt_tokens 为准（旧 profile 无此字段时退回记录数）。
+        "prefill_tokens": profile.get("prompt_tokens") or len(prefill_ms),
+        # LLM serving 标准指标口径：
+        # - TTFT：首 token 延迟 = prefill 总耗时（token-by-token prefill 下
+        #   profiler 的 first_token_ms 即各 prefill token 之和）；
+        # - TOPT：每输出 token 延迟，主指标用稳态 decode 中位数（见上方
+        #   decode_median_ms），decode_avg_ms 是含预热的全量平均，仅参考；
+        # - decode 长度 = 生成 token 总数（含被丢弃的预热 token）。
+        "ttft_ms": profile.get("first_token_ms", sum(prefill_ms)),
+        "decode_avg_ms": profile.get("decode_avg_ms"),
+        "generated_tokens": profile.get("generated_tokens", len(decode_ms)),
+        "total_ms": profile.get("total_ms"),
         "top_ops": [{"op": n, "total_ms": round(s["total_ms"], 2)} for n, s in top_ops],
     }
 
@@ -202,12 +214,15 @@ def main() -> None:
         result["extra_args"] = extra  # 可复现性：记录本次测量启用了什么开关
 
     # ---- 人类可读汇总 ----
-    print(f"\n  decode 延迟/token：median={headline['decode_median_ms']:.2f}ms  "
-          f"p95={headline['decode_p95_ms']:.2f}ms")
+    print(f"\n  TTFT：{headline['ttft_ms']:.2f} ms"
+          f"（prefill {last_stats['prefill_tokens']} tok）")
+    print(f"  TOPT：median={headline['decode_median_ms']:.2f} ms/tok  "
+          f"p95={headline['decode_p95_ms']:.2f}（decode 共 {last_stats['generated_tokens']} tok，"
+          f"丢预热 {WARMUP}，稳态样本 {last_stats['decode_samples']}）")
+    if headline.get("total_ms") is not None:
+        print(f"  forward 总耗时：{headline['total_ms']:.1f} ms")
     if runs > 1:
         print(f"  各遍中位数：{headline['per_run_median_ms']}（取中位 {headline['decode_median_ms']:.2f}）")
-    print(f"  样本量：每遍 {last_stats['decode_samples']} 个稳态 decode token")
-    print(f"  prefill：{last_stats['prefill_tokens']} token 共 {last_stats['prefill_total_ms']:.2f}ms")
     print(f"  环境：{env['processor']} @ {env['git_commit']}")
     print("  耗时 top op：")
     for op in last_stats["top_ops"]:

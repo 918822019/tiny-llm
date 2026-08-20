@@ -12,7 +12,11 @@ add_library(tinyqwen_runtime OBJECT
         gdn_state.cpp
         profiler.cpp
         config.cpp
+        backend_cpu.cpp
         qwen_model.cpp
+        qwen_forward_token.cpp
+        qwen_forward_prefill.cpp
+        ../quantization/quant.cpp
 )
 target_include_directories(tinyqwen_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(tinyqwen_runtime PUBLIC tinyqwen_kernels)

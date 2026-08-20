@@ -142,11 +142,11 @@ namespace tinyqwen {
                    int M, int K, int N, int group_size);
 
 #define TINYQWEN_MATMUL_VARIANT(fn, name)                                              \
-    [[maybe_unused]] static const bool tqwen_reg_mm_##fn =                             \
+    [[maybe_unused]] static const bool tqwen_reg_mm_## fn =                             \
             (tinyqwen::register_matmul_impl(name, fn), true)
 
 #define TINYQWEN_MATMUL_I4_VARIANT(fn, name)                                           \
-    [[maybe_unused]] static const bool tqwen_reg_mm_i4_##fn =                          \
+    [[maybe_unused]] static const bool tqwen_reg_mm_i4_## fn =                          \
             (tinyqwen::register_matmul_i4_impl(name, fn), true)
 
     // ---- 非 matvec 算子分发（ops dispatch）----
@@ -257,65 +257,65 @@ namespace tinyqwen {
 // tinytest::Registrar 同款模式）。注意：所在 .cpp 必须真正被链接进来
 // （kernels 是 OBJECT 库，所有 .o 都会链入，见 kernels/CMakeLists.txt）。
 #define TINYQWEN_MATVEC_VARIANT(fn, name)                                            \
-    [[maybe_unused]] static const bool tqwen_reg_##fn =                              \
+    [[maybe_unused]] static const bool tqwen_reg_## fn =                              \
             (tinyqwen::register_matvec_impl(name, fn), true)
 
 // pair 实现的自注册宏（同上，登记进 pair 注册表；key 与 matvec 实现同名，
 // matvec_pair_f32 按当前 impl 名查表）。
 #define TINYQWEN_MATVEC_PAIR_VARIANT(fn, name)                                       \
-    [[maybe_unused]] static const bool tqwen_reg_pair_##fn =                         \
+    [[maybe_unused]] static const bool tqwen_reg_pair_## fn =                         \
             (tinyqwen::register_matvec_pair_impl(name, fn), true)
 
 // f16 路径的同款自注册宏（登记进 f16 / f16-pair 注册表）。
 #define TINYQWEN_MATVEC_F16_VARIANT(fn, name)                                        \
-    [[maybe_unused]] static const bool tqwen_reg_f16_##fn =                          \
+    [[maybe_unused]] static const bool tqwen_reg_f16_## fn =                          \
             (tinyqwen::register_matvec_f16_impl(name, fn), true)
 
 #define TINYQWEN_MATVEC_F16_PAIR_VARIANT(fn, name)                                   \
-    [[maybe_unused]] static const bool tqwen_reg_f16_pair_##fn =                     \
+    [[maybe_unused]] static const bool tqwen_reg_f16_pair_## fn =                     \
             (tinyqwen::register_matvec_f16_pair_impl(name, fn), true)
 
 // qkv 三路融合的自注册宏。
 #define TINYQWEN_MATVEC_QKV_VARIANT(fn, name)                                        \
-    [[maybe_unused]] static const bool tqwen_reg_qkv_##fn =                          \
+    [[maybe_unused]] static const bool tqwen_reg_qkv_## fn =                          \
             (tinyqwen::register_matvec_qkv_impl(name, fn), true)
 
 #define TINYQWEN_MATVEC_QKV_F16_VARIANT(fn, name)                                    \
-    [[maybe_unused]] static const bool tqwen_reg_qkv_f16_##fn =                      \
+    [[maybe_unused]] static const bool tqwen_reg_qkv_f16_## fn =                      \
             (tinyqwen::register_matvec_qkv_f16_impl(name, fn), true)
 
 // INT4 路径的自注册宏（登记进 i4 / i4-pair / i4-qkv 注册表）。
 #define TINYQWEN_MATVEC_I4_VARIANT(fn, name)                                         \
-    [[maybe_unused]] static const bool tqwen_reg_i4_##fn =                           \
+    [[maybe_unused]] static const bool tqwen_reg_i4_## fn =                           \
             (tinyqwen::register_matvec_i4_impl(name, fn), true)
 
 #define TINYQWEN_MATVEC_I4_PAIR_VARIANT(fn, name)                                    \
-    [[maybe_unused]] static const bool tqwen_reg_i4_pair_##fn =                      \
+    [[maybe_unused]] static const bool tqwen_reg_i4_pair_## fn =                      \
             (tinyqwen::register_matvec_i4_pair_impl(name, fn), true)
 
 #define TINYQWEN_MATVEC_QKV_I4_VARIANT(fn, name)                                     \
-    [[maybe_unused]] static const bool tqwen_reg_qkv_i4_##fn =                       \
+    [[maybe_unused]] static const bool tqwen_reg_qkv_i4_## fn =                       \
             (tinyqwen::register_matvec_qkv_i4_impl(name, fn), true)
 
 // 非 matvec 算子的自注册宏（各登记进对应算子注册表；key 用同一个实现名）。
 #define TINYQWEN_RMSNORM_VARIANT(fn, name)                                           \
-    [[maybe_unused]] static const bool tqwen_reg_rmsnorm_##fn =                      \
+    [[maybe_unused]] static const bool tqwen_reg_rmsnorm_## fn =                      \
             (tinyqwen::register_rmsnorm_impl(name, fn), true)
 
 #define TINYQWEN_ROPE_VARIANT(fn, name)                                              \
-    [[maybe_unused]] static const bool tqwen_reg_rope_##fn =                         \
+    [[maybe_unused]] static const bool tqwen_reg_rope_## fn =                         \
             (tinyqwen::register_rope_impl(name, fn), true)
 
 #define TINYQWEN_ATTENTION_DECODE_VARIANT(fn, name)                                  \
-    [[maybe_unused]] static const bool tqwen_reg_attn_##fn =                         \
+    [[maybe_unused]] static const bool tqwen_reg_attn_## fn =                         \
             (tinyqwen::register_attention_decode_impl(name, fn), true)
 
 #define TINYQWEN_SWIGLU_VARIANT(fn, name)                                            \
-    [[maybe_unused]] static const bool tqwen_reg_swiglu_##fn =                       \
+    [[maybe_unused]] static const bool tqwen_reg_swiglu_## fn =                       \
             (tinyqwen::register_swiglu_impl(name, fn), true)
 
 #define TINYQWEN_ARGMAX_VARIANT(fn, name)                                            \
-    [[maybe_unused]] static const bool tqwen_reg_argmax_##fn =                       \
+    [[maybe_unused]] static const bool tqwen_reg_argmax_## fn =                       \
             (tinyqwen::register_argmax_impl(name, fn), true)
 
 // GPU decode engine 的自注册宏：engine 的 .cu 文件末尾调用一次，登记
@@ -323,24 +323,24 @@ namespace tinyqwen {
 // 无 CUDA 时没有 engine 注册，gpu_decode_available() 为 false，自动走 CPU。
 #define TINYQWEN_GPU_DECODE_VARIANT(name_str, create_fn, step_fn, reset_fn,          \
                                     destroy_fn, logits_fn)                            \
-    [[maybe_unused]] static const bool tqwen_reg_gpud_##create_fn =                  \
+    [[maybe_unused]] static const bool tqwen_reg_gpud_## create_fn =                  \
             (tinyqwen::register_gpu_decode_impl(name_str, create_fn, step_fn,        \
                                                 reset_fn, destroy_fn, logits_fn),     \
              true)
 
 // GDN 算子的自注册宏（共用 ops 实现名）。
 #define TINYQWEN_CAUSAL_CONV1D_UPDATE_VARIANT(fn, name)                              \
-    [[maybe_unused]] static const bool tqwen_reg_conv1d_##fn =                       \
+    [[maybe_unused]] static const bool tqwen_reg_conv1d_## fn =                       \
             (tinyqwen::register_causal_conv1d_update_impl(name, fn), true)
 
 #define TINYQWEN_L2NORM_INPLACE_VARIANT(fn, name)                                    \
-    [[maybe_unused]] static const bool tqwen_reg_l2norm_##fn =                       \
+    [[maybe_unused]] static const bool tqwen_reg_l2norm_## fn =                       \
             (tinyqwen::register_l2norm_inplace_impl(name, fn), true)
 
 #define TINYQWEN_GDN_STEP_VARIANT(fn, name)                                          \
-    [[maybe_unused]] static const bool tqwen_reg_gdn_step_##fn =                     \
+    [[maybe_unused]] static const bool tqwen_reg_gdn_step_## fn =                     \
             (tinyqwen::register_gdn_step_impl(name, fn), true)
 
 #define TINYQWEN_RMSNORM_GATED_VARIANT(fn, name)                                     \
-    [[maybe_unused]] static const bool tqwen_reg_rmsnorm_gated_##fn =                \
+    [[maybe_unused]] static const bool tqwen_reg_rmsnorm_gated_## fn =                \
             (tinyqwen::register_rmsnorm_gated_impl(name, fn), true)

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,12 @@ namespace tinyqwen {
         void enter(const char *name); // 一个 op 开始（一般不直接调，用 ScopedTimer）
         void leave(const char *name); // 一个 op 结束
 
+        // 显式声明"prompt 长度 / 生成 token 数"，write_json 优先用它。
+        // 为什么不能只靠 token 记录数推导：
+        // - 批量 prefill 下整个 prompt 只有一条记录（记录数=1 ≠ prompt 长度）；
+        // - decode 步数 = 生成数 - 1（最后一个 token 不需要再 forward）。
+        void set_counts(uint64_t prompt_tokens, uint64_t generated_tokens);
+
         const std::vector<TokenRecord> &tokens() const { return tokens_; }
         const std::map<std::string, OpStat> &op_totals() const { return op_totals_; }
 
@@ -97,6 +104,9 @@ namespace tinyqwen {
 
         std::vector<TokenRecord> tokens_; // 所有已完成的 token 记录
         std::map<std::string, OpStat> op_totals_; // 跨 token 的 op 聚合
+        // 显式计数（set_counts）；未设置时 write_json 退回按记录推导。
+        std::optional<uint64_t> prompt_tokens_;
+        std::optional<uint64_t> generated_tokens_;
     };
 
     // RAII 计时器：构造时开始计时，析构时停止计时。

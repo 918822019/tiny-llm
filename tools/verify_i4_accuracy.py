@@ -13,43 +13,60 @@
 from __future__ import annotations
 
 import argparse
+import numpy as np
 import struct
 import sys
 from pathlib import Path
 
-import numpy as np
-
-
 # ---- tqwen 格式常量 ----
-MAGIC = b"TQWN"
+MAGIC = b"TINYQWEN"  # 8 字节魔数（runtime/tiny_format.h kMagic）
 DTYPE_F32 = 0
-DTYPE_I4 = 2
+DTYPE_I4 = 3  # runtime/tiny_format.h: kI4 = 3（kI8 = 2）
+
+# 与 exporter 一致：header 192B，entry 120B
+HEADER_FMT = "<8s12Iff4Q96s"
+ENTRY_FMT = "<64sII4QQQ"
+
+
+def parse_header_bytes(header: bytes):
+    """解析 192B header，返回 (tensor_count, dtype, quant_group_size)。
+
+    v1/v2 共用同一 192B 布局；v1 的 reserved[96] 全 0（无量化信息），
+    v2 把前 64B 解读为 TinyHeaderV2Ext（含 quant_group_size）。
+    """
+    magic = header[:8]
+    assert magic == MAGIC, f"bad magic: {magic}"
+    version = struct.unpack_from("<I", header, 8)[0]
+    assert version in (1, 2), f"unsupported version: {version}"
+    dtype = struct.unpack_from("<I", header, 12)[0]
+    # tensor_count / tensor_table_offset 是 4×u64 的前两个（offset 64 / 72）
+    tensor_count = struct.unpack_from("<Q", header, 64)[0]
+    quant_group_size = 0
+    if version >= 2:
+        # v2 ext 复用 reserved[96] 的前 64B（起始 offset 96）；quant_group_size
+        # 在 ext 内 offset 40（EXT_I4_FMT = "<7If2II20s"：7×u32+f32+2×u32+u32+20s）。
+        quant_group_size = struct.unpack_from("<I", header, 96 + 40)[0]
+    return tensor_count, dtype, quant_group_size
 
 
 def read_header(f):
-    """读取 tqwen v2 header，返回 (n_tensors, dtype, ext_info)。"""
-    magic = f.read(4)
-    assert magic == MAGIC, f"bad magic: {magic}"
-    version = struct.unpack("<I", f.read(4))[0]
-    assert version == 2, f"unsupported version: {version}"
-    n_tensors, dtype = struct.unpack("<II", f.read(8))
-    # ext header (v2): model_type(4) + n_layers(4) + hidden(4) + ... + quant_group_size(4)
-    ext_data = f.read(64)
-    # quant_group_size is at offset 44 in ext (after model_type, n_layers, hidden, intermediate,
-    # n_heads, n_kv_heads, head_dim, vocab, max_seq, rope_base, rope_scaling) = 11*4=44
-    quant_group_size = struct.unpack_from("<I", ext_data, 44)[0]
-    return n_tensors, dtype, quant_group_size
+    """读取 tqwen v2 header（192B），返回 (n_tensors, dtype, quant_group_size)。"""
+    header = f.read(struct.calcsize(HEADER_FMT))
+    result = parse_header_bytes(header)
+    f.seek(0)  # 交回调用方按 tensor_table_offset 定位
+    return result
 
 
 def read_tensor_entries(f, n_tensors):
-    """读取 tensor table，返回 [(name, dtype, dims, offset, nbytes)]。"""
+    """读取 tensor 表，返回 [(name, dtype, dims, offset, nbytes)]。offset 为绝对偏移。"""
     entries = []
+    entry_size = struct.calcsize(ENTRY_FMT)
     for _ in range(n_tensors):
-        name_len = struct.unpack("<I", f.read(4))[0]
-        name = f.read(name_len).decode("utf-8")
-        tdtype, ndim = struct.unpack("<II", f.read(8))
-        dims = list(struct.unpack(f"<{ndim}I", f.read(4 * ndim)))
-        offset, nbytes = struct.unpack("<QQ", f.read(16))
+        raw = f.read(entry_size)
+        name_b, tdtype, ndim, d0, d1, d2, d3, offset, nbytes = struct.unpack(
+            ENTRY_FMT, raw)
+        name = name_b.split(b"\x00", 1)[0].decode("ascii")
+        dims = [d0, d1, d2, d3][:ndim]
         entries.append((name, tdtype, dims, offset, nbytes))
     return entries
 
@@ -93,12 +110,15 @@ def load_tensors(path: Path):
     """加载 tqwen 文件中所有 tensor，返回 {name: (dtype, dims, ndarray)}。"""
     tensors = {}
     with open(path, "rb") as f:
-        n_tensors, file_dtype, group_size = read_header(f)
+        header = f.read(struct.calcsize(HEADER_FMT))
+        n_tensors, file_dtype, group_size = parse_header_bytes(header)
+        # tensor 表位置由 header 的 tensor_table_offset 给出（=192）
+        table_offset = struct.unpack_from("<Q", header, 72)[0]
+        f.seek(table_offset)
         entries = read_tensor_entries(f, n_tensors)
-        data_base = f.tell()
 
         for name, tdtype, dims, offset, nbytes in entries:
-            f.seek(data_base + offset)
+            f.seek(offset)  # entry 里的 offset 是文件绝对偏移
             raw = f.read(nbytes)
             if tdtype == DTYPE_F32:
                 arr = np.frombuffer(raw, dtype=np.float32).reshape(dims)
@@ -123,11 +143,17 @@ def compare_tensors(fp32_tensors, i4_tensors):
         i4_dtype, i4_dims, i4_arr = i4_tensors[name]
         if i4_dtype != DTYPE_I4:
             continue
+        ref_name = name
         if name not in fp32_tensors:
-            print(f"  {name:<48} {'MISSING in fp32':>36}")
-            continue
+            # tied 模型：i4 文件带独立的 lm_head.weight 量化副本，
+            # fp32 参照是共享的 embed_tokens。
+            if name == "lm_head.weight" and "model.embed_tokens.weight" in fp32_tensors:
+                ref_name = "model.embed_tokens.weight"
+            else:
+                print(f"  {name:<48} {'MISSING in fp32':>36}")
+                continue
 
-        fp32_dtype, fp32_dims, fp32_arr = fp32_tensors[name]
+        fp32_dtype, fp32_dims, fp32_arr = fp32_tensors[ref_name]
         if fp32_arr is None:
             continue
 
@@ -144,7 +170,8 @@ def compare_tensors(fp32_tensors, i4_tensors):
         total_mse += mse
         count += 1
 
-        print(f"  {name:<48} {mse:>12.6e} {max_err:>12.6e} {cos_sim:>10.6f}")
+        disp = name if ref_name == name else f"{name} (vs embed)"
+        print(f"  {disp:<48} {mse:>12.6e} {max_err:>12.6e} {cos_sim:>10.6f}")
 
     if count > 0:
         print("-" * 88)

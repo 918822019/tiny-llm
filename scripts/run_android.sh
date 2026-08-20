@@ -38,9 +38,15 @@ fi
 
 adb push "$TOKENS" "$DEVICE_DIR/tokens.json" >/dev/null
 
+# 额外参数逐个单引号转义后拼进 adb shell 命令串：整条命令要过两层 shell
+# （本机 → 设备端 sh），未转义的 $* 会让带空格/特殊字符的参数碎裂。
+REMOTE_ARGS=""
+for a in "$@"; do
+  REMOTE_ARGS="$REMOTE_ARGS '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
+done
+
 echo "--- run ---"
 adb shell "cd $DEVICE_DIR && ./tinyqwen \
   --model $DEVICE_MODEL \
   --tokens-json $DEVICE_DIR/tokens.json \
-  --profile-out $DEVICE_DIR/profile.json \
-  $*"
+  --profile-out $DEVICE_DIR/profile.json$REMOTE_ARGS"

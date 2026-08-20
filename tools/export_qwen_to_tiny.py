@@ -20,12 +20,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import numpy as np
 import os
 import struct
 import sys
 from pathlib import Path
-
-import numpy as np
 
 # 必须与 runtime/tiny_format.h 保持一致 -------------------------------
 MAGIC = b"TINYQWEN"

@@ -1,0 +1,36 @@
+# Model registry: model.tqwen（Qwen2.5-0.5B fp32 基线）
+name: model
+architecture: qwen2.5
+source: Qwen/Qwen2.5-0.5B
+dtype: f32
+file: model.tqwen
+size_mb: 1884.5
+
+params:
+  n_layers: 24
+  hidden_size: 896
+  intermediate_size: 4864
+  n_heads: 14
+  n_kv_heads: 2
+  head_dim: 64
+  vocab_size: 151936
+  tied_embeddings: true
+
+quantization:
+  method: none
+  group_size: null
+  lm_head_quantized: false
+
+recipe:
+  matvec_impl: neon_mt
+  ops_impl: neon
+  note: fp32 满栈 NEON + 多线程（基线参照，已抵达带宽墙）
+
+benchmark:
+  android:
+    topt_ms: 695.52
+    ttft_ms: null
+    peak_rss_mb: null
+    device: PLK110
+    commit: 54d05f4
+    note: ref 起点基线（android-fp16-ref-baseline）

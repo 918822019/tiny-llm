@@ -1,0 +1,9 @@
+{
+  "label": "android-fp16-ref-baseline",
+  "decode_median_ms": 695.52,
+  "decode_p95_ms": 696.15,
+  "commit": "54d05f4",
+  "device_model": "PLK110",
+  "soc": "canoe",
+  "note": "Android 端侧基线；换基线时重跑 scripts/set_baseline_android.sh"
+}

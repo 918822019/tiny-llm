@@ -21,8 +21,8 @@
 
 ## 格式
 
-- dtype 支持 f32 / f16（weight-only，全文件单一 dtype）；i8/i4 已在 header
-  中预留但 loader 拒绝；
+- dtype 支持 f32 / f16 / i4（i4 为混合 dtype：matmul 权重 uint4-packed，
+  embed/norm/bias 保留 fp32）；i8 已在 header 中预留但 loader 拒绝；
 - f16 的数值验收只做过 canonical prompt 的 greedy 对照（16 token 与 fp32
   逐位一致），长文本/敏感任务未覆盖；
 - tensor name 上限 64 字符；
@@ -37,8 +37,11 @@
 
 ## 未实现（路线图，不在 v1）
 
+- INT4 路线进行中：HQQ 量化导出 + ref/neon kernel 已落地（见优化日志
+  i4-hqq-android），但 **i4 kernel 尚不如 f16 满栈快**——缺多线程变体、
+  nibble unpack 慢，且 tied lm_head 仍是 fp32（÷4 流量红利未拿满）；
 - INT8 weight-only reference quantization；
-- INT4 / KronQ packing 与 NEON kernel；
+- KronQ packing；
 - Speculative decoding（draft/verify/rollback）；
 - 多 LoRA adapter 调度；
 - KV cache 的 speculative rollback / truncate；
