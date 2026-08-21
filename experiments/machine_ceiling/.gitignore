@@ -1,0 +1,11 @@
+# 编译产物（源码在本目录，编译方式见 ../../benchmarks/machine_ceiling/m4_ceiling.md 附录）
+bench_bw
+bench_gpu_bw
+bench_flops
+bench_nand
+bench_sustain
+probe_metal
+
+# 测量输出（逐机器/逐次增长，结论已汇总进账表）
+*.txt
+*.log
