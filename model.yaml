@@ -1,3 +1,24 @@
+# =============================================================================
+# model.yaml —— Qwen2.5-0.5B FP32 基线模型注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件是 tinyqwen 项目的模型注册表（Model Registry），用于记录
+#   每个模型版本的关键元数据：来源、数据类型、量化方式、推荐配方和基准数据。
+#   tinyqwen 运行时本身不依赖此文件，它主要服务于项目的文档和 CI 基准追踪。
+#
+# 字段说明：
+#   name          - 模型在注册表中的唯一标识名
+#   architecture  - 模型架构族（qwen2.5 / qwen3.5）
+#   source        - HuggingFace 或其他来源的模型标识
+#   dtype         - 权重数据类型（f32 / f16 / i4）
+#   file          - 对应的 .tqwen 文件路径
+#   size_mb       - 模型文件大小（MB）
+#   params        - 模型结构参数（层数、隐藏维度、头数等）
+#   quantization  - 量化配置（方法、组大小、lm_head 是否量化）
+#   recipe        - 推荐的计算配方（matvec 实现、非 matvec 算子实现）
+#   benchmark     - 基准测试结果（按平台分组）
+# =============================================================================
+
 # Model registry: model.tqwen（Qwen2.5-0.5B fp32 基线）
 name: model
 architecture: qwen2.5
@@ -6,31 +27,35 @@ dtype: f32
 file: model.tqwen
 size_mb: 1884.5
 
+# 模型结构参数（与 HuggingFace config.json 对应）
 params:
-  n_layers: 24
-  hidden_size: 896
-  intermediate_size: 4864
-  n_heads: 14
-  n_kv_heads: 2
-  head_dim: 64
-  vocab_size: 151936
-  tied_embeddings: true
+  n_layers: 24             # Transformer 层数
+  hidden_size: 896         # 隐藏层维度
+  intermediate_size: 4864  # FFN 中间层维度
+  n_heads: 14              # Query 注意力头数
+  n_kv_heads: 2            # Key/Value 注意力头数（GQA 分组数）
+  head_dim: 64             # 每个注意力头的维度
+  vocab_size: 151936       # 词表大小
+  tied_embeddings: true    # 嵌入层和输出层是否共享权重
 
+# 量化配置（FP32 基线不量化）
 quantization:
-  method: none
-  group_size: null
-  lm_head_quantized: false
+  method: none             # 量化方法：none（不量化）
+  group_size: null         # 量化组大小：不适用
+  lm_head_quantized: false # lm_head（输出层）不量化
 
+# 推荐的计算配方
 recipe:
-  matvec_impl: neon_mt
-  ops_impl: neon
+  matvec_impl: neon_mt     # 矩阵向量乘实现：NEON + 多线程行切分
+  ops_impl: neon           # 非 matvec 算子实现：NEON 向量化
   note: fp32 满栈 NEON + 多线程（基线参照，已抵达带宽墙）
 
+# 基准测试结果
 benchmark:
   android:
-    topt_ms: 695.52
-    ttft_ms: null
-    peak_rss_mb: null
-    device: PLK110
-    commit: 54d05f4
+    topt_ms: 695.52        # 每个 token 的生成时间（毫秒）
+    ttft_ms: null          # 首个 token 时间（毫秒）
+    peak_rss_mb: null      # 峰值内存占用（MB）
+    device: PLK110         # 测试设备型号
+    commit: 54d05f4        # 测试时对应的 git commit
     note: ref 起点基线（android-fp16-ref-baseline）

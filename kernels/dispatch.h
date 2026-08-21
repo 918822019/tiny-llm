@@ -1,39 +1,70 @@
-#pragma once
+#pragma once  // 头文件保护：防止重复包含
 
-// 算子分发层：model 只调用这里的"通用入口"，由分发层决定用哪个实现。
-// 这是"保留 base + 可插拔优化"的关键接缝。
+// ============================================================================
+// dispatch.h — 算子分发层的公共接口
+// ============================================================================
 //
-//   model ──> matvec_f32(通用入口) ──dispatch──> matvec_f32_ref / _double_2_float / ...
+// 本头文件定义 tinyqwen 的算子分发（dispatch）机制的所有公共接口。
+// 模型推理代码（model）只调用这里声明的"通用入口"函数，由分发层根据运行时配置
+// 决定使用哪个已自注册的具体实现变体。
 //
-// 实现采用**自注册**：每个变体在自己的 .cpp 末尾用 TINYQWEN_MATVEC_VARIANT
-// 一行宏登记，加变体不需要改 dispatch/main/conf。
+// 架构示意：
+//   model ──> matvec_f32(通用入口) ──dispatch──> matvec_f32_ref / _neon / ...
+//   model ──> rmsnorm(通用入口)    ──dispatch──> rmsnorm_ref / _neon / ...
+//   model ──> gdn_step(通用入口)   ──dispatch──> gdn_step_ref / _neon / ...
+//
+// 实现采用**自注册**模式：每个变体在自己的 .cpp 末尾用 TINYQWEN_MATVEC_VARIANT
+// 等宏登记一行，加新变体不需要改 dispatch/main/conf。静态 bool 变量的初始化器
+// 在 main() 之前执行 register_xxx_impl()，将函数指针登记到对应的 unordered_map。
 // 详见 docs/optimization.md。
+//
+// 数据类型层次：
+//   - f32：float 权重 + float 激活（基线精度）
+//   - f16：uint16_t (fp16) 权重 + float 激活（weight-only 半精度）
+//   - i4：uint8_t (packed uint4) 权重 + float 激活（INT4 量化）
+//   每种类型有独立的注册表和选择变量，互不干扰。
+//
+// 算子融合层次：
+//   - 基础 matvec：y = W @ x
+//   - pair matvec：y1 = W1 @ x, y2 = W2 @ x（k+v 共享输入）
+//   - qkv matvec：yq = Wq @ x, yk = Wk @ x, yv = Wv @ x（三路融合）
+//   高层融合兜底到低层：没注册 qkv → matvec(q) + pair(k,v)；没注册 pair → 两次 matvec。
+// ============================================================================
 
-#include <string>
+#include <string>       // std::string（gpu_decode_create 的错误消息参数）
 
-#include "ref_ops.h"
+#include "ref_ops.h"    // 参考实现声明：提供 *_ref 函数签名和类型定义
 
 namespace tinyqwen {
+    // ================================================================
+    // matvec f32 分发接口
+    // ================================================================
+
     // matvec 实现的统一签名（与 matvec_f32_ref 一致）。
+    // w[out_dim × in_dim] 行主序权重矩阵，x[in_dim] 输入向量，y[out_dim] 输出向量。
     using MatvecFn = void (*)(const float *w, const float *x, float *y, int out_dim, int in_dim);
 
-    // 注册一个实现（通常不直接调用，而是用文件末尾的 TINYQWEN_MATVEC_VARIANT 宏）。
+    // 注册一个 matvec f32 实现。通常不直接调用，而是用文件末尾的
+    // TINYQWEN_MATVEC_VARIANT 宏自动注册。
     void register_matvec_impl(const char *name, MatvecFn fn);
 
-    // 按名字选择实现。找到返回 true；未找到返回 false 且不改变当前选择。
+    // 按名字选择 matvec f32 实现。找到返回 true 并更新当前选择；
+    // 未找到返回 false 且不改变当前选择（由调用方报错）。
     bool set_matvec_impl_by_name(const char *name);
 
-    // 当前实现的名字（未显式选择时为 "ref"——matvec_f32 会兜底到 ref）。
+    // 获取当前 matvec f32 实现的名字。未显式选择时为 "ref"——matvec_f32 会兜底到 ref。
     const char *matvec_impl_name();
 
-    // 所有已注册实现名，逗号分隔（报错/帮助用）。
+    // 获取所有已注册的 matvec f32 实现名，逗号分隔（排序后，用于报错/帮助信息）。
     const char *available_matvec_impls();
 
-    // 通用入口：model 调用这个，而不是直接调某个具体实现。
+    // matvec f32 通用入口：model 调用这个，而不是直接调某个具体实现。
     // 未显式选择时自动用 "ref"；ref 都没注册（链接配置错误）则 abort。
     void matvec_f32(const float *w, const float *x, float *y, int out_dim, int in_dim);
 
-    // ---- 成对 matvec：y1 = W1 @ x，y2 = W2 @ x（同一个 x）----
+    // ================================================================
+    // 成对 matvec：y1 = W1 @ x，y2 = W2 @ x（同一个 x）
+    // ================================================================
     // Qwen 的 k_proj/v_proj 正是这个形状：两个小矩阵共享同一个输入向量。
     // 分开调用时它们各自太小（0.45MB），够不着多线程阈值，只能单线程内联；
     // 合并成一次调用后总量翻倍，有机会摊薄同步开销、走并行路径。
@@ -41,30 +72,38 @@ namespace tinyqwen {
     // 通用入口语义：当前 impl 注册过 pair 实现就用它；没注册则**兜底为调用
     // 两次 matvec_f32**——与调用方分开调数值完全一致，不关心此优化的 impl
     // （ref 等）无需注册任何东西，行为不变。
+
+    // pair matvec 的统一签名
     using MatvecPairFn = void (*)(const float *w1, const float *w2, const float *x,
                                   float *y1, float *y2, int out_dim, int in_dim);
 
+    // 注册 pair matvec 实现
     void register_matvec_pair_impl(const char *name, MatvecPairFn fn);
 
+    // pair matvec 通用入口
     void matvec_pair_f32(const float *w1, const float *w2, const float *x,
                          float *y1, float *y2, int out_dim, int in_dim);
 
-    // ---- f16 权重路径（weight-only 半精度：权重 f16，激活/计算 f32）----
+    // ================================================================
+    // f16 权重路径（weight-only 半精度：权重 f16，激活/计算 f32）
+    // ================================================================
     //
     // f16 实现有**独立注册表**，实现名与 f32 注册表共享同一命名空间
     // （"ref" / "neon_mt_kv_nt" / ...）：选哪个实现由"模型文件的 dtype +
     // 实现名"共同决定（main 按模型 dtype 查对应注册表，未知即报错），
     // forward 按 dtype 调对应入口。两表独立保证"f32 模型配 f16 实现名"
     // 会 fail fast，而不是静默兜底。
+
+    // f16 matvec 的统一签名（权重类型为 uint16_t，即 fp16 的位表示）
     using MatvecF16Fn = void (*)(const uint16_t *w, const float *x, float *y, int out_dim,
                                  int in_dim);
 
-    void register_matvec_f16_impl(const char *name, MatvecF16Fn fn);
-    bool set_matvec_f16_impl_by_name(const char *name);
-    const char *matvec_f16_impl_name();
-    const char *available_matvec_f16_impls();
+    void register_matvec_f16_impl(const char *name, MatvecF16Fn fn);  // 注册 f16 实现
+    bool set_matvec_f16_impl_by_name(const char *name);               // 按名字选择
+    const char *matvec_f16_impl_name();                                // 当前实现名
+    const char *available_matvec_f16_impls();                          // 所有已注册名
 
-    // 通用入口：未显式选择时兜底到 f16 注册表里的 "ref"。
+    // f16 matvec 通用入口：未显式选择时兜底到 f16 注册表里的 "ref"。
     void matvec_f16(const uint16_t *w, const float *x, float *y, int out_dim, int in_dim);
 
     // f16 成对入口：语义与 matvec_pair_f32 相同；未注册 pair 的 impl 兜底为
@@ -72,74 +111,97 @@ namespace tinyqwen {
     using MatvecPairF16Fn = void (*)(const uint16_t *w1, const uint16_t *w2, const float *x,
                                      float *y1, float *y2, int out_dim, int in_dim);
 
-    void register_matvec_f16_pair_impl(const char *name, MatvecPairF16Fn fn);
+    void register_matvec_f16_pair_impl(const char *name, MatvecPairF16Fn fn);  // 注册
 
     void matvec_pair_f16(const uint16_t *w1, const uint16_t *w2, const float *x,
-                         float *y1, float *y2, int out_dim, int in_dim);
+                         float *y1, float *y2, int out_dim, int in_dim);  // 通用入口
 
-    // ---- qkv 三路融合：q + k + v 共享输入向量，一次 fork-join ----
+    // ================================================================
+    // qkv 三路融合：q + k + v 共享输入向量，一次 fork-join
+    // ================================================================
     // q_dim 和 kv_dim 可以不同（Qwen: 896 vs 128）。
     // 兜底：matvec(q) + matvec_pair(k,v)。
+
+    // qkv f32 融合签名
     using MatvecQkvFn = void (*)(const float *wq, const float *wk, const float *wv,
                                  const float *x, float *yq, float *yk, float *yv,
                                  int q_dim, int kv_dim, int in_dim);
-    void register_matvec_qkv_impl(const char *name, MatvecQkvFn fn);
+    void register_matvec_qkv_impl(const char *name, MatvecQkvFn fn);  // 注册
     void matvec_qkv_f32(const float *wq, const float *wk, const float *wv,
                         const float *x, float *yq, float *yk, float *yv,
-                        int q_dim, int kv_dim, int in_dim);
+                        int q_dim, int kv_dim, int in_dim);            // 通用入口
 
+    // qkv f16 融合签名
     using MatvecQkvF16Fn = void (*)(const uint16_t *wq, const uint16_t *wk, const uint16_t *wv,
                                     const float *x, float *yq, float *yk, float *yv,
                                     int q_dim, int kv_dim, int in_dim);
-    void register_matvec_qkv_f16_impl(const char *name, MatvecQkvF16Fn fn);
+    void register_matvec_qkv_f16_impl(const char *name, MatvecQkvF16Fn fn);  // 注册
     void matvec_qkv_f16(const uint16_t *wq, const uint16_t *wk, const uint16_t *wv,
                         const float *x, float *yq, float *yk, float *yv,
-                        int q_dim, int kv_dim, int in_dim);
+                        int q_dim, int kv_dim, int in_dim);                   // 通用入口
 
-    // ---- INT4 weight-only 路径（非对称 uint4，per-group scale+zero，interleaved）----
+    // ================================================================
+    // INT4 weight-only 路径（非对称 uint4，per-group scale+zero，interleaved）
+    // ================================================================
     //
     // 签名比 f32/f16 多一个 group_size 参数：kernel 内部按 interleaved 布局
     // 逐组解包反量化。权重指针类型 = const uint8_t*（packed bytes，包含 scale/zero）。
+
+    // INT4 matvec 签名
     using MatvecI4Fn = void (*)(const uint8_t *w, const float *x, float *y,
                                 int out_dim, int in_dim, int group_size);
 
-    void register_matvec_i4_impl(const char *name, MatvecI4Fn fn);
-    bool set_matvec_i4_impl_by_name(const char *name);
-    const char *matvec_i4_impl_name();
-    const char *available_matvec_i4_impls();
+    void register_matvec_i4_impl(const char *name, MatvecI4Fn fn);  // 注册
+    bool set_matvec_i4_impl_by_name(const char *name);               // 按名字选择
+    const char *matvec_i4_impl_name();                                // 当前实现名
+    const char *available_matvec_i4_impls();                          // 所有已注册名
     void matvec_i4(const uint8_t *w, const float *x, float *y,
-                   int out_dim, int in_dim, int group_size);
+                   int out_dim, int in_dim, int group_size);          // 通用入口
 
+    // INT4 pair matvec 签名
     using MatvecPairI4Fn = void (*)(const uint8_t *w1, const uint8_t *w2, const float *x,
                                     float *y1, float *y2, int out_dim, int in_dim, int group_size);
-    void register_matvec_i4_pair_impl(const char *name, MatvecPairI4Fn fn);
+    void register_matvec_i4_pair_impl(const char *name, MatvecPairI4Fn fn);  // 注册
     void matvec_pair_i4(const uint8_t *w1, const uint8_t *w2, const float *x,
-                        float *y1, float *y2, int out_dim, int in_dim, int group_size);
+                        float *y1, float *y2, int out_dim, int in_dim, int group_size);  // 通用入口
 
+    // INT4 qkv 融合签名
     using MatvecQkvI4Fn = void (*)(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
                                    const float *x, float *yq, float *yk, float *yv,
                                    int q_dim, int kv_dim, int in_dim, int group_size);
-    void register_matvec_qkv_i4_impl(const char *name, MatvecQkvI4Fn fn);
+    void register_matvec_qkv_i4_impl(const char *name, MatvecQkvI4Fn fn);  // 注册
     void matvec_qkv_i4(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
                        const float *x, float *yq, float *yk, float *yv,
-                       int q_dim, int kv_dim, int in_dim, int group_size);
+                       int q_dim, int kv_dim, int in_dim, int group_size);  // 通用入口
 
-    // ---- Matmul (GEMM) 路径：prefill 批量投影 ----
+    // ================================================================
+    // Matmul (GEMM) 路径：prefill 批量投影
+    // ================================================================
     //
     // Y[M,N] = W[M,K] × X[K,N]。X 和 Y 按列主序存储：每列 = 一个 token 的向量。
     // W 行主序（与 matvec 共用同一份权重布局）。
     // N=1 时退化为 matvec，但专门的 matvec kernel 通常更快（少 loop overhead）。
+
+    // f32 matmul 签名
     using MatmulFn = void (*)(const float *w, const float *x, float *y,
                               int M, int K, int N);
-    void register_matmul_impl(const char *name, MatmulFn fn);
-    bool set_matmul_impl_by_name(const char *name);
-    void matmul_f32(const float *w, const float *x, float *y, int M, int K, int N);
+    void register_matmul_impl(const char *name, MatmulFn fn);    // 注册
+    bool set_matmul_impl_by_name(const char *name);               // 按名字选择
+    void matmul_f32(const float *w, const float *x, float *y, int M, int K, int N);  // 通用入口
 
+    // INT4 matmul 签名
     using MatmulI4Fn = void (*)(const uint8_t *w, const float *x, float *y,
                                 int M, int K, int N, int group_size);
-    void register_matmul_i4_impl(const char *name, MatmulI4Fn fn);
+    void register_matmul_i4_impl(const char *name, MatmulI4Fn fn);  // 注册
     void matmul_i4(const uint8_t *w, const float *x, float *y,
-                   int M, int K, int N, int group_size);
+                   int M, int K, int N, int group_size);             // 通用入口
+
+    // ================================================================
+    // Matmul 自注册宏
+    // ================================================================
+    // 写在实现文件末尾、namespace tinyqwen 外部。
+    // 展开为一个 static const bool 变量，其初始化器调用 register_matmul_impl()，
+    // 在 main() 之前的静态初始化阶段完成注册。
 
 #define TINYQWEN_MATMUL_VARIANT(fn, name)                                              \
     [[maybe_unused]] static const bool tqwen_reg_mm_## fn =                             \
@@ -149,7 +211,9 @@ namespace tinyqwen {
     [[maybe_unused]] static const bool tqwen_reg_mm_i4_## fn =                          \
             (tinyqwen::register_matmul_i4_impl(name, fn), true)
 
-    // ---- 非 matvec 算子分发（ops dispatch）----
+    // ================================================================
+    // 非 matvec 算子分发（ops dispatch）
+    // ================================================================
     //
     // rmsnorm / rope / attention_decode / swiglu / argmax 这五个算子在
     // forward_token 里原来直调 *_ref。这里给它们各建一个小注册表，共享同一个
@@ -158,6 +222,8 @@ namespace tinyqwen {
     // 行为不变，优化变体（NEON）自注册后才生效。
     //
     // 函数指针签名与 ref_ops.h 里的 _ref 完全一致（argmax 返回 int）。
+
+    // ---- 函数指针类型别名 ----
     using RmsnormFn = void (*)(const float *x, const float *weight, float *y, int n, float eps);
     using RopeFn = void (*)(float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
                             int pos, float theta);
@@ -167,17 +233,21 @@ namespace tinyqwen {
     using SwigluFn = void (*)(float *gate, const float *up, int n);
     using ArgmaxFn = int (*)(const float *logits, int n);
 
+    // ---- 注册函数 ----
     void register_rmsnorm_impl(const char *name, RmsnormFn fn);
     void register_rope_impl(const char *name, RopeFn fn);
     void register_attention_decode_impl(const char *name, AttentionDecodeFn fn);
     void register_swiglu_impl(const char *name, SwigluFn fn);
     void register_argmax_impl(const char *name, ArgmaxFn fn);
 
-    // 按名字选择 ops 实现（所有非 matvec 算子共用一个名字）。找到任一注册即返回 true。
+    // 按名字选择 ops 实现（所有非 matvec 算子共用一个名字）。
+    // "ref" 恒接受（清空当前名，各入口自动落回 _ref）。
+    // 其余名字只要任一算子注册了该名就接受（允许部分算子有变体、其余兜底 ref）。
     bool set_ops_impl_by_name(const char *name);
-    const char *ops_impl_name();
+    const char *ops_impl_name();  // 当前 ops 实现名（未选择时为 "ref"）
 
-    // 通用入口：model 调这些而不是直调 _ref。未注册的算子自动兜底到 _ref。
+    // ---- 通用入口：model 调这些而不是直调 _ref ----
+    // 未注册的算子自动兜底到 _ref，行为与 v1 完全一致。
     void rmsnorm(const float *x, const float *weight, float *y, int n, float eps);
     void rope(float *q, float *k, int n_heads, int n_kv_heads, int head_dim, int pos,
               float theta);
@@ -187,7 +257,9 @@ namespace tinyqwen {
     void swiglu(float *gate, const float *up, int n);
     int argmax(const float *logits, int n);
 
-    // ---- GPU decode engine 分发 ----
+    // ================================================================
+    // GPU decode engine 分发
+    // ================================================================
     //
     // 与上面"逐算子"分发不同：这是一个"整段 forward"级的可插拔入口。engine
     // 把权重/激活/KV cache 全部常驻显存，decode_step 在单条 CUDA stream 上
@@ -200,8 +272,10 @@ namespace tinyqwen {
     //
     // model_file 以 const void* 传递（实为 const ModelFile*），避免本头文件
     // 依赖 runtime 的 model_loader.h；engine 的 .cu 里再 cast 回去。
-    struct GpuDecodeEngine; // opaque
 
+    struct GpuDecodeEngine;  // opaque 前向声明
+
+    // GPU decode engine 的五个函数指针类型
     using GpuDecodeCreateFn = bool (*)(const void *model_file, int max_seq_len,
                                        std::string *err, GpuDecodeEngine **out);
     using GpuDecodeStepFn = int (*)(GpuDecodeEngine *e, int token_id);
@@ -209,26 +283,32 @@ namespace tinyqwen {
     using GpuDecodeDestroyFn = void (*)(GpuDecodeEngine *e);
     using GpuDecodeLogitsFn = const float *(*)(const GpuDecodeEngine *e);
 
+    // 注册 GPU decode engine（五个函数指针一起登记）
     void register_gpu_decode_impl(const char *name, GpuDecodeCreateFn create,
                                   GpuDecodeStepFn step, GpuDecodeResetFn reset,
                                   GpuDecodeDestroyFn destroy, GpuDecodeLogitsFn logits);
-    bool set_gpu_decode_impl_by_name(const char *name);
-    const char *gpu_decode_impl_name(); // 未选择时为 ""
-    const char *available_gpu_decode_impls();
+    bool set_gpu_decode_impl_by_name(const char *name);  // 按名字选择
+    const char *gpu_decode_impl_name();                   // 当前名字（未选择时为 ""）
+    const char *available_gpu_decode_impls();             // 所有已注册名
 
-    // 通用入口。create 在未选择实现时返回 false（调用方回退 CPU forward）。
-    bool gpu_decode_available();
+    // GPU decode 通用入口。create 在未选择实现时返回 false（调用方回退 CPU forward）。
+    bool gpu_decode_available();  // 是否有 GPU 实现可用
     bool gpu_decode_create(const void *model_file, int max_seq_len, std::string *err,
                            GpuDecodeEngine **out);
     int gpu_decode_step(GpuDecodeEngine *e, int token_id);
     void gpu_decode_reset(GpuDecodeEngine *e);
     void gpu_decode_destroy(GpuDecodeEngine *e);
-    const float *gpu_decode_logits(const GpuDecodeEngine *e); // device 指针（供 dump）
+    const float *gpu_decode_logits(const GpuDecodeEngine *e);  // device 指针（供 dump）
 
-    // ---- GDN（Gated DeltaNet）算子分发 ----
+    // ================================================================
+    // GDN（Gated DeltaNet）算子分发
+    // ================================================================
     //
     // Qwen3.5 的 GDN 层专属算子：l2norm / causal conv1d / gated delta rule 递归 /
-    // 门控 RMSNorm。与上面五个算子共用同一个实现名（--ops-impl neon 同时启用）。
+    // 门控 RMSNorm。与上面五个传统算子共用同一个实现名（--ops-impl neon 同时启用）。
+    // 每个 GDN 层调用：1 次 conv1d + 32 次 l2norm + 16 次 gdn_step + 16 次 rmsnorm_gated。
+
+    // ---- GDN 函数指针类型别名 ----
     using CausalConv1dUpdateFn = void (*)(const float *x, float *conv_state,
                                           const float *weight, float *out,
                                           int dim, int kernel_size);
@@ -238,11 +318,13 @@ namespace tinyqwen {
     using RmsnormGatedFn = void (*)(const float *x, const float *gate, const float *weight,
                                     float *y, int n, float eps);
 
+    // ---- GDN 注册函数 ----
     void register_causal_conv1d_update_impl(const char *name, CausalConv1dUpdateFn fn);
     void register_l2norm_inplace_impl(const char *name, L2normInplaceFn fn);
     void register_gdn_step_impl(const char *name, GdnStepFn fn);
     void register_rmsnorm_gated_impl(const char *name, RmsnormGatedFn fn);
 
+    // ---- GDN 通用入口：model 调这些而不是直调 _ref ----
     void causal_conv1d_update(const float *x, float *conv_state, const float *weight,
                               float *out, int dim, int kernel_size);
     void l2norm_inplace(float *x, int n, float eps);
@@ -252,15 +334,27 @@ namespace tinyqwen {
                        float *y, int n, float eps);
 } // namespace tinyqwen
 
-// 变体自注册宏：写在实现文件末尾、namespace tinyqwen 内部（fn 要用非限定名）。
+// ============================================================================
+// 变体自注册宏
+// ============================================================================
+// 写在实现文件末尾、namespace tinyqwen 内部（fn 要用非限定名）。
 // 静态 bool 注册器在 main 之前运行（与 tests/test_framework.h 的
 // tinytest::Registrar 同款模式）。注意：所在 .cpp 必须真正被链接进来
 // （kernels 是 OBJECT 库，所有 .o 都会链入，见 kernels/CMakeLists.txt）。
+//
+// 宏展开原理：
+//   [[maybe_unused]] static const bool tqwen_reg_<fn> =
+//       (tinyqwen::register_xxx_impl(name, fn), true);
+// 逗号表达式先执行 register 调用（返回 void），再取 true 赋给 bool。
+// static const bool 的初始化发生在程序启动的静态初始化阶段（main 之前）。
+// [[maybe_unused]] 抑制"变量未被使用"的编译器警告。
+
+// ---- matvec f32 自注册宏 ----
 #define TINYQWEN_MATVEC_VARIANT(fn, name)                                            \
     [[maybe_unused]] static const bool tqwen_reg_## fn =                              \
             (tinyqwen::register_matvec_impl(name, fn), true)
 
-// pair 实现的自注册宏（同上，登记进 pair 注册表；key 与 matvec 实现同名，
+// pair 实现的自注册宏（登记进 pair 注册表；key 与 matvec 实现同名，
 // matvec_pair_f32 按当前 impl 名查表）。
 #define TINYQWEN_MATVEC_PAIR_VARIANT(fn, name)                                       \
     [[maybe_unused]] static const bool tqwen_reg_pair_## fn =                         \
@@ -297,7 +391,9 @@ namespace tinyqwen {
     [[maybe_unused]] static const bool tqwen_reg_qkv_i4_## fn =                       \
             (tinyqwen::register_matvec_qkv_i4_impl(name, fn), true)
 
-// 非 matvec 算子的自注册宏（各登记进对应算子注册表；key 用同一个实现名）。
+// ---- 非 matvec 算子的自注册宏 ----
+// 各登记进对应算子注册表；key 用同一个实现名。
+
 #define TINYQWEN_RMSNORM_VARIANT(fn, name)                                           \
     [[maybe_unused]] static const bool tqwen_reg_rmsnorm_## fn =                      \
             (tinyqwen::register_rmsnorm_impl(name, fn), true)
@@ -328,7 +424,9 @@ namespace tinyqwen {
                                                 reset_fn, destroy_fn, logits_fn),     \
              true)
 
-// GDN 算子的自注册宏（共用 ops 实现名）。
+// ---- GDN 算子的自注册宏 ----
+// 共用 ops 实现名（--ops-impl neon 同时启用所有 GDN NEON 算子）。
+
 #define TINYQWEN_CAUSAL_CONV1D_UPDATE_VARIANT(fn, name)                              \
     [[maybe_unused]] static const bool tqwen_reg_conv1d_## fn =                       \
             (tinyqwen::register_causal_conv1d_update_impl(name, fn), true)

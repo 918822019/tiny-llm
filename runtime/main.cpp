@@ -1,25 +1,39 @@
-// tinyqwen CLI：命令行入口，把"加载模型 -> 前向 -> 输出"串起来。
+// ============================================================================
+// main.cpp — tinyqwen 命令行入口
+// ============================================================================
+// 本文件是整个 tiny-llm 推理引擎的命令行入口，负责将"加载模型 → 前向推理
+// → 输出结果"这一完整流程串联起来。支持两种推理模式：
 //
+// 1. 单条推理模式：
+//      加载一个 .tqwen 模型文件，对一组 prompt token 做 prefill（预填充）
+//      然后进入 decode（逐 token 生成）循环，输出生成的 token 序列。
+//
+// 2. 批量测试模式（--batch-tokens-jsonl）：
+//      一次进程加载模型，对 JSONL 中每条 prompt 独立做 reset → prefill → decode，
+//      输出每条的时间测量结果（TTFT、每步 decode 耗时）到 JSON 文件。
+//
+// 推理分为两个阶段（概念见 docs/infra_primer.md 第 2 节）：
+//   - prefill（预填充）：把输入的每个 prompt token 依次喂进模型，填满 KV cache，
+//     最后一步产出第一个生成 token；
+//   - decode（解码）：之后每步把上一步生成的 token 再喂回去，生成下一个，循环。
+//
+// 典型用法：
 //   tinyqwen --model model.tqwen \
 //            --tokens-json prompt_tokens.json \
 //            --max-new-tokens 16 \
 //            --profile-out profile.json
 //
-// 推理分两个阶段（概念见 docs/infra_primer.md 第 2 节）：
-//   - prefill：把输入的每个 prompt token 依次喂进模型，填满 KV cache，
-//     最后一步产出第一个生成 token；
-//   - decode：之后每步把上一步生成的 token 再喂回去，生成下一个，循环。
-//
 // token ids 来自 Python（tools/tokenize_prompt.py）：v1 的 C++ 侧刻意不内置
 // tokenizer（分词与研究主线无关，复用现成工具即可）。
+// ============================================================================
 
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <string>
-#include <vector>
+#include <chrono>       // 高精度计时（std::chrono::steady_clock）
+#include <cstdio>        // 标准输入输出（fprintf, printf, fflush）
+#include <cstdlib>       // 标准库（atoi, exit）
+#include <cstring>       // C 字符串操作
+#include <memory>        // 智能指针（std::unique_ptr, std::make_unique）
+#include <string>        // C++ 字符串
+#include <vector>        // 动态数组
 
 #include "backend_cpu.h"
 #include "config.h"
@@ -33,32 +47,30 @@
 #endif
 
 namespace {
+    // 命令行参数结构体：集中存储所有 CLI 选项
     struct Args {
-        std::string model;
-        std::string tokens_csv;
-        std::string tokens_json;
-        // 批量模式（数据集测试）：JSONL 每行一个 {"tokens":[...]}，一次进程
-        // 逐条独立 prefill+decode；--batch-out 写每条的 TTFT/decode 时序 JSON。
-        std::string batch_tokens_jsonl;
-        std::string batch_out;
-        std::string profile_out;
-        std::string dump_logits;
-        int max_new_tokens = 16;
-        int max_seq_len = 1024;
-        int topk = 0;
-        // 停止符：-2 = 按模型自动（v2 文件头带 eos_token_id 就用它，否则
-        // Qwen2.5 的 im_end 151645）；-1 = 禁用；其余值 = 显式指定。
-        int eos = -2;
-        bool verbose = false;
-        bool no_fuse_gate_up = false;
-        bool no_fuse_qkv = false;
-        std::string config; // 配置文件路径（可选）
-        std::string matvec_impl; // matvec 实现；空 = 未指定，交给配置/默认值
-        std::string ops_impl; // 非 matvec 算子实现；空 = 未指定，交给配置/默认值
-        std::string engine; // decode engine；空 = CPU forward（默认），"cuda" = GPU 常驻
-        std::string backend; // 计算后端；空 = CPU（默认），"cuda" = CUDA 后端
+        std::string model;             // 模型文件路径（.tqwen），必选
+        std::string tokens_csv;        // CSV 格式 token 列表（如 "1,2,3"）
+        std::string tokens_json;       // JSON 格式 token 文件
+        std::string batch_tokens_jsonl; // 批量输入 JSONL 文件路径
+        std::string batch_out;          // 批量输出 JSON 文件路径
+        std::string profile_out;        // 性能剖析输出 JSON 路径
+        std::string dump_logits;        // 输出 logits 的二进制文件路径
+        int max_new_tokens = 16;        // 最大生成 token 数，默认 16
+        int max_seq_len = 1024;         // KV cache 容量（最大序列长度），默认 1024
+        int topk = 0;                   // 输出 top-k logits 的行数，0 表示关闭
+        int eos = -2;                   // 停止符：-2=自动，-1=禁用，其余值=显式指定
+        bool verbose = false;           // 是否输出详细调试信息
+        bool no_fuse_gate_up = false;   // 禁用 gate/up 投影融合
+        bool no_fuse_qkv = false;       // 禁用 Q/K/V 投影融合
+        std::string config;             // 配置文件路径（可选）
+        std::string matvec_impl;        // matvec 实现选择；空 = 未指定
+        std::string ops_impl;           // 非 matvec 算子实现；空 = 未指定
+        std::string engine;             // decode engine；空 = CPU forward（默认）
+        std::string backend;            // 计算后端；空 = CPU（默认）
     };
 
+    // 打印命令行帮助信息
     void usage(const char *prog) {
         std::fprintf(stderr,
                      "usage: %s --model <model.tqwen> [options]\n"
@@ -89,10 +101,13 @@ namespace {
                      prog);
     }
 
+    // 解析命令行参数
+    // 返回值：成功返回 true，失败返回 false
     bool parse_args(int argc, char **argv, Args *out) {
+        // 从索引 1 开始遍历（跳过程序名 argv[0]）
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
-            // 取 flag 的值；缺值直接报错退出。
+            // value lambda：获取当前 flag 的下一个参数作为值，缺值则报错退出
             const auto value = [&](const char *flag) -> std::string {
                 if (i + 1 >= argc) {
                     std::fprintf(stderr, "error: %s needs a value\n", flag);
@@ -132,7 +147,7 @@ namespace {
             std::fprintf(stderr, "error: --model is required\n");
             return false;
         }
-        // 三种输入模式必须且只能提供一个。
+        // 三种输入模式必须且只能提供一个
         const bool has_batch = !out->batch_tokens_jsonl.empty();
         const int modes = (!out->tokens_csv.empty()) + (!out->tokens_json.empty()) + has_batch;
         if (modes != 1) {
@@ -141,9 +156,6 @@ namespace {
             return false;
         }
         if (has_batch) {
-            // batch 的输出契约是纯时序测量：混入 topk/logits 行会让 stdout 不
-            // 可解析；engine 没有批量 prefill 入口；op 级 profiler 跨 prompt
-            // 累积会爆内存（TTFT/decode 在 batch 循环里用 steady_clock 手测）。
             if (out->topk > 0 || !out->dump_logits.empty() || out->verbose ||
                 !out->engine.empty() || !out->profile_out.empty()) {
                 std::fprintf(stderr, "error: --batch-tokens-jsonl cannot be combined with "
@@ -158,7 +170,8 @@ namespace {
         return true;
     }
 
-    // "--tokens 1,2,3" -> ids。容忍空格；遇到非法字符直接报错。
+    // 解析 CSV 格式的 token ID 列表（如 "1,2,3"）
+    // 容忍空格，遇到非法字符直接报错
     std::vector<int> parse_csv(const std::string &s) {
         std::vector<int> ids;
         size_t i = 0;
@@ -177,9 +190,8 @@ namespace {
         return ids;
     }
 
-    // 从 JSON 文本中做最小化的 "tokens" 整数数组提取；不引 JSON 依赖。
-    // 约定见 tools/tokenize_prompt.py 的输出格式。what 用于报错定位
-    // （文件路径或 "<path> line N"）。
+    // 从 JSON 文本中最小化提取 "tokens" 整数数组，不引入 JSON 解析库依赖
+    // 参数 what 用于报错定位（文件路径或 "<path> line N"）
     std::vector<int> parse_tokens_from_string(const std::string &text, const char *what) {
         size_t key = text.find("\"tokens\"");
         if (key == std::string::npos) {
@@ -205,7 +217,7 @@ namespace {
         return ids;
     }
 
-    // 读整个文件后调上面的扫描；单 prompt 路径（--tokens-json）用。
+    // 从 JSON 文件读取 token 列表（单 prompt 路径用）
     std::vector<int> parse_tokens_json(const std::string &path) {
         FILE *f = std::fopen(path.c_str(), "rb");
         if (!f) {
@@ -222,8 +234,8 @@ namespace {
         return parse_tokens_from_string(text, path.c_str());
     }
 
-    // 批量模式输入：JSONL，每行一个 {"tokens": [...]}。空行跳过（文件末尾
-    // 多一个换行是常态）；非空坏行 fail fast 带行号。
+    // 解析批量输入 JSONL 文件，每行一个 {"tokens": [...]}
+    // 空行跳过，非空坏行 fail fast 带行号
     std::vector<std::vector<int>> parse_batch_jsonl(const std::string &path) {
         FILE *f = std::fopen(path.c_str(), "rb");
         if (!f) {
@@ -274,9 +286,7 @@ int main(int argc, char **argv) {
     }
 
     // ---- 解析 matvec 实现名：CLI > 配置文件 > 默认 ref ----
-    // 实现名由各 kernel 文件自注册（dispatch.h），这里只按名字查表——
-    // 新增变体不需要改这段代码。
-    std::string impl_name = args.matvec_impl; // 非空 = CLI 显式指定
+    std::string impl_name = args.matvec_impl;
     if (impl_name.empty()) impl_name = config.get("matvec_impl", "ref");
 
     // ---- 加载权重文件并校验 ----
@@ -295,10 +305,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[init] eos: %d (auto)\n", args.eos);
     }
 
-    // ---- 按模型 dtype 选择 matvec 实现（f32/f16 各有独立注册表）----
-    // 加载模型在前、选实现在后：同一个实现名（如 "ref"/"neon_mt_kv_nt"）
-    // 在两个注册表里各有一份，按文件 dtype 查对应的表——f32 模型配
-    // f16 专属实现（或反过来）会在这里 fail fast，而不是静默兜底。
+    // ---- 按模型 dtype 选择 matvec 实现（f32/f16/i4 各有独立注册表）----
     const bool is_f16 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kF16);
     const bool is_i4 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kI4);
     if (is_i4) {
@@ -308,9 +315,6 @@ int main(int argc, char **argv) {
                          impl_name.c_str(), tinyqwen::available_matvec_i4_impls());
             return 2;
         }
-        // lm_head（tied embed，fp32）走 f32 注册表：优先同名实现，取不到退回
-        // 最强 f32 实现。不设的话 lm_head 落标量 ref——每 token 544MB fp32
-        // 是单项最大流量，曾占 i4 decode 90% 时间（实测 154/213 ms）。
         if (!tinyqwen::set_matvec_impl_by_name(impl_name.c_str())) {
             tinyqwen::set_matvec_impl_by_name("neon_mt_kv_nt");
         }
@@ -336,9 +340,6 @@ int main(int argc, char **argv) {
     }
 
     // ---- 选择非 matvec 算子实现（与 dtype 无关，五算子共用一个名）----
-    // 优先级 CLI > 配置 > 默认 ref。"ref" 是兜底行为（不注册、不 set），
-    // 其余名字（如 neon）查五个算子注册表，任一注册即接受、未注册的算子
-    // 自动兜底 ref。
     std::string ops_name = args.ops_impl;
     if (ops_name.empty()) ops_name = config.get("ops_impl", "ref");
     if (ops_name != "ref") {
@@ -350,14 +351,13 @@ int main(int argc, char **argv) {
     }
     std::fprintf(stderr, "[init] ops impl: %s\n", tinyqwen::ops_impl_name());
 
-    // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作。
+    // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作
     tinyqwen::Profiler profiler(!args.profile_out.empty());
     const bool is_qwen35 = file.config().model_type == tinyqwen::ModelType::kQwen35;
     profiler.set_meta(is_qwen35 ? "qwen3.5-hybrid" : "qwen2.5-like", "cpu_ref",
                       is_f16 ? "f16w_fp32a" : "fp32");
 
-    // ---- 建模：校验权重、分配 KV cache 和 workspace ----
-    // 创建后端（默认 CPU，可选 CUDA）
+    // ---- 创建后端（默认 CPU，可选 CUDA）----
     std::unique_ptr<tinyqwen::IBackend> backend;
     if (args.backend == "cuda") {
 #ifdef TINYQWEN_HAS_CUDA
@@ -374,6 +374,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    // ---- 建模：校验权重、分配 KV cache 和 workspace ----
     std::unique_ptr<tinyqwen::QwenModel> model;
     if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model, std::move(backend))) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
@@ -387,10 +388,6 @@ int main(int argc, char **argv) {
     }
 
     // ---- 批量模式（数据集测试）：一次进程顺序跑多条 prompt ----
-    // 每条独立 reset → prefill → decode；TTFT / 逐步 decode 用 steady_clock
-    // 手测，不开 op 级 profiler（跨 prompt 累积会爆内存，且本模式的契约是纯
-    // 时序测量）。与 --topk/--dump-logits/--verbose/--engine/--profile-out
-    // 互斥（parse_args 已拦）。
     if (!args.batch_tokens_jsonl.empty()) {
         const std::vector<std::vector<int>> prompts = parse_batch_jsonl(args.batch_tokens_jsonl);
         if (prompts.empty()) {
@@ -432,8 +429,6 @@ int main(int argc, char **argv) {
                 return 2;
             }
 
-            // 关键：reset 只清 KV/GDN/token_count_，prompt_len_ 必须每条重设，
-            // 否则 forward 内部的 is_prefill 判定会错乱。
             model->reset();
             model->set_prompt_len(n);
 
@@ -453,7 +448,7 @@ int main(int argc, char **argv) {
                                  pi + 1, prompts.size(), args.eos, step);
                     break;
                 }
-                if (step + 1 == args.max_new_tokens) break; // 最后一个 token 不再前向
+                if (step + 1 == args.max_new_tokens) break;
                 const auto ts = Clock::now();
                 next = model->forward_token(next, nullptr, 0);
                 const auto te = Clock::now();
@@ -463,7 +458,6 @@ int main(int argc, char **argv) {
             }
             r.generated_tokens = static_cast<int>(generated.size());
 
-            // stdout 契约：与单 prompt 模式同格式，每条一行、顺序对应 JSONL 行序。
             std::printf("generated_ids:");
             for (int id: generated) std::printf(" %d", id);
             std::printf("\n");
@@ -474,8 +468,6 @@ int main(int argc, char **argv) {
         }
         const double wall_ms = ms_since(wall_start, Clock::now());
 
-        // 手写结果 JSON（同 profiler 风格，不引第三方库）。C++ 只出原始数，
-        // 统计口径（分桶/中位数）留给 Python 侧。
         FILE *f = std::fopen(args.batch_out.c_str(), "w");
         if (!f) {
             std::fprintf(stderr, "error: cannot write %s\n", args.batch_out.c_str());
@@ -510,9 +502,6 @@ int main(int argc, char **argv) {
     }
 
     // ---- 选择 decode engine（GPU-resident forward，opt-in）----
-    // 默认空 = CPU forward（参考路径）。--engine cuda 时把整段 forward 搬上
-    // GPU：权重/激活/KV 常驻显存，单 stream 跑完，只有 token id 过 PCIe。
-    // CPU 的 forward_token 原样保留作参考；engine 创建失败即报错（fail fast）。
     std::string engine_name = args.engine;
     if (engine_name.empty()) engine_name = config.get("engine", "");
     tinyqwen::GpuDecodeEngine *engine = nullptr;
@@ -522,7 +511,6 @@ int main(int argc, char **argv) {
                          engine_name.c_str(), tinyqwen::available_gpu_decode_impls());
             return 2;
         }
-        // v1：engine 路径只支持 greedy，--topk / --dump-logits 暂不支持。
         if (args.topk > 0 || !args.dump_logits.empty()) {
             std::fprintf(stderr,
                          "error: --topk / --dump-logits 在 --engine 下暂不支持（v1）\n");
@@ -537,8 +525,7 @@ int main(int argc, char **argv) {
                      tinyqwen::gpu_decode_impl_name());
     }
 
-    // engine 路径下由 main 驱动 profiler（forward_token 被绕过，不再自己记）。
-    // pos = 当前 KV 长度 = 已处理 token 数，与 forward_token 内部口径一致。
+    // engine 路径下由 main 驱动 profiler（forward_token 被绕过，不再自己记）
     int engine_token_idx = 0;
     const auto engine_step = [&](int token, bool is_prefill) -> int {
         profiler.begin_token(engine_token_idx, engine_token_idx, is_prefill);
@@ -548,15 +535,14 @@ int main(int argc, char **argv) {
         return nxt;
     };
 
-    // prompt 的 token ids（由 Python 侧 tools/tokenize_prompt.py 生成；
-    // v1 按设计不在 C++ 里做 tokenizer）。
+    // prompt 的 token ids（由 Python 侧 tools/tokenize_prompt.py 生成）
     std::vector<int> tokens =
             args.tokens_csv.empty() ? parse_tokens_json(args.tokens_json) : parse_csv(args.tokens_csv);
     if (tokens.empty()) {
         std::fprintf(stderr, "error: empty token list\n");
         return 2;
     }
-    // 融合开关：CLI > 配置文件 > 默认 true。
+    // 融合开关：CLI > 配置文件 > 默认 true
     const bool fuse_gate_up = args.no_fuse_gate_up ? false
                               : config.get("fuse_gate_up", "true") != "false";
     const bool fuse_qkv = args.no_fuse_qkv ? false
@@ -565,6 +551,7 @@ int main(int argc, char **argv) {
     model->set_fuse_qkv(fuse_qkv);
     model->set_prompt_len(static_cast<int>(tokens.size()));
 
+    // 打开 logits 输出文件（如果指定了 --dump-logits）
     FILE *logits_out = nullptr;
     if (!args.dump_logits.empty()) {
         logits_out = std::fopen(args.dump_logits.c_str(), "wb");
@@ -573,16 +560,14 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    // 每次 forward 追加一行 vocab 个 fp32 logits；行序与序列位置一一对应
-    // （tools/align_fake_model.py 依赖这个约定）。
+    // dump lambda：每次 forward 追加一行 vocab 个 fp32 logits
     const auto dump = [&]() {
         if (logits_out) {
             std::fwrite(model->last_logits(), sizeof(float), file.config().vocab_size, logits_out);
         }
     };
 
-    // 每个 "topk" 行描述的是下一个 "gen" 行 token 的分布
-    // （第一行在 prefill 结束后输出）。
+    // 打印 top-k 结果
     const auto print_topk = [](const tinyqwen::TopKResult &topk) {
         std::printf("topk");
         for (size_t i = 0; i < topk.indices.size(); ++i) {
@@ -592,8 +577,6 @@ int main(int argc, char **argv) {
     };
 
     // ---- prefill 阶段 ----
-    // 批量 GEMM 路径：一次处理所有 prompt token 的线性投影，显著降低延迟。
-    // verbose 模式退回逐 token 以输出每步中间结果。
     int next = 0;
     tinyqwen::TopKResult topk;
     if (engine) {
@@ -606,7 +589,7 @@ int main(int argc, char **argv) {
             }
         }
     } else if (args.verbose) {
-        // 逐 token：可打印每步详情
+        // 逐 token prefill：可打印每步详情
         for (size_t i = 0; i < tokens.size(); ++i) {
             const bool last_prefill = i + 1 == tokens.size();
             const bool need_topk = args.topk > 0 && last_prefill;
@@ -616,10 +599,7 @@ int main(int argc, char **argv) {
                          tokens[i], next);
         }
     } else {
-        // 批量 GEMM prefill。整批作为一条 prefill 记录计时：TTFT 需要它
-        // （此前这条路径完全没进 profiler，profile 里 prompt_tokens=0、
-        // first_token_ms=0、total_ms 也漏掉 prefill 耗时）。批量 GEMM 的算子
-        // 结构与逐 token 不同，不做 op 级拆分。
+        // 批量 GEMM prefill：整批作为一条 prefill 记录计时
         const bool need_topk = args.topk > 0;
         profiler.begin_token(0, 0, /*is_prefill=*/true);
         next = model->forward_prefill(tokens.data(), static_cast<int>(tokens.size()),
@@ -627,11 +607,9 @@ int main(int argc, char **argv) {
         profiler.end_token();
     }
     std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
-    if (args.topk > 0) print_topk(topk); // 第一个生成 token g0 的分数分布
+    if (args.topk > 0) print_topk(topk);
 
     // ---- decode 阶段 ----
-    // 循环：把上一步的输出当作下一步的输入，每次生成一个新 token，
-    // 直到凑够 max_new_tokens 或遇到停止符 eos。
     std::vector<int> generated;
     for (int step = 0; step < args.max_new_tokens; ++step) {
         generated.push_back(next);
@@ -640,25 +618,22 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "[decode] hit eos %d at step %d\n", args.eos, step);
             break;
         }
-        if (step + 1 == args.max_new_tokens) break; // 最后一个 token 不用再前向
+        if (step + 1 == args.max_new_tokens) break;
         if (engine) {
-            next = engine_step(next, false); // GPU-resident forward
+            next = engine_step(next, false);
         } else {
             next = model->forward_token(next, args.topk > 0 ? &topk : nullptr, args.topk);
             dump();
         }
-        if (args.topk > 0) print_topk(topk); // 下一个 gen token 的分布
+        if (args.topk > 0) print_topk(topk);
     }
 
     std::printf("generated_ids:");
     for (int id: generated) std::printf(" %d", id);
     std::printf("\n");
 
-    // 显式声明真实计数，覆盖"按记录数推导"的口径偏差：
-    // 批量 prefill 只有一条记录（≠ prompt 长度）；decode 步数 = 生成数 - 1。
     profiler.set_counts(tokens.size(), generated.size());
 
-    // 释放 GPU engine（若有）。CPU 路径无操作。
     if (engine) tinyqwen::gpu_decode_destroy(engine);
 
     if (!args.profile_out.empty()) {

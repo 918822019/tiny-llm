@@ -1,37 +1,53 @@
+# =============================================================================
+# model_f16.yaml —— Qwen2.5-0.5B FP16 满栈模型注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件记录 FP16 量化模型的元数据、推荐配方和基准数据。
+#   FP16 将权重从 4 字节/元素压缩到 2 字节/元素，模型大小减半，
+#   同时内存带宽需求减半，是该项目的推荐推理精度。
+#
+#   与 FP32 基线相比，FP16 满栈（NEON + 线程池 + kv 融合 + LDNP）
+#   在 Android 设备上实现了约 40 倍的加速（695ms -> 17ms per token）。
+# =============================================================================
+
 # Model registry: model_f16.tqwen（Qwen2.5-0.5B f16 满栈）
 name: model_f16
 architecture: qwen2.5
 source: Qwen/Qwen2.5-0.5B
-dtype: f16
+dtype: f16                   # 权重数据类型：FP16（半精度浮点）
 file: model_f16.tqwen
-size_mb: 942.3
+size_mb: 942.3               # 约为 FP32 的一半（1884.5 / 2）
 
+# 模型结构参数（与 FP32 基线相同）
 params:
-  n_layers: 24
-  hidden_size: 896
-  intermediate_size: 4864
-  n_heads: 14
-  n_kv_heads: 2
-  head_dim: 64
-  vocab_size: 151936
-  tied_embeddings: true
+  n_layers: 24               # Transformer 层数
+  hidden_size: 896           # 隐藏层维度
+  intermediate_size: 4864    # FFN 中间层维度
+  n_heads: 14                # Query 注意力头数
+  n_kv_heads: 2              # Key/Value 注意力头数（GQA）
+  head_dim: 64               # 每个注意力头的维度
+  vocab_size: 151936         # 词表大小
+  tied_embeddings: true      # 嵌入层和输出层共享权重
 
+# 量化配置：FP16 不是量化，而是原生半精度导出
 quantization:
-  method: none
-  group_size: null
-  lm_head_quantized: false
+  method: none               # 无量化方法（原生 FP16 导出）
+  group_size: null           # 不适用
+  lm_head_quantized: false   # lm_head 保持 FP16
 
+# 推荐的计算配方：FP16 满栈（当前最快组合）
 recipe:
-  matvec_impl: neon_mt_kv_nt
-  ops_impl: neon
+  matvec_impl: neon_mt_kv_nt # 矩阵乘：NEON + 线程池 + kv 融合 + LDNP 流式加载
+  ops_impl: neon             # 非 matvec 算子：NEON 向量化
   note: f16 满栈（NEON + 线程池 + k/v 融合 + LDNP），已抵达带宽墙
 
+# 基准测试结果
 benchmark:
   android:
-    topt_ms: 17.05
-    ttft_ms: 96.21
-    peak_rss_mb: 949.1
-    pmu_dram_bw_gbps: 29.6
-    device: PLK110
-    commit: 54d05f4
+    topt_ms: 17.05           # 每个 token 生成时间（凉机器，最优值）
+    ttft_ms: 96.21           # 首个 token 时间
+    peak_rss_mb: 949.1       # 峰值内存占用
+    pmu_dram_bw_gbps: 29.6   # PMU 测量的 DRAM 带宽（Gbps）
+    device: PLK110           # 测试设备
+    commit: 54d05f4          # 测试时对应的 git commit
     note: 跨模型同场 A/B 满血值（凉 17.05 / 热 21.16，带宽瓶颈随温度漂）

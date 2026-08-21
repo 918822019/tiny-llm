@@ -1,36 +1,87 @@
 #!/usr/bin/env python3
 """Android 端侧优化记录：稳定测速 + 自动写入 optimization_log.md。
 
-与 record_optimization.py 对等——区别仅在于测量跑在 Android 设备上。
-日志写入同一个文件、用同样的标记和格式，便于全局对比。
+与 record_optimization.py 对等——区别仅在于测量跑在 Android 设备上（通过 adb）。
+日志写入同一个文件（docs/optimization_log.md）、用同样的标记和格式，便于全局对比。
+
+工作流程：
+    1. 推送 binary 和模型到 Android 设备
+    2. 在设备上执行标准测速（复用 bench_android.measure / measure_ab）
+    3. 读取 Android 基线算加速比
+    4. 往 docs/optimization_log.md 追加：汇总表一行 + 详细小节
+    5. 追加 benchmarks/history_android.jsonl 结构化历史
 
 用法：
+    # 基本记录
     python tools/record_android.py --label neon-android --runs 3
+    # 带额外参数（自动进入同场 A/B 模式）
     python tools/record_android.py --label neon-android --runs 3 --extra-args "--matvec-impl neon"
+    # 跨 dtype A/B
+    python tools/record_android.py --label i4-android --model model_i4.tqwen \\
+        --control-model model.tqwen --runs 3
+
+输入：
+    - Android 设备通过 adb 连接
+    - build-android/runtime/tinyqwen 交叉编译产物
+    - .tqwen 模型文件
+
+输出：
+    - docs/optimization_log.md 追加表格行和详细小节
+    - benchmarks/history_android.jsonl 追加一行
+    - 终端打印结果摘要
 """
 
+# 启用延迟注解求值
 from __future__ import annotations
 
-import argparse
-import datetime
-import json
-import shlex
-import sys
-from pathlib import Path
+# ---- 标准库导入 ----
+import argparse       # 命令行参数解析
+import datetime       # 日期格式化（详细小节标题）
+import json           # JSON 读取（基线文件）
+import shlex          # shell 字符串安全分割
+import sys            # 系统退出
+from pathlib import Path  # 路径操作
 
+# 把 tools/ 目录加入搜索路径
 sys.path.insert(0, str(Path(__file__).parent))
-import bench  # noqa: E402
-import bench_android  # noqa: E402
-import record_optimization as rec  # noqa: E402
+import bench  # noqa: E402              # 复用 env_info
+import bench_android  # noqa: E402      # 复用设备测速、资源采样、adb helpers
+import record_optimization as rec  # noqa: E402  # 复用日志写入工具函数
 
 
 def build_detail_android(label, commit, med, p95, runs, last, vs_prev_str,
                          base_note, dev_env, extra_suffix="", model_prefix="",
                          verify_note="scripts/verify_android.sh（golden token 逐位对照）",
                          resource_note="未采样") -> str:
-    today = datetime.date.today().isoformat()
+    """构建 Android 优化记录的详细小节 Markdown 文本。
+
+    与 record_optimization.py 的 build_detail 结构一致，增加了设备信息和资源采样。
+    其中 <填...> 占位符由人工后续补全。
+
+    Args:
+        label: 配置标签名
+        commit: git commit hash
+        med: decode 中位延迟（ms）
+        p95: decode P95 延迟（ms）
+        runs: 测量遍数
+        last: 最后一遍的 summarize 字典
+        vs_prev_str: vs 上一配置的对比描述
+        base_note: 基线参照说明
+        dev_env: 设备环境信息字典
+        extra_suffix: 复现命令中的额外参数后缀
+        model_prefix: 复现命令中的 MODEL 环境变量前缀
+        verify_note: 验证方式说明
+        resource_note: 资源采样结果文本
+
+    Returns:
+        str: Markdown 格式的详细小节文本
+    """
+    today = datetime.date.today().isoformat()  # 今日日期（YYYY-MM-DD）
+    # 耗时 top 3 算子，用反引号包裹
     top_ops = "、".join(f"`{o['op']}`" for o in last["top_ops"][:3])
+    # 设备信息字符串
     device_str = f"{dev_env.get('device_model', '?')} / {dev_env.get('soc', '?')} / Android {dev_env.get('android_version', '?')}"
+    # 返回 Markdown 详细小节模板
     return f"""### {label}（{today}，Android）
 
 - **设备**：{device_str}
@@ -52,14 +103,19 @@ def build_detail_android(label, commit, med, p95, runs, last, vs_prev_str,
 
 
 def main() -> None:
+    """record_android.py 的主入口函数。
+
+    解析参数 → 推送文件 → 设备测速 → 读基线 → 写日志 → 追加历史。
+    """
+    # 创建参数解析器
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--label", required=True, help="本次优化的名字")
-    ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--binary", default=None)
-    ap.add_argument("--model", default="model.tqwen")
-    ap.add_argument("--baseline", default="benchmarks/baseline_android.json")
-    ap.add_argument("--log", default="docs/optimization_log.md")
+    ap.add_argument("--runs", type=int, default=3)                # 测量遍数
+    ap.add_argument("--binary", default=None)                     # binary 路径
+    ap.add_argument("--model", default="model.tqwen")             # 模型文件
+    ap.add_argument("--baseline", default="benchmarks/baseline_android.json")  # 基线文件
+    ap.add_argument("--log", default="docs/optimization_log.md")  # 日志文件
     ap.add_argument("--extra-args", default="",
                     help="原样传给设备端 binary 的额外 CLI 参数")
     ap.add_argument("--control-model", default=None,
@@ -74,20 +130,26 @@ def main() -> None:
                     help="覆盖 TINYQWEN_MT_THREADS（默认：绑核时 = 绑核数，不绑核时不设置）")
     args = ap.parse_args()
 
-    import os
+    import os  # 延迟导入 os（用于文件大小查询和路径比较）
+    # 解析额外参数
     extra = shlex.split(args.extra_args)
     control_extra = shlex.split(args.control_args)
     control_model = args.control_model or args.model
+    # 判断是否跨模型
     cross_model = os.path.abspath(control_model) != os.path.abspath(args.model)
+    # 有额外参数或跨模型时进入 A/B 模式
     ab_mode = bool(extra) or cross_model
+    # 构造复现命令的后缀部分
     extra_suffix = f' --extra-args "{args.extra_args.strip()}"' if extra else ""
     if cross_model:
         extra_suffix += f" --control-model {control_model}"
     if control_extra:
         extra_suffix += f' --control-args "{args.control_args.strip()}"'
 
+    # 确定 binary 路径
     build_dir = os.environ.get("BUILD_DIR", bench_android.BUILD_DIR_DEFAULT)
     binary = args.binary or f"{build_dir}/runtime/tinyqwen"
+    # 检查必要文件
     if not os.path.isfile(binary):
         sys.exit(f"error: binary not found: {binary}; run scripts/build_android.sh first")
     if not os.path.isfile(args.model):
@@ -95,6 +157,7 @@ def main() -> None:
     if not os.path.isfile(control_model):
         sys.exit(f"error: control model not found: {control_model}")
 
+    # 打印配置摘要
     print(f"[record-android] label={args.label} runs={args.runs}"
           + (f"  额外参数: {' '.join(extra)}（同场 A/B 模式）" if extra else "")
           + (f"  跨模型 A/B: {os.path.basename(control_model)} → "
@@ -104,44 +167,53 @@ def main() -> None:
     # 保证 record 的数字与 bench 口径一致、可直接对比。
     bench_android.configure_measurement(args.pin_cores, args.threads)
 
+    # 推送 binary 和模型到设备
     print("[record-android] pushing binary & model...")
     bench_android.ensure_binary_pushed(binary)
     variant_on_device = bench_android.ensure_model_pushed(args.model)
     control_on_device = (bench_android.ensure_model_pushed(control_model) if cross_model
                          else variant_on_device)
 
+    # 采集设备环境信息
     dev_env = bench_android.device_env_info()
     print(f"[record-android] device: {dev_env.get('device_model', '?')} "
           f"({dev_env.get('soc', '?')}) Android {dev_env.get('android_version', '?')}")
 
+    # ---- 执行测速 ----
     if ab_mode:
+        # A/B 模式：交错测对照和变体
         ctrl_med, ctrl_p95, med, p95, last, ctrl_res, var_res = \
             bench_android.measure_ab(
                 args.runs, variant_on_device, extra, control_on_device,
                 control_extra)
-        ab_ratio = ctrl_med / med if med > 0 else float("inf")
+        ab_ratio = ctrl_med / med if med > 0 else float("inf")  # 加速比
+        # 构造对照组描述
         if cross_model:
             control_desc = f"对照模型 {os.path.basename(control_model)} "
         elif control_extra:
             control_desc = f"对照（{' '.join(control_extra)}）"
         else:
             control_desc = "对照（无额外参数，当前即 ref）"
+        # vs 上一配置的描述文本
         vs_prev_str = (f"**{ab_ratio:.2f}×（同场 A/B）**——{control_desc}"
                        f"中位 {ctrl_med:.2f}（p95 {ctrl_p95:.2f}）→ 变体 {med:.2f}，"
                        f"同 binary 同场交错测量")
-        vs_prev_col = f"{ab_ratio:.2f}×（同场）"
+        vs_prev_col = f"{ab_ratio:.2f}×（同场）"  # 表格列用的简短版本
     else:
+        # 普通模式：只测变体
         med, p95, last, var_res = bench_android.measure(
             variant_on_device, args.runs, extra if extra else None)
         ctrl_res = None
-        vs_prev_str = None
+        vs_prev_str = None   # 下面与基线信息合并
         vs_prev_col = "—"
 
     # 资源采样：权重大小注入便于对账（RSS ≈ 权重 + KV cache + 其余）
     if var_res.get("mem") is not None:
         var_res["mem"]["model_mb"] = round(
             os.path.getsize(args.model) / (1024 * 1024), 1)
+    # 格式化资源采样为人类可读文本
     resource_note = "；".join(bench_android.format_resources(var_res)) or "未采样"
+    # 如果有对照组资源，也附加
     if cross_model and ctrl_res:
         if ctrl_res.get("mem") is not None:
             ctrl_res["mem"]["model_mb"] = round(
@@ -155,14 +227,15 @@ def main() -> None:
     if series_file:
         resource_note += f"；曲线 {series_file}"
 
+    # 采集 host 环境信息
     host_env = bench.env_info()
     commit = host_env["git_commit"]
 
-    # 读 Android 基线算加速比
+    # ---- 读 Android 基线算加速比 ----
     base_path = Path(args.baseline)
     if base_path.exists():
         base = json.loads(base_path.read_text())
-        vs_base = base["decode_median_ms"] / med
+        vs_base = base["decode_median_ms"] / med  # 加速比 = 基线延迟 / 本次延迟
         vs_base_str = f"{vs_base:.2f}×"
         base_note = (f"{base['label']}（{base['decode_median_ms']:.2f} ms/tok @ "
                      f"{base.get('device_model', base.get('commit', '?'))}），"
@@ -175,12 +248,12 @@ def main() -> None:
         # 基线漂移警告：用"参照中位"判断——A/B 模式用对照（它才是与基线
         # 同配置的量），否则用本次结果。>5% 说明机器状态或基线已过期。
         # 注意：仅当对照就是"默认配置"（同文件、无额外参数）时才有可比性；
-        # 跨配置对照与基线配置不同，跳过漂移检查（与 record_optimization.py 同款护栏）。
+        # 跨配置对照与基线配置不同，跳过漂移检查。
         default_control = control_model == args.model and not control_extra
         if ab_mode and not default_control:
             print("  [info] 跨配置对照，跳过基线漂移检查")
         else:
-            reference_med = ctrl_med if ab_mode else med
+            reference_med = ctrl_med if ab_mode else med  # 选择参照值
             drift = (reference_med - base["decode_median_ms"]) / base["decode_median_ms"]
             if abs(drift) > 0.05:
                 print(f"  ⚠️ 基线漂移警告：参照中位 {reference_med:.2f} vs 基线 "
@@ -192,25 +265,30 @@ def main() -> None:
         if vs_prev_str is None:
             vs_prev_str = "—"
 
-    # 写日志
+    # ---- 写日志 ----
     log_path = Path(args.log)
-    text = log_path.read_text()
-    label_with_device = f"{args.label}（Android）"
+    text = log_path.read_text()  # 读取现有日志内容
+    label_with_device = f"{args.label}（Android）"  # 表格中带设备标记
+    # 构建表格行
     row = rec.build_table_row(label_with_device, commit, med, p95, vs_base_str,
                               "<填：一句话归因>", vs_prev_col)
+    # 模型前缀：非默认模型需要设 MODEL 环境变量
     model_prefix = ("" if os.path.basename(args.model) == "model.tqwen"
                     else f"MODEL={args.model} ")
+    # 量化模型的验证方式不同（容差 vs 精确匹配）
     verify_note = ("scripts/verify_android.sh（量化容差口径，token diff 上限 2）"
                    if "_i4" in os.path.basename(args.model)
                    else "scripts/verify_android.sh（golden token 逐位对照）")
+    # 构建详细小节
     detail = build_detail_android(args.label, commit, med, p95, args.runs, last,
                                   vs_prev_str, base_note, dev_env, extra_suffix,
                                   model_prefix, verify_note, resource_note)
+    # 插入表格行（防断表）和详细小节
     text = rec.insert_table_row(text, rec.TABLE_MARKER, row)
     text = rec.insert_before(text, rec.DETAIL_MARKER, detail)
-    log_path.write_text(text)
+    log_path.write_text(text)  # 写回日志文件
 
-    # 结构化历史落盘（与 bench_android.py 的 jsonl 同源）
+    # ---- 结构化历史落盘（与 bench_android.py 的 jsonl 同源）----
     history_row = {
         "label": args.label,
         "model": os.path.basename(args.model),
@@ -237,6 +315,7 @@ def main() -> None:
         history_row["ab_control_resources"] = ctrl_res
     bench_android.append_history(history_row, source="record")
 
+    # ---- 打印结果摘要 ----
     print(f"\n[record-android] 已写入 {args.log}")
     print(f"  TTFT {last['ttft_ms']:.2f} ms（prefill {last['prefill_tokens']} tok）；"
           f"TOPT 中位 {med:.2f} ms/token（p95 {p95:.2f}）@ {commit}")
@@ -249,5 +328,6 @@ def main() -> None:
     print("  ⚠️ 请手动补全日志里的 <填...>：优化栈/是什么/假设/归因/教训")
 
 
+# 脚本直接运行入口
 if __name__ == "__main__":
     main()

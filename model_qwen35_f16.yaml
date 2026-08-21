@@ -1,47 +1,69 @@
+# =============================================================================
+# model_qwen35_f16.yaml —— Qwen3.5-0.8B FP16 混合架构模型注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件记录 Qwen3.5 混合架构模型的元数据。Qwen3.5 引入了 GDN
+#   （Gated Delta Network）层与标准 Full Attention 层交替排列的混合架构。
+#   GDN 层使用线性注意力（linear attention），通过卷积状态机
+#   和门控 delta 规则实现高效的长序列建模。
+#
+#   架构特点：
+#   - full_attention_interval=4：每 4 层中有 1 层是 Full Attention，
+#     其余 3 层是 GDN 线性注意力。
+#   - GDN 层有独立的 QK 和 V 头数/维度，与 Full Attention 不同。
+#   - 支持 Partial Rotary（部分维度旋转），rotary_factor=0.25。
+#   - attn_output_gate 控制注意力输出是否经过门控。
+# =============================================================================
+
 # Model registry: model_qwen35_f16.tqwen（Qwen3.5-0.8B f16 混合架构）
 name: model_qwen35_f16
-architecture: qwen3.5
+architecture: qwen3.5        # 架构族：Qwen3.5 混合架构
 source: Qwen/Qwen3.5-0.8B
-dtype: f16
+dtype: f16                   # 权重数据类型：FP16
 file: model_qwen35_f16.tqwen
-size_mb: 1435.1
+size_mb: 1435.1              # 总模型大小
 
+# 模型结构参数
 params:
-  n_layers: 24
-  hidden_size: 1024
-  intermediate_size: 3584
-  n_heads: 8
-  n_kv_heads: 2
-  head_dim: 256
-  vocab_size: 248320
-  tied_embeddings: true
-  model_type: qwen3_5
-  full_attention_interval: 4
-  attn_output_gate: true
+  n_layers: 24               # Transformer 总层数（GDN + Full Attention 混合）
+  hidden_size: 1024          # 隐藏层维度（比 Qwen2.5-0.5B 的 896 大）
+  intermediate_size: 3584    # FFN 中间层维度
+  n_heads: 8                 # Full Attention 的 Query 头数
+  n_kv_heads: 2              # Full Attention 的 KV 头数（GQA）
+  head_dim: 256              # Full Attention 的每个头维度（比 Qwen2.5 的 64 大很多）
+  vocab_size: 248320         # 词表大小（比 Qwen2.5 的 151936 大）
+  tied_embeddings: true      # 嵌入层和输出层共享权重
+  model_type: qwen3_5        # 模型类型：Qwen3.5 混合架构
+  full_attention_interval: 4 # 每 4 层中有 1 层 Full Attention（其余为 GDN）
+  attn_output_gate: true     # 注意力输出经过门控
 
+# GDN（Gated Delta Network）层参数
 gdn:
-  linear_num_qk_heads: 16
-  linear_num_v_heads: 16
-  linear_qk_head_dim: 128
-  linear_v_head_dim: 128
-  linear_conv_kernel_dim: 4
-  gdn_state_mb: 19.3
+  linear_num_qk_heads: 16    # GDN 的 QK 头数（比 Full Attention 的 8 多）
+  linear_num_v_heads: 16     # GDN 的 V 头数
+  linear_qk_head_dim: 128    # GDN 的 QK 头维度
+  linear_v_head_dim: 128     # GDN 的 V 头维度
+  linear_conv_kernel_dim: 4  # GDN 因果卷积核大小（K=4）
+  gdn_state_mb: 19.3         # GDN 隐状态占用的内存（MB）
 
+# 量化配置：FP16 原生导出，不量化
 quantization:
-  method: none
-  group_size: null
-  lm_head_quantized: false
+  method: none               # 无量化
+  group_size: null           # 不适用
+  lm_head_quantized: false   # lm_head 不量化
 
+# 推荐的计算配方：FP16 满栈
 recipe:
-  matvec_impl: neon_mt_kv_nt
-  ops_impl: neon
+  matvec_impl: neon_mt_kv_nt # 矩阵乘：NEON + 线程池 + kv 融合 + LDNP
+  ops_impl: neon             # 非 matvec 算子：NEON 向量化
   note: GDN + full attn 混合架构 f16 满栈
 
+# 基准测试结果
 benchmark:
   android:
-    topt_ms: 35.29
-    ttft_ms: 231.29
-    peak_rss_mb: 1463.7
+    topt_ms: 35.29           # 每个 token 生成时间
+    ttft_ms: 231.29          # 首个 token 时间
+    peak_rss_mb: 1463.7      # 峰值内存占用
     device: PLK110
     commit: 54d05f4+
     note: lm_head 主导（508MB f16，占 49%）；GDN 层高效 ~0.6ms/tok/层

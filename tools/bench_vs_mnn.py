@@ -1,172 +1,233 @@
 #!/usr/bin/env python3
 """tinyqwen vs MNN 速度对比 benchmark。
 
-同一个 Qwen2.5-0.5B 模型，不同量化 / 引擎：
+同一个 Qwen2.5-0.5B 模型，不同量化 / 引擎的横向对比：
   - tinyqwen fp32     (model.tqwen, ~1.9 GB)
   - tinyqwen f16      (model_f16.tqwen, ~988 MB)
   - MNN 4-bit         (llm.mnn + llm.mnn.weight, ~265 MB 打包)
 
-测量方式：
+测量方式差异：
   - tinyqwen：使用内置 profiler，逐 token 计时（最精确）
   - MNN：外部 wall-clock 计时 + 输出 token 计数（llm_infer 不暴露逐 token 时间）
 
+注意：MNN 的 token 数是按字符数估算的（中文约 0.7 tok/char），不如 tinyqwen
+profiler 精确；数字仅供量级参考，不做严格对比。
+
 用法：
+    # 全量对比（默认跑 3 遍取中位数）
     python3 tools/bench_vs_mnn.py
+    # 指定遍数
     python3 tools/bench_vs_mnn.py --runs 5
+    # 只测 MNN
     python3 tools/bench_vs_mnn.py --mnn-only
+    # 额外测一个 tinyqwen matvec impl
     python3 tools/bench_vs_mnn.py --tinyqwen-impl neon_mt_kv_nt
+
+输入：
+    - build/runtime/tinyqwen（macOS native binary）
+    - model.tqwen / model_f16.tqwen 模型文件
+    - /tmp/zip_verify/mnn_demo/（MNN demo 解压目录）
+
+输出：
+    - 终端打印对比表格
+    - benchmarks/mnn_comparison.json 结果文件
 """
 
+# 启用延迟注解求值
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import statistics
-import subprocess
-import sys
-import tempfile
-import time
-from pathlib import Path
+# ---- 标准库导入 ----
+import argparse       # 命令行参数解析
+import json           # JSON 序列化
+import os             # 文件存在性检查
+import statistics     # 统计函数（median）
+import subprocess     # 调用外部进程（tinyqwen、llm_infer）
+import sys            # 系统退出
+import tempfile       # 临时文件（profile JSON、prompt 文件）
+import time           # wall-clock 计时
+from pathlib import Path  # 路径操作
 
+# 项目根目录（脚本所在目录的上一级）
 PROJECT = Path(__file__).resolve().parent.parent
+# MNN demo 解压目录（固定路径，与使用说明一致）
 MNN_DIR = Path("/tmp/zip_verify/mnn_demo")
 
-# 统一 prompt："中国的首都是"
+# ---- 统一测试负载 ----
+# prompt 文本："中国的首都是"
 PROMPT_TEXT = "中国的首都是"
-PROMPT_TOKENS = [105538, 59975, 100132]  # tinyqwen 用 token id
+# tinyqwen 用的 token id 序列（与 bench.py 的 CANONICAL_PROMPT 相同）
+PROMPT_TOKENS = [105538, 59975, 100132]
 
 # 生成长度控制
-DECODE_TOKENS = 64
-WARMUP_TOKENS = 4  # tinyqwen profiler 丢弃前 N 个 decode token
+DECODE_TOKENS = 64        # 生成 token 数
+WARMUP_TOKENS = 4         # tinyqwen profiler 丢弃前 N 个 decode token（预热）
 
 
 def run_tinyqwen(label: str, model: str, impl: str, ops_impl: str,
                  extra_args: list[str] | None = None) -> dict | None:
-    """跑 tinyqwen 一次，返回 {median_ms, tok_per_sec, ...}。"""
+    """运行 tinyqwen 一次测速，返回性能指标字典。
+
+    Args:
+        label: 配置标签名
+        model: 模型文件名（相对于项目根目录）
+        impl: matvec 实现名称（如 ref、neon_mt_kv_nt）
+        ops_impl: ops 实现名称（如 ref、neon）
+        extra_args: 额外 CLI 参数列表
+
+    Returns:
+        dict | None: 包含 decode_median_ms、tok_per_sec 等字段；失败返回 None
+    """
+    # 构建 binary 和模型的绝对路径
     binary = str(PROJECT / "build" / "runtime" / "tinyqwen")
     model_path = str(PROJECT / model)
     if not os.path.isfile(model_path):
         print(f"  [skip] {label}: 模型文件不存在 {model}")
         return None
 
+    # 创建临时文件存放 profile 输出
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
         profile_path = tf.name
 
+    # 构造 tinyqwen CLI 命令
     cmd = [
-        binary,
-        "--model", model_path,
-        "--tokens", ",".join(map(str, PROMPT_TOKENS)),
-        "--max-new-tokens", str(DECODE_TOKENS),
-        "--max-seq-len", "128",
-        "--eos", "-1",
-        "--profile-out", profile_path,
-        "--matvec-impl", impl,
-        "--ops-impl", ops_impl,
+        binary,                                      # 可执行文件
+        "--model", model_path,                       # 模型文件
+        "--tokens", ",".join(map(str, PROMPT_TOKENS)),  # prompt token CSV
+        "--max-new-tokens", str(DECODE_TOKENS),      # 生成 token 数
+        "--max-seq-len", "128",                      # KV cache 容量
+        "--eos", "-1",                               # 禁用 EOS，保证固定生成数
+        "--profile-out", profile_path,               # profile 输出路径
+        "--matvec-impl", impl,                       # matvec kernel 实现
+        "--ops-impl", ops_impl,                      # ops kernel 实现
     ]
-    cmd += list(extra_args or [])
+    cmd += list(extra_args or [])  # 追加额外参数
 
+    # wall-clock 计时（含模型加载等全流程耗时）
     t0 = time.perf_counter()
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True)  # 同步执行
     wall_s = time.perf_counter() - t0
 
+    # 检查退出码
     if result.returncode != 0:
         print(f"  [error] {label}: tinyqwen 返回 {result.returncode}")
         print(f"    stderr: {result.stderr.decode()[:200]}")
         Path(profile_path).unlink(missing_ok=True)
         return None
 
+    # 读取 profile JSON
     with open(profile_path) as f:
         profile = json.load(f)
-    Path(profile_path).unlink(missing_ok=True)
+    Path(profile_path).unlink(missing_ok=True)  # 清理临时文件
 
+    # 分离 prefill 和 decode 延迟
     decode_ms = [t["latency_ms"] for t in profile["tokens"] if not t["is_prefill"]]
     prefill_ms = [t["latency_ms"] for t in profile["tokens"] if t["is_prefill"]]
+    # 丢弃预热 token
     steady = decode_ms[WARMUP_TOKENS:]
     if not steady:
         print(f"  [error] {label}: decode token 不足")
         return None
 
+    # 计算稳态中位数
     median_ms = statistics.median(steady)
     return {
         "label": label,
         "engine": "tinyqwen",
-        "quant": "fp32" if "f16" not in model else "f16",
-        "decode_median_ms": round(median_ms, 2),
-        "decode_p95_ms": round(sorted(steady)[int(len(steady) * 0.95)], 2),
-        "tok_per_sec": round(1000.0 / median_ms, 1),
-        "prefill_ms": round(sum(prefill_ms), 2),
-        "decode_tokens": len(decode_ms),
-        "wall_s": round(wall_s, 2),
-        "impl": impl,
+        "quant": "fp32" if "f16" not in model else "f16",  # 从文件名推断量化类型
+        "decode_median_ms": round(median_ms, 2),            # 稳态 decode 中位延迟
+        "decode_p95_ms": round(sorted(steady)[int(len(steady) * 0.95)], 2),  # P95
+        "tok_per_sec": round(1000.0 / median_ms, 1),        # tokens/s
+        "prefill_ms": round(sum(prefill_ms), 2),             # prefill 总耗时
+        "decode_tokens": len(decode_ms),                     # decode token 总数
+        "wall_s": round(wall_s, 2),                          # wall-clock 耗时
+        "impl": impl,                                        # matvec 实现名
     }
 
 
 def run_mnn(label: str, max_tokens: int = DECODE_TOKENS) -> dict | None:
-    """跑 MNN llm_infer 一次，wall-clock 计时。"""
+    """运行 MNN llm_infer 一次测速，wall-clock 计时。
+
+    MNN 的 llm_infer 不暴露逐 token 时间，只能用 wall-clock + 输出字符数估算。
+    token 数按中文字符 × 0.7 近似换算（Qwen2.5 中文约 1.2-1.5 字符/token）。
+
+    Args:
+        label: 配置标签名
+        max_tokens: 最大生成 token 数（传给 llm_infer）
+
+    Returns:
+        dict | None: 包含 wall_s、est_tokens、tok_per_sec_overall 等字段；失败返回 None
+    """
+    # 检查 MNN demo 目录是否存在
     if not MNN_DIR.exists():
         print(f"  [skip] MNN: 目录不存在 {MNN_DIR}")
         print(f"    请先解压：unzip ~/Downloads/mnn_demo_3.6.1.2_macos_arm64.zip -d /tmp/zip_verify/")
         return None
 
-    llm_infer = MNN_DIR / "llm_infer"
-    config = MNN_DIR / "models" / "qwen25_v8_4bit" / "config.json"
+    llm_infer = MNN_DIR / "llm_infer"  # MNN 推理可执行文件
+    config = MNN_DIR / "models" / "qwen25_v8_4bit" / "config.json"  # 模型配置
 
-    # prompt 文件
+    # 将 prompt 写入临时文件（llm_infer 从文件读 prompt）
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, dir="/tmp") as pf:
         pf.write(PROMPT_TEXT)
         prompt_path = pf.name
 
-    out_path = "/tmp/mnn_bench_out.jsonl"
-    Path(out_path).unlink(missing_ok=True)
+    out_path = "/tmp/mnn_bench_out.jsonl"  # MNN 输出文件
+    Path(out_path).unlink(missing_ok=True)  # 清理旧输出
 
+    # 构造 llm_infer 命令：llm_infer <config> <prompt_file> <output_file>
     cmd = [str(llm_infer), str(config), prompt_path, out_path]
 
+    # wall-clock 计时
     t0 = time.perf_counter()
     result = subprocess.run(cmd, capture_output=True, cwd=str(MNN_DIR))
     wall_s = time.perf_counter() - t0
 
-    Path(prompt_path).unlink(missing_ok=True)
+    Path(prompt_path).unlink(missing_ok=True)  # 清理 prompt 临时文件
 
+    # 检查退出码
     if result.returncode != 0:
         print(f"  [error] MNN: 返回 {result.returncode}")
         print(f"    stderr: {result.stderr.decode()[:300]}")
         return None
 
-    # 读输出，估算 token 数
+    # 读取 MNN 输出并提取 response 文本
     try:
         with open(out_path) as f:
             lines = f.readlines()
-        resp = json.loads(lines[0])["response"]
+        resp = json.loads(lines[0])["response"]  # 第一行的 response 字段
     except Exception as e:
         print(f"  [error] MNN: 读取输出失败: {e}")
         return None
 
     # 粗略 token 估算：中文字符约 1-1.5 tok/char，这里用字符数 * 0.7 近似
-    # 更准确的做法是用 tokenizer，但 MNN 用的是 .mtok 格式
     n_chars = len(resp)
     # 对于 Qwen2.5 中文，约 1.2-1.5 字符/token
     est_tokens = int(n_chars * 0.7)
 
-    # 用 wall time 算整体 tok/s（包含 prefill）
+    # 用 wall time 算整体 tok/s（包含 prefill + 模型加载）
     tok_per_sec = est_tokens / wall_s if wall_s > 0 else 0
 
     return {
         "label": label,
         "engine": "MNN 3.6.1.2",
-        "quant": "int4",
-        "wall_s": round(wall_s, 2),
-        "output_chars": n_chars,
-        "est_tokens": est_tokens,
-        "tok_per_sec_overall": round(tok_per_sec, 1),
+        "quant": "int4",                                          # MNN 用 4-bit 量化
+        "wall_s": round(wall_s, 2),                               # wall-clock 耗时
+        "output_chars": n_chars,                                  # 输出字符数
+        "est_tokens": est_tokens,                                 # 估算 token 数
+        "tok_per_sec_overall": round(tok_per_sec, 1),             # 整体 tok/s
+        # 用整体 tok/s 反推等效 ms/tok（仅量级参考）
         "decode_median_ms": round(1000.0 / tok_per_sec, 2) if tok_per_sec > 0 else None,
-        "threads": 4,
+        "threads": 4,                                             # MNN 默认线程数
         "note": "wall-clock 计时，含 prefill + 模型加载；token 数为估算",
     }
 
 
 def print_comparison(results: list[dict]) -> None:
-    """打印对比表格。"""
+    """打印所有配置的对比表格到终端。
+
+    Args:
+        results: 各配置的测速结果字典列表
+    """
     print("\n" + "=" * 72)
     print("  Qwen2.5-0.5B 推理速度对比 (macOS arm64)")
     print("=" * 72)
@@ -175,20 +236,22 @@ def print_comparison(results: list[dict]) -> None:
     print(f"\n  {'配置':<28} {'量化':>5} {'ms/tok':>8} {'tok/s':>7} {'wall(s)':>8}  备注")
     print(f"  {'-' * 28} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 8}  {'-' * 16}")
 
+    # 逐行打印每个配置
     for r in results:
         if r is None:
             continue
         quant = r.get("quant", "?")
+        # ms/tok 列
         if "decode_median_ms" in r and r["decode_median_ms"]:
             ms_tok = f"{r['decode_median_ms']:.1f}"
         else:
             ms_tok = "N/A"
-
+        # tok/s 列
         tok_s = r.get("tok_per_sec") or r.get("tok_per_sec_overall") or 0
         tok_s_str = f"{tok_s:.1f}"
-
+        # wall-clock 列
         wall = f"{r['wall_s']:.2f}" if "wall_s" in r else "N/A"
-
+        # 备注列（截断到 30 字符）
         note = r.get("impl", "") or r.get("note", "")
         if len(note) > 30:
             note = note[:30] + "…"
@@ -199,6 +262,10 @@ def print_comparison(results: list[dict]) -> None:
 
 
 def main():
+    """bench_vs_mnn.py 的主入口函数。
+
+    依次运行 MNN 和各 tinyqwen 配置的多遍测速，汇总后打印对比表格。
+    """
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--runs", type=int, default=3, help="每个配置跑几遍取中位数")
@@ -208,13 +275,13 @@ def main():
                    help="额外测一个 tinyqwen matvec impl（如 neon_mt_kv_nt）")
     args = p.parse_args()
 
-    runs = max(1, args.runs)
-    results = []
+    runs = max(1, args.runs)  # 至少跑 1 遍
+    results = []  # 收集所有配置的结果
 
     print(f"[bench_vs_mnn] 对比测试 | prompt=\"{PROMPT_TEXT}\" | decode={DECODE_TOKENS} tok | runs={runs}")
     print()
 
-    # --- MNN ---
+    # --- MNN 测速 ---
     if not args.tinyqwen_only:
         print("[MNN 3.6.1.2] int4 量化, 4 threads ...")
         mnn_results = []
@@ -226,15 +293,16 @@ def main():
                       f"({r['output_chars']} chars → est {r['est_tokens']} tok)")
 
         if mnn_results:
-            # 取 wall time 中位数那次
+            # 取 wall time 中位数那次作为代表结果
             mnn_results.sort(key=lambda x: x["wall_s"])
             median_run = mnn_results[len(mnn_results) // 2]
             median_run["label"] = "MNN 3.6.1.2 int4"
             results.append(median_run)
         print()
 
-    # --- tinyqwen configs ---
+    # --- tinyqwen 各配置测速 ---
     if not args.mnn_only:
+        # 预定义的配置列表：(标签, 模型文件, matvec impl, ops impl)
         configs = [
             ("tinyqwen fp32 ref", "model.tqwen", "ref", "ref"),
             ("tinyqwen f16 ref", "model_f16.tqwen", "ref", "ref"),
@@ -242,6 +310,7 @@ def main():
             ("tinyqwen f16 neon_mt_kv_nt", "model_f16.tqwen", "neon_mt_kv_nt", "neon"),
         ]
 
+        # 如果用户指定了额外的 impl，追加一个配置
         if args.tinyqwen_impl and args.tinyqwen_impl not in ("ref", "neon_mt_kv_nt"):
             configs.append((f"tinyqwen fp32 {args.tinyqwen_impl}",
                             "model.tqwen", args.tinyqwen_impl, "neon"))
@@ -256,20 +325,20 @@ def main():
                     print(f"  run {i + 1}/{runs}: median={r['decode_median_ms']:.2f} ms/tok, "
                           f"{r['tok_per_sec']:.1f} tok/s")
                 else:
-                    break
+                    break  # 某次失败则停止该配置
 
             if medians:
-                # 取 median of medians
+                # 取 median of medians（按 decode_median_ms 排序取中间值）
                 medians.sort(key=lambda x: x["decode_median_ms"])
                 best = medians[len(medians) // 2]
                 best["label"] = label
                 results.append(best)
             print()
 
-    # --- 对比 ---
+    # --- 打印对比表格 ---
     print_comparison(results)
 
-    # JSON 输出
+    # 将结果写入 JSON 文件
     out_path = PROJECT / "benchmarks" / "mnn_comparison.json"
     out_path.parent.mkdir(exist_ok=True)
     with open(out_path, "w") as f:
@@ -277,5 +346,6 @@ def main():
     print(f"  结果已写入: {out_path}")
 
 
+# 脚本直接运行入口
 if __name__ == "__main__":
     main()

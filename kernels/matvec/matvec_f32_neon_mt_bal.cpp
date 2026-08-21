@@ -1,5 +1,7 @@
-// 矩阵乘向量：y = W @ x —— NEON + 多线程 + 自校准加权分块版。
-//
+// ============================================================================
+// matvec_f32_neon_mt_bal.cpp — 矩阵乘向量：y = W @ x
+//                  NEON + 多线程 + 自校准加权分块版
+// ============================================================================
 // 在 neon_mt（NEON 行点积 + 常驻线程池）之上只改一件事：**行怎么分**。
 //
 // ============================================================================
@@ -41,77 +43,94 @@
 // 门禁与 neon_mt 相同，只是行的归属不同（每行内部算法没变）。
 //
 // 选用：--matvec-impl neon_mt_bal（仅 aarch64 构建注册；其他平台编译为空）。
+// ============================================================================
 
 #include "dispatch.h" // TINYQWEN_MATVEC_VARIANT 自注册宏
-#include "ref_ops.h"
+#include "ref_ops.h"  // 辅助函数声明
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 
-#include <arm_neon.h>
+#include <arm_neon.h>  // NEON intrinsic 声明
 
-#include <atomic>
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <cstdlib>
-#include <thread>
-#include <vector>
+#include <atomic>      // std::atomic（线程同步）
+#include <chrono>      // steady_clock（高精度计时）
+#include <cstddef>     // size_t
+#include <cstdint>     // uint64_t
+#include <cstdlib>     // std::getenv、std::strtol
+#include <thread>      // std::thread
+#include <vector>      // std::vector
 
 #if defined(__APPLE__)
-#include <sys/sysctl.h>
+#include <sys/sysctl.h> // macOS 专用：查询 P 核数量
 #endif
 
 namespace tinyqwen {
   namespace {
-    // ---- 行点积：与 neon_mt / neon 逐位一致（4 累加器 + FMA + 标量尾段）----
+    // ========================================================================
+    // dot_row_neon() — 行点积：与 neon_mt / neon 逐位一致
+    // ========================================================================
+    // 功能：NEON 4 链 FMA 点积（float 累加 + 标量尾段）
     inline float dot_row_neon(const float *row, const float *x, int n) {
-      float32x4_t acc0 = vdupq_n_f32(0.0f);
-      float32x4_t acc1 = vdupq_n_f32(0.0f);
-      float32x4_t acc2 = vdupq_n_f32(0.0f);
-      float32x4_t acc3 = vdupq_n_f32(0.0f);
+      float32x4_t acc0 = vdupq_n_f32(0.0f); // 累加器 0
+      float32x4_t acc1 = vdupq_n_f32(0.0f); // 累加器 1
+      float32x4_t acc2 = vdupq_n_f32(0.0f); // 累加器 2
+      float32x4_t acc3 = vdupq_n_f32(0.0f); // 累加器 3
       int i = 0;
-      const int n16 = n & ~15;
+      const int n16 = n & ~15; // 主循环边界：16 的倍数
       for (; i < n16; i += 16) {
+        // 4 条独立 FMA 链，各处理 4 个连续元素
         acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
         acc1 = vfmaq_f32(acc1, vld1q_f32(row + i + 4), vld1q_f32(x + i + 4));
         acc2 = vfmaq_f32(acc2, vld1q_f32(row + i + 8), vld1q_f32(x + i + 8));
         acc3 = vfmaq_f32(acc3, vld1q_f32(row + i + 12), vld1q_f32(x + i + 12));
       }
-      const int n4 = n & ~3;
+      const int n4 = n & ~3; // 向量尾段边界：4 的倍数
       for (; i < n4; i += 4) {
         acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
       }
+      // 合并 + 横向归约
       const float32x4_t sum01 = vaddq_f32(acc0, acc1);
       const float32x4_t sum23 = vaddq_f32(acc2, acc3);
       float total = vaddvq_f32(vaddq_f32(sum01, sum23));
+      // 标量尾段
       for (; i < n; ++i) {
         total += row[i] * x[i];
       }
       return total;
     }
 
-    // 自旋等待原子计数器到达目标值（与 neon_mt 相同：先 YIELD 自旋，
-    // 久了让出 CPU）。
+    // ========================================================================
+    // spin_until() — 自旋等待原子计数器到达目标值
+    // ========================================================================
+    // 与 neon_mt 相同：先 YIELD 自旋，久了让出 CPU
     inline void spin_until(const std::atomic<std::uint64_t> &a, std::uint64_t target) {
       int spins = 0;
       while (a.load(std::memory_order_acquire) != target) {
         if (++spins <= 256) {
 #if defined(__aarch64__)
-          __builtin_arm_yield();
+          __builtin_arm_yield(); // ARM YIELD 指令
 #endif
         } else {
-          std::this_thread::yield();
+          std::this_thread::yield(); // 让出 CPU 时间片
         }
       }
     }
 
+    // ========================================================================
+    // now_ns() — 获取当前高精度时间戳（纳秒）
+    // ========================================================================
+    // 功能：返回 steady_clock 的当前时刻，以纳秒为单位的 uint64_t。
+    // 说明：用于 worker 计时。steady_clock 不受系统时钟调整影响。
     inline std::uint64_t now_ns() {
       return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now().time_since_epoch())
               .count());
     }
 
-    // 总并行度（含 master）：与 neon_mt 相同的优先级与取值。
+    // ========================================================================
+    // default_parallelism() — 计算默认并行度（含 master 线程）
+    // ========================================================================
+    // 与 neon_mt 相同的优先级与取值
     inline int default_parallelism() {
       if (const char *env = std::getenv("TINYQWEN_MT_THREADS")) {
         const long v = std::strtol(env, nullptr, 10);
@@ -130,12 +149,13 @@ namespace tinyqwen {
       return p > 16 ? 16 : p;
     }
 
-    // 常驻行切分线程池（在 neon_mt 的 RowPool 上加了速度自校准与加权分块）。
+    // ========================================================================
+    // RowPool — 常驻行切分线程池（在 neon_mt 基础上加了速度自校准与加权分块）
+    // ========================================================================
     struct RowPool {
-      static constexpr int kMaxThreads = 16;
+      static constexpr int kMaxThreads = 16; // 最大支持线程数（bounds/speed 数组上限）
 
-      // 任务参数：仅 master 在发布新任务前写；worker 只在 acquire 到新的
-      // job_gen 之后读，可见性由 release/acquire 保证。
+      // ---- 任务参数：仅 master 在发布新任务前写 ----
       const float *w = nullptr;
       const float *x = nullptr;
       float *y = nullptr;
@@ -146,24 +166,26 @@ namespace tinyqwen {
       // 线程 i 的行区间。master 在发布前计算（O(p)），worker 只读。
       int bounds[kMaxThreads + 1] = {};
 
-      std::atomic<std::uint64_t> job_gen{0};  // master 发布任务时递增
-      std::atomic<std::uint64_t> done_gen{0}; // 每个 worker 完成一块后递增
+      // ---- 同步原语 ----
+      std::atomic<std::uint64_t> job_gen{0};
+      std::atomic<std::uint64_t> done_gen{0};
       std::atomic<bool> shutdown{false};
       std::vector<std::thread> workers;
-      std::uint64_t job_counter = 0;    // 仅 master 访问
-      std::uint64_t expected_done = 0;  // 仅 master 访问
+      std::uint64_t job_counter = 0;
+      std::uint64_t expected_done = 0;
 
       // ---- 速度自校准状态 ----
-      // chunk_ns[i]：线程 i 上一个 job 的块耗时（线程 i 写，master 在
-      // join 后读——done_gen 的 release/acquire 建立 happens-before）。
+      // chunk_ns[i]：线程 i 上一个 job 的块耗时（纳秒）
+      // 线程 i 写，master 在 join 后读——done_gen 的 release/acquire 建立 happens-before
       std::uint64_t chunk_ns[kMaxThreads] = {};
-      // rows_done[i]：线程 i 上一个 job 分到的行数（master 前后都知道）。
+      // rows_done[i]：线程 i 上一个 job 分到的行数（master 前后都知道）
       int rows_done[kMaxThreads] = {};
-      // speed[i]：线程 i 的吞吐 EMA 估计（rows/ms，仅 master 读写）。
+      // speed[i]：线程 i 的吞吐 EMA 估计（rows/ms，仅 master 读写）
       double speed[kMaxThreads] = {};
-      bool calibrated = false; // 是否已积累过至少一轮完整测量
-      static constexpr double kEmaNew = 0.3; // 新样本权重
+      bool calibrated = false;          // 是否已积累过至少一轮完整测量
+      static constexpr double kEmaNew = 0.3; // EMA 新样本权重（0.3 = 较敏感但不噪声）
 
+      // 构造函数：创建 p-1 个 worker 线程
       RowPool() {
         const int p = default_parallelism();
         workers.reserve(static_cast<size_t>(p - 1));
@@ -172,156 +194,172 @@ namespace tinyqwen {
         }
       }
 
+      // 析构函数：通知关闭并 join 所有 worker
       ~RowPool() {
         shutdown.store(true, std::memory_order_release);
-        job_gen.fetch_add(1, std::memory_order_release); // 唤醒所有 worker 退出
+        job_gen.fetch_add(1, std::memory_order_release); // 唤醒所有 worker
         for (auto &t : workers) {
           t.join();
         }
       }
 
-      // worker 循环：等任务 -> 计时算自己那块行 -> 记耗时 -> 归位。
+      // worker 主循环：等任务 → 计时算自己那块行 → 记耗时 → 归位
       void worker_main(int idx) {
         std::uint64_t next_job = 1;
         for (;;) {
-          spin_until(job_gen, next_job);
+          spin_until(job_gen, next_job); // 等待新任务
           if (shutdown.load(std::memory_order_acquire)) return;
-          const std::uint64_t t0 = now_ns();
-          do_chunk(idx);
-          chunk_ns[idx] = now_ns() - t0;
-          done_gen.fetch_add(1, std::memory_order_release);
+          const std::uint64_t t0 = now_ns(); // 记录开始时间
+          do_chunk(idx);                      // 执行行块
+          chunk_ns[idx] = now_ns() - t0;      // 记录耗时（纳秒）
+          done_gen.fetch_add(1, std::memory_order_release); // 报告完成
           ++next_job;
         }
       }
 
-      // 线程 idx 的行区间上的逐行点积。区间来自 bounds[]（加权分块）。
+      // 线程 idx 的行区间上的逐行点积。区间来自 bounds[]（加权分块结果）
       void do_chunk(int idx) const {
-        const int begin = bounds[idx];
-        const int end = bounds[idx + 1];
+        const int begin = bounds[idx];     // 本线程的起始行号
+        const int end = bounds[idx + 1];   // 本线程的结束行号（不含）
         for (int o = begin; o < end; ++o) {
           const float *row = w + static_cast<size_t>(o) * in_dim;
           y[o] = dot_row_neon(row, x, in_dim);
         }
       }
 
-      // 按速度比例切行（仅 master 调用，发布前）。
+      // ====================================================================
+      // compute_bounds() — 按速度比例切行（仅 master 调用，发布前）
+      // ====================================================================
       // 未校准时退化为均分（与 neon_mt 相同）；校准后按 speed 前缀和切：
       // 快线程多分、慢线程少分，目标是所有线程同时完工。
       void compute_bounds() {
-        const int p = static_cast<int>(workers.size()) + 1;
+        const int p = static_cast<int>(workers.size()) + 1; // 总并行度
         if (!calibrated) {
-          // 均分（neon_mt 原逻辑）：前 rem 块各多 1 行。
+          // 未校准：均分（neon_mt 原逻辑），前 rem 块各多 1 行
           const int base = out_dim / p;
           const int rem = out_dim % p;
           int b = 0;
           for (int i = 0; i < p; ++i) {
             bounds[i] = b;
-            b += base + (i < rem ? 1 : 0);
+            b += base + (i < rem ? 1 : 0); // 前 rem 块多 1 行
           }
-          bounds[p] = out_dim;
+          bounds[p] = out_dim; // 最后一块结束于 out_dim
           return;
         }
+        // 已校准：按速度比例分配
         double total = 0.0;
-        for (int i = 0; i < p; ++i) total += speed[i];
+        for (int i = 0; i < p; ++i) total += speed[i]; // 计算总速度
         if (total <= 0.0) { // 防御：权重全零时退回均分
           calibrated = false;
-          compute_bounds();
+          compute_bounds(); // 递归回退到均分路径
           return;
         }
-        // 前缀和取整：bounds[i] = round(out_dim * cum_weight_i)。
-        // 单调不减、首 0 尾 out_dim，每段行数误差 ≤1。
+        // 前缀和取整：bounds[i] = round(out_dim * cum_weight_i)
+        // 单调不减、首 0 尾 out_dim，每段行数误差 ≤1
         bounds[0] = 0;
         double cum = 0.0;
         for (int i = 1; i < p; ++i) {
-          cum += speed[i - 1];
-          bounds[i] = static_cast<int>(out_dim * cum / total + 0.5);
+          cum += speed[i - 1]; // 累加前面线程的速度
+          bounds[i] = static_cast<int>(out_dim * cum / total + 0.5); // 四舍五入取整
         }
-        bounds[p] = out_dim;
+        bounds[p] = out_dim; // 确保最后一块结束于 out_dim
+        // 记录每个线程实际分到的行数（供 update_speeds 使用）
         for (int i = 0; i < p; ++i) rows_done[i] = bounds[i + 1] - bounds[i];
       }
 
-      // join 之后用本轮实测更新速度 EMA（仅 master 调用）。
+      // ====================================================================
+      // update_speeds() — join 之后用本轮实测更新速度 EMA（仅 master 调用）
+      // ====================================================================
       void update_speeds() {
         const int p = static_cast<int>(workers.size()) + 1;
-        // 耗时过短（<0.5µs）或空块的测量信噪比太低，不采样。
+        // 耗时过短（<0.5µs = 500ns）或空块的测量信噪比太低，不采样
         auto valid = [&](int i) { return rows_done[i] > 0 && chunk_ns[i] > 500; };
         if (!calibrated) {
-          // 首轮：有测量的直接用作初值；没测量的（空块/太短）用本轮
-          // 最小测量值兜底（保守：宁可少分，不制造新尾巴）。
+          // 首轮校准：有测量的直接用作初值；没测量的用本轮最小测量值兜底
           double min_meas = 0.0;
           bool any = false;
           for (int i = 0; i < p; ++i) {
             if (valid(i)) {
+              // 计算速度：rows / ms = rows_done * 1e6 / chunk_ns
               const double meas = static_cast<double>(rows_done[i]) * 1e6 /
-                                  static_cast<double>(chunk_ns[i]); // rows/ms
-              speed[i] = meas;
-              if (!any || meas < min_meas) min_meas = meas;
+                                  static_cast<double>(chunk_ns[i]);
+              speed[i] = meas; // 首轮直接用实测值
+              if (!any || meas < min_meas) min_meas = meas; // 跟踪最小速度
               any = true;
             }
           }
           if (!any) return; // 全员不可测：维持均分
+          // 未测量的线程（空块/太短）用最小速度兜底（保守：宁可少分，不制造新尾巴）
           for (int i = 0; i < p; ++i) {
             if (!valid(i)) speed[i] = min_meas;
           }
-          calibrated = true;
+          calibrated = true; // 标记已完成首轮校准
           return;
         }
+        // 后续轮次：EMA 更新 speed[i] = (1-α)*old + α*new
         for (int i = 0; i < p; ++i) {
-          if (!valid(i)) continue;
+          if (!valid(i)) continue; // 跳过无效测量
           const double meas = static_cast<double>(rows_done[i]) * 1e6 /
                               static_cast<double>(chunk_ns[i]); // rows/ms
-          speed[i] = (1.0 - kEmaNew) * speed[i] + kEmaNew * meas;
+          speed[i] = (1.0 - kEmaNew) * speed[i] + kEmaNew * meas; // EMA 平滑
         }
       }
 
-      // fork-join 入口（仅 master 调用）：切块 -> 发布 -> 自己算第 0 块
-      // -> 等归位 -> 更新速度估计。
+      // fork-join 入口（仅 master 调用）：切块 → 发布 → 自己算第 0 块
+      // → 等归位 → 更新速度估计
       void run(const float *w_, const float *x_, float *y_, int out_dim_, int in_dim_) {
-        w = w_;
+        w = w_;         // 写入任务参数
         x = x_;
         y = y_;
         out_dim = out_dim_;
         in_dim = in_dim_;
-        compute_bounds();
-        // 均分路径（未校准）也要记行数，供首轮校准使用。
+        compute_bounds(); // 根据速度估计计算加权分块
+        // 均分路径（未校准）也要记行数，供首轮校准使用
         if (!calibrated) {
           const int p = static_cast<int>(workers.size()) + 1;
           for (int i = 0; i < p; ++i) rows_done[i] = bounds[i + 1] - bounds[i];
         }
-        const std::uint64_t t0 = now_ns();
-        job_gen.store(++job_counter, std::memory_order_release); // 发布
-        do_chunk(0);
-        chunk_ns[0] = now_ns() - t0;
+        const std::uint64_t t0 = now_ns(); // master 自己的计时起点
+        job_gen.store(++job_counter, std::memory_order_release); // 发布新任务
+        do_chunk(0);    // master 自己算第 0 块
+        chunk_ns[0] = now_ns() - t0; // 记录 master 的耗时
         expected_done += workers.size();
-        spin_until(done_gen, expected_done); // join
-        update_speeds();
+        spin_until(done_gen, expected_done); // join：等待所有 worker 完成
+        update_speeds(); // 用本轮实测更新速度 EMA
       }
     };
 
+    // Meyers singleton：首次调用创建；线程安全（C++11 magic static）
     RowPool &pool() {
-      static RowPool p; // 首次调用创建；线程安全（C++11 magic static）
+      static RowPool p;
       return p;
     }
 
-    // 与 neon_mt 相同的粒度阈值：权重不足 1MB 直接单线程内联。
+    // 与 neon_mt 相同的粒度阈值：权重不足 1MB 直接单线程内联
     constexpr std::size_t kMinParallelElems = 262144;
   } // namespace
 
+  // ========================================================================
+  // matvec_f32_neon_mt_bal() — 外部入口
+  // ========================================================================
+  // 功能：计算 y = W @ x（fp32，NEON + 多线程 + 自校准加权分块）
   void matvec_f32_neon_mt_bal(const float *w, const float *x, float *y, int out_dim,
                               int in_dim) {
     RowPool &p = pool();
     const std::size_t elems = static_cast<size_t>(out_dim) * in_dim;
     if (elems < kMinParallelElems || p.workers.empty()) {
+      // 小矩阵走单线程内联
       for (int o = 0; o < out_dim; ++o) {
         const float *row = w + static_cast<size_t>(o) * in_dim;
         y[o] = dot_row_neon(row, x, in_dim);
       }
       return;
     }
+    // 大矩阵走多线程加权分块路径
     p.run(w, x, y, out_dim, in_dim);
   }
 
-  // 自注册进 dispatch：--matvec-impl neon_mt_bal 即可选用（仅 aarch64 构建存在）。
+  // 自注册进 dispatch：--matvec-impl neon_mt_bal 即可选用（仅 aarch64 构建存在）
   TINYQWEN_MATVEC_VARIANT(matvec_f32_neon_mt_bal, "neon_mt_bal");
 } // namespace tinyqwen
 

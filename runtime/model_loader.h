@@ -1,7 +1,26 @@
 #pragma once
 
-// ModelFile：把 .tqwen 文件读进内存并校验，然后提供按名字取 tensor 的能力。
-// 先看 docs/infra_primer.md 第 5、9 节（二进制格式 / fail fast）。
+// ============================================================================
+// 文件: model_loader.h
+// 作用: ModelFile 定义 —— 把 .tqwen 文件读进内存并校验，提供按名字取 tensor 的能力
+//
+// 核心职责:
+//   1. 读取并校验 .tqwen 二进制权重文件的完整性
+//   2. 解析文件头（TinyHeader）和 tensor 表（TensorEntry），构建 ModelConfig
+//   3. 按名字提供 TensorView（不拥有数据的视图），供 QwenModel 绑定权重
+//
+// 二进制格式规范:
+//   .tqwen 是 tiny-llm 自定义的扁平二进制格式，文件布局:
+//     [ TinyHeader (192B) ][ TensorEntry[] (每项120B) ][ 64B对齐填充 ][ 权重数据区 ]
+//   每条 tensor 数据起点都 64B 对齐，所有整数用小端字节序。
+//
+// 内存所有权:
+//   ModelFile 把整个文件读进内部的 data_ buffer；所有 TensorView 的 data 指针
+//   都指向 data_ 内部。因此 ModelFile 必须比所有使用这些指针的地方活得更久
+//   （见 primer 第 3 节"视图"）。因为持有这块内存，所以禁止拷贝。
+//
+// 前置阅读: docs/infra_primer.md 第 5、9 节（二进制格式 / fail fast）
+// ============================================================================
 
 #include <string>
 #include <unordered_map>
@@ -11,93 +30,224 @@
 #include "tiny_format.h"
 
 namespace tinyqwen {
-    // 从文件头解析出来的模型配置（这是一个什么形状的模型）。
+    // -------------------------------------------------------------------------
+    // ModelConfig: 从文件头解析出来的模型配置
+    //
+    // 这个结构体描述"这是一个什么形状的模型"——它有多少层、隐藏层多宽、
+    // 注意力头数量和维度、词表大小等。所有字段在 ModelFile::load() 时
+    // 从 TinyHeader 中解析填充，之后不再改变。
+    //
+    // 支持两种架构:
+    //   - Qwen2.x: 所有层同构（full attention + SwiGLU）
+    //   - Qwen3.5: 混合架构（Gated DeltaNet + full attention 按间隔交替）
+    // -------------------------------------------------------------------------
     struct ModelConfig {
-        uint32_t n_layers = 0;
-        uint32_t hidden_size = 0;
-        uint32_t intermediate_size = 0;
-        uint32_t n_heads = 0;
-        uint32_t n_kv_heads = 0;
-        uint32_t head_dim = 0;
-        uint32_t vocab_size = 0;
-        uint32_t max_seq_len = 0;
-        float rms_norm_eps = 0.0f;
-        float rope_theta = 0.0f;
-        bool tied_embeddings = false;
+        uint32_t n_layers = 0;          // transformer 层数
+        uint32_t hidden_size = 0;       // 隐藏层宽度（每个 token 的向量维度）
+        uint32_t intermediate_size = 0; // FFN 中间层宽度（通常是 hidden_size 的倍数）
+        uint32_t n_heads = 0;           // query 注意力头数
+        uint32_t n_kv_heads = 0;        // key/value 头数（GQA，通常 ≤ n_heads）
+        uint32_t head_dim = 0;          // 每个注意力头的维度
+        uint32_t vocab_size = 0;        // 词表大小
+        uint32_t max_seq_len = 0;       // 训练时支持的最大序列长度
+        float rms_norm_eps = 0.0f;      // RMSNorm 中防止除零的小常数
+        float rope_theta = 0.0f;        // RoPE 位置编码的底数 theta
+        bool tied_embeddings = false;   // 是否共享词嵌入和输出投影的权重
 
         // --- v2 扩展字段（v1 文件加载后保持默认值，行为与旧版完全一致）---
-        ModelType model_type = ModelType::kQwen2;
-        // Qwen3.5 线性注意力（Gated DeltaNet）层的形状参数。
-        uint32_t linear_num_qk_heads = 0;
-        uint32_t linear_num_v_heads = 0;
-        uint32_t linear_qk_head_dim = 0;
-        uint32_t linear_v_head_dim = 0;
-        uint32_t linear_conv_kernel_dim = 0;
-        // full attention 层的出现间隔：layer i 是 full attention 当且仅当
-        // (i + 1) % full_attention_interval == 0。0 表示全部是 full attention（v1）。
+        ModelType model_type = ModelType::kQwen2; // 模型架构族
+
+        // Qwen3.5 线性注意力（Gated DeltaNet）层的形状参数
+        uint32_t linear_num_qk_heads = 0;    // GDN 线性注意力的 Q/K 头数
+        uint32_t linear_num_v_heads = 0;     // GDN 线性注意力的 V 头数
+        uint32_t linear_qk_head_dim = 0;     // GDN 每个 Q/K 头的维度
+        uint32_t linear_v_head_dim = 0;      // GDN 每个 V 头的维度
+        uint32_t linear_conv_kernel_dim = 0; // GDN 内 causal conv1d 的 kernel 大小
+
+        // full attention 层的出现间隔: 当 (layer_idx + 1) % full_attention_interval == 0
+        // 时该层为 full attention，否则为 linear attention（GDN）。
+        // 0 表示全部是 full attention（v1 行为）。
         uint32_t full_attention_interval = 0;
-        float partial_rotary_factor = 1.0f; // RoPE 只旋转 head_dim 的这一比例
-        uint32_t eos_token_id = 0; // 0 = 未指定，用 CLI 默认
+
+        // RoPE 只旋转 head_dim 的这一比例（例如 Qwen3.5 为 0.25）
+        float partial_rotary_factor = 1.0f;
+
+        // 结束符 token id（Qwen3.5 = 248044），0 表示未指定，用 CLI 默认
+        uint32_t eos_token_id = 0;
 
         // --- 量化参数（仅 dtype == kI4 时有意义）---
         uint32_t quant_group_size = 0; // 0 = 未量化；128 = INT4 典型 group size
 
-        // layer 类型判断。interval == 0（v1）或 model_type == kQwen2 时恒为 false。
+        // ---------------------------------------------------------------------
+        // is_linear_layer: 判断 layer_idx 是否为 linear attention（GDN）层
+        //
+        // 参数:
+        //   layer_idx: 层索引（0-based）
+        //
+        // 返回值:
+        //   当 full_attention_interval <= 1（v1 行为）或 model_type == kQwen2 时
+        //   恒为 false；否则按 full_attention_interval 判断。
+        // ---------------------------------------------------------------------
         bool is_linear_layer(uint32_t layer_idx) const {
+            // interval <= 1 意味着所有层都是 full attention，没有线性层
             if (full_attention_interval <= 1) return false;
+            // 线性层: 满足 (layer_idx+1) 不能被 interval 整除
             return (layer_idx + 1) % full_attention_interval != 0;
         }
 
+        // ---------------------------------------------------------------------
+        // n_full_layers: 计算 full attention 层的数量
+        //
+        // 返回值:
+        //   interval <= 1 时所有层都是 full attention，返回 n_layers；
+        //   否则返回 n_layers / full_attention_interval（整数除法取整）。
+        // ---------------------------------------------------------------------
         int n_full_layers() const {
             if (full_attention_interval <= 1) return static_cast<int>(n_layers);
             return static_cast<int>(n_layers / full_attention_interval);
         }
 
-        // full attention 层在 KV cache 里的紧凑下标（只给 full 层分配 cache）。
+        // ---------------------------------------------------------------------
+        // full_layer_cache_index: 将全局层号映射到 KV cache 中的紧凑下标
+        //
+        // 参数:
+        //   layer_idx: 全局层索引（0-based）
+        //
+        // 返回值:
+        //   该层在 KV cache 数组中的位置（0-based）
+        //
+        // 说明:
+        //   只有 full attention 层才分配 KV cache，所以需要把全局层号
+        //   压缩映射到 KV cache 的紧凑下标。例如 interval=4 时:
+        //     layer 3、7、11... 映射到 cache index 0、1、2...
+        // ---------------------------------------------------------------------
         int full_layer_cache_index(uint32_t layer_idx) const {
             return static_cast<int>((layer_idx + 1) / full_attention_interval - 1);
         }
 
-        // linear attention 层在 GDN 状态里的紧凑下标（= 层号减去前面的 full 层数）。
+        // ---------------------------------------------------------------------
+        // linear_layer_cache_index: 将全局层号映射到 GDN 状态中的紧凑下标
+        //
+        // 参数:
+        //   layer_idx: 全局层索引（0-based）
+        //
+        // 返回值:
+        //   该层在 GDN 状态数组中的位置（0-based）
+        //
+        // 说明:
+        //   线性层在 GDN 状态数组里是紧凑排列的，需要跳过前面的 full attention 层。
+        //   公式: 全局层号 - 前面的 full attention 层数
+        // ---------------------------------------------------------------------
         int linear_layer_cache_index(uint32_t layer_idx) const {
             return static_cast<int>(layer_idx - (layer_idx + 1) / full_attention_interval);
         }
     };
 
-    // 加载并校验一个 .tqwen 文件。
+    // -------------------------------------------------------------------------
+    // ModelFile: 加载并校验一个 .tqwen 文件
     //
-    // 内存所有权：本对象把整个文件读进自己内部的 data_ buffer；所有 TensorView
-    // 的 data 指针都指向 data_ 内部。因此 ModelFile 必须比所有使用这些指针的
-    // 地方活得更久（见 primer 第 3 节"视图"）。因为持有这块内存，所以禁止拷贝。
+    // 内存所有权:
+    //   本对象把整个文件读进自己内部的 data_ buffer；所有 TensorView 的 data
+    //   指针都指向 data_ 内部。因此 ModelFile 必须比所有使用这些指针的地方
+    //   活得更久。因为持有这块内存，所以禁止拷贝（避免误拷贝整块权重内存）。
+    //
+    // 加载流程:
+    //   1. 读取整个文件到 data_ buffer
+    //   2. 校验魔数 "TINYQWEN" 和版本号
+    //   3. 解析 TinyHeader，填充 ModelConfig
+    //   4. 解析 tensor 表，为每个 tensor 创建 TensorView
+    //   5. 校验每个 tensor 的偏移和大小在文件范围内
+    // -------------------------------------------------------------------------
     class ModelFile {
     public:
         ModelFile() = default;
 
-        ModelFile(const ModelFile &) = delete; // 禁止拷贝（避免误拷贝整块权重内存）
+        // 禁止拷贝（避免误拷贝整块权重内存，可能导致 OOM 或 double-free）
+        ModelFile(const ModelFile &) = delete;
         ModelFile &operator=(const ModelFile &) = delete;
 
-        // 读入整个文件并逐层校验。任何一步失败都返回 false 并把原因写进 *err。
+        // ---------------------------------------------------------------------
+        // load: 读取并校验整个 .tqwen 文件
+        //
+        // 参数:
+        //   path: .tqwen 文件的路径
+        //   err:  输出参数，任何一步失败都返回 false 并把原因写进 *err
+        //
+        // 返回值:
+        //   成功返回 true，失败返回 false
+        //
+        // 校验项目:
+        //   - 文件是否存在、是否能打开
+        //   - 魔数是否为 "TINYQWEN"
+        //   - 版本号是否在 [kFormatVersionMin, kFormatVersion] 范围内
+        //   - tensor 表和数据区偏移是否在文件范围内
+        //   - 每个 tensor 的 offset + nbytes 是否在文件范围内
+        //   - tensor 的 shape 和 dtype 是否合法
+        // ---------------------------------------------------------------------
         bool load(const std::string &path, std::string *err);
 
+        // ---- 状态查询 ----
+
+        // 是否已成功加载文件
         bool loaded() const { return !data_.empty(); }
-        const uint8_t *base() const { return data_.data(); } // 文件数据在内存里的起点
+
+        // 文件数据在内存中的起始地址（用于计算 tensor 的绝对地址）
+        const uint8_t *base() const { return data_.data(); }
+
+        // 获取文件头（包含魔数、版本、配置等）
         const TinyHeader &header() const { return header_; }
+
+        // 获取模型配置（从文件头解析出来的结构体）
         const ModelConfig &config() const { return config_; }
 
-        // 按名字取 tensor；不存在返回 nullptr。
+        // ---- 张量访问 ----
+
+        // ---------------------------------------------------------------------
+        // get: 按名字获取 tensor 的只读视图
+        //
+        // 参数:
+        //   name: tensor 名字，如 "model.layers.0.mlp.up_proj.weight"
+        //
+        // 返回值:
+        //   指向 TensorView 的指针；如果名字不存在返回 nullptr
+        //
+        // 说明:
+        //   返回的 TensorView 的 data 指针指向 data_ 内部，不拷贝数据。
+        // ---------------------------------------------------------------------
         const TensorView *get(const std::string &name) const;
 
+        // 文件中 tensor 的总数
         size_t tensor_count() const { return order_.size(); }
+
+        // 所有 tensor 名字的列表（按文件内出现顺序排列）
         const std::vector<std::string> &tensor_names() const { return order_; }
 
-        // 打印模型摘要（配置 + 每个 tensor 的 shape/偏移），调试用。
+        // ---------------------------------------------------------------------
+        // print_summary: 打印模型摘要信息
+        //
+        // 输出内容:
+        //   - 模型配置（层数、隐藏层维度、头数等）
+        //   - 每个 tensor 的名字、形状、dtype 和偏移
+        //
+        // 说明:
+        //   调试用，帮助快速了解模型文件的内容和结构。
+        // ---------------------------------------------------------------------
         void print_summary() const;
 
     private:
-        std::vector<uint8_t> data_; // 整个文件的字节（我们拥有的唯一一份内存）
+        // 整个文件的内容（我们拥有的唯一一份内存，所有 TensorView 的 data 都指向这里）
+        std::vector<uint8_t> data_;
+
+        // 文件头（192 字节），包含魔数、版本、模型配置等
         TinyHeader header_{};
+
+        // 从文件头解析出的模型配置结构体
         ModelConfig config_{};
-        std::unordered_map<std::string, TensorView> tensors_; // 名字 -> 视图
-        std::vector<std::string> order_; // 按文件内顺序记录名字，供 summary 打印
+
+        // 名字到 TensorView 的映射表，O(1) 平均查找时间
+        std::unordered_map<std::string, TensorView> tensors_;
+
+        // 按文件内顺序记录 tensor 名字，供 print_summary() 按序打印
+        std::vector<std::string> order_;
     };
 } // namespace tinyqwen

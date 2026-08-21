@@ -1,22 +1,45 @@
-// QwenModel::forward_prefill 的实现：批量 prefill（GEMM + per-token attention）
+// ============================================================================
+// qwen_forward_prefill.cpp — Qwen2.x 批量 prefill 实现
+// ============================================================================
+// 本文件实现 QwenModel::forward_prefill() 方法，提供批量 prefill（GEMM 路径）
+// 的高效实现。与逐 token 的 forward_token 不同，prefill 使用矩阵乘法（GEMM）
+// 一次性处理所有 prompt token 的线性投影，显著降低延迟。
 //
-// 从 qwen_model.cpp 拆分出来，只支持 Qwen2.x（Qwen3.5 回退到 forward_token）。
+// 适用场景：非 verbose 模式下的标准 prefill 阶段。
+// 限制：只支持 Qwen2.x（Qwen3.5 的 GDN linear attention 层需要顺序状态更新，
+//       会回退到 forward_token 逐 token 处理）。
+//
+// 算法流程：
+//   Step 1: 词嵌入 - 所有 token 的嵌入向量批量取出
+//   Step 2: 逐层循环
+//     2a. RMSNorm - 所有 token 的归一化
+//     2b. Q/K/V 投影 - 通过 GEMM 批量计算
+//     2c. Per-token 循环 - bias + RoPE + KV append + attention
+//     2d. O 投影 - GEMM 批量计算
+//     2e. 残差连接
+//     2f. Post-attention RMSNorm
+//     2g. Gate/Up 投影 - GEMM 批量计算
+//     2h. SwiGLU - 逐 token 激活
+//     2i. Down 投影 - GEMM 批量计算
+//     2j. 残差连接
+//   Step 3: 最终 norm + lm_head（仅最后一个 token）
+//   Step 4: argmax（取下一个 token）
+// ============================================================================
 
 #include "qwen_model.h"
 
-#include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <numeric>
+#include <algorithm>   // std::min, std::partial_sort
+#include <cmath>       // std::sqrt
+#include <cstdio>      // 标准输入输出（snprintf）
+#include <cstring>     // 内存操作（memcpy）
+#include <numeric>     // std::iota
 
 #include "dispatch.h"  // matvec_f32, argmax
-#include "ref_ops.h"
+#include "ref_ops.h"   // ref 实现（作为兜底参考）
 
 namespace tinyqwen {
     namespace {
-        // 取分数最高的 k 个 token。实现：对下标数组做 partial_sort，
-        // 只把前 k 个排好序，复杂度 O(vocab * k)。结果第一个就是 argmax。
+        // 取分数最高的 k 个 token（使用 partial_sort，复杂度 O(vocab * k)）
         void top_k_logits(const float *logits, int vocab, int k, TopKResult *out) {
             k = std::min(k, vocab);
             std::vector<int> idx(vocab);
@@ -32,21 +55,38 @@ namespace tinyqwen {
         }
     } // namespace
 
+    // =========================================================================
+    // QwenModel::forward_prefill() — 批量 prefill（GEMM 路径）
+    // =========================================================================
+    // 参数：
+    //   token_ids — prompt token ID 数组
+    //   n         — prompt token 数量
+    //   topk      — 输出参数，不为 nullptr 时写入 top-k 结果
+    //   topk_k    — top-k 的 k 值
+    // 返回值：下一个要生成的 token ID
+    // 说明：如果 n == 1，回退到 forward_token（单 token 不需要批处理）。
+    //       如果 n == 0，返回 -1。
+    //       如果模型是 Qwen3.5，回退到逐 token 的 forward_token（GDN 需要
+    //       顺序状态更新）。
+    //       批量 prefill 的算子结构与逐 token 不同，不做 op 级拆分——整批
+    //       作为一条 prefill 记录计时。
     int QwenModel::forward_prefill(const int *token_ids, int n,
                                    TopKResult *topk, int topk_k) {
-        if (n <= 0) return -1;
-        if (n == 1) return forward_token(token_ids[0], topk, topk_k);
+        if (n <= 0) return -1; // 空 prompt，直接返回
+        if (n == 1) return forward_token(token_ids[0], topk, topk_k); // 单 token 回退
 
+        // 提取配置参数（转为 int 便于循环中使用）
         const int hidden = static_cast<int>(cfg_.hidden_size);
         const int inter = static_cast<int>(cfg_.intermediate_size);
         const int vocab = static_cast<int>(cfg_.vocab_size);
         const int n_heads = static_cast<int>(cfg_.n_heads);
         const int n_kv_heads = static_cast<int>(cfg_.n_kv_heads);
         const int head_dim = static_cast<int>(cfg_.head_dim);
-        const int base_pos = kv_.seq_len();
+        const int base_pos = kv_.seq_len(); // 当前 KV cache 中已存储的序列长度
         const bool is_qwen35 = cfg_.model_type == ModelType::kQwen35;
 
         // GDN (linear attention) layers need sequential state updates — fall back
+        // 如果模型是 Qwen3.5，GDN 的状态更新必须顺序进行，退回到逐 token 处理
         if (is_qwen35) {
             int last = -1;
             for (int i = 0; i < n; ++i)
@@ -55,32 +95,39 @@ namespace tinyqwen {
         }
 
         Profiler &prof = *profiler_;
+        // attention 缩放因子 = 1 / sqrt(head_dim)，标准化点积的方差
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-        // Allocate batch buffers (column-major: each col = one token's vector)
+        // 分配批量缓冲区（列主序存储：每列是一个 token 的向量）
+        // 布局 [hidden, N]：第 c 列是第 c 个 token 的 hidden 向量
         const size_t N = static_cast<size_t>(n);
-        std::vector<float> hid_batch(hidden * N);   // residual stream [hidden, N]
-        std::vector<float> norm_batch(hidden * N);  // after rmsnorm
-        std::vector<float> q_batch(q_dim_ * N);
-        std::vector<float> k_batch(kv_dim_ * N);
-        std::vector<float> v_batch(kv_dim_ * N);
-        std::vector<float> attn_batch(q_dim_ * N);
-        std::vector<float> o_batch(hidden * N);
-        std::vector<float> gate_batch(inter * N);
-        std::vector<float> up_batch(inter * N);
-        std::vector<float> ffn_batch(hidden * N);
+        std::vector<float> hid_batch(hidden * N);   // 残差流批量 [hidden, N]
+        std::vector<float> norm_batch(hidden * N);  // RMSNorm 后批量 [hidden, N]
+        std::vector<float> q_batch(q_dim_ * N);     // Q 投影批量 [q_dim, N]
+        std::vector<float> k_batch(kv_dim_ * N);    // K 投影批量 [kv_dim, N]
+        std::vector<float> v_batch(kv_dim_ * N);    // V 投影批量 [kv_dim, N]
+        std::vector<float> attn_batch(q_dim_ * N);  // Attention 输出批量 [q_dim, N]
+        std::vector<float> o_batch(hidden * N);     // o_proj 输出批量 [hidden, N]
+        std::vector<float> gate_batch(inter * N);   // FFN gate 批量 [inter, N]
+        std::vector<float> up_batch(inter * N);     // FFN up 批量 [inter, N]
+        std::vector<float> ffn_batch(hidden * N);   // FFN 输出批量 [hidden, N]
 
-        // Step 1: Embed all tokens
+        // =====================================================================
+        // Step 1: 词嵌入 - 批量取出所有 token 的嵌入向量
+        // =====================================================================
         {
             ScopedTimer t(prof, "prefill_embed");
             for (int c = 0; c < n; ++c) {
-                int tid = token_ids[c];
+                int tid = token_ids[c]; // 当前 token 的 ID
+                // 目标位置：hid_batch 的第 c 列（偏移 c * hidden）
                 float *dst = hid_batch.data() + static_cast<size_t>(c) * hidden;
                 if (dtype_ == Dtype::kF32 || dtype_ == Dtype::kI4) {
+                    // fp32 或 I4 文件（embed 存为 fp32 lookup table）：直接 memcpy
                     std::memcpy(dst, static_cast<const float *>(embed_) +
                                     static_cast<size_t>(tid) * hidden,
                                 hidden * sizeof(float));
                 } else {
+                    // f16 文件：逐元素转为 fp32
                     const uint16_t *row = static_cast<const uint16_t *>(embed_) +
                                           static_cast<size_t>(tid) * hidden;
                     for (int j = 0; j < hidden; ++j) dst[j] = half_to_float(row[j]);
@@ -88,12 +135,14 @@ namespace tinyqwen {
             }
         }
 
-        // Step 2: Layer loop
-        char name[64];
+        // =====================================================================
+        // Step 2: 逐层循环（Transformer 层）
+        // =====================================================================
+        char name[64]; // profiler 作用域名的栈上缓冲区，避免每次分配 std::string
         for (uint32_t li = 0; li < cfg_.n_layers; ++li) {
             const LayerWeights &w = layers_[li];
 
-            // 2a. RMSNorm all tokens
+            // 2a. RMSNorm：所有 token 的输入归一化（逐 token 独立）
             {
                 std::snprintf(name, sizeof(name), "layer_%d.input_layernorm", li);
                 ScopedTimer t(prof, name);
@@ -104,59 +153,67 @@ namespace tinyqwen {
                 }
             }
 
-            // 2b. Q/K/V projections via GEMM
+            // 2b. Q/K/V 投影：通过 GEMM 批量计算（核心加速点）
             {
                 std::snprintf(name, sizeof(name), "layer_%d.qkv_proj", li);
                 ScopedTimer t(prof, name);
+                // mm() 计算 y = W * x，其中 W 是 [M, K]，x 是 [K, N] 列主序
                 mm(w.q_proj, norm_batch.data(), q_batch.data(), q_dim_, hidden, n);
                 mm(w.k_proj, norm_batch.data(), k_batch.data(), kv_dim_, hidden, n);
                 mm(w.v_proj, norm_batch.data(), v_batch.data(), kv_dim_, hidden, n);
             }
 
-            // 2c. Per-token: bias + RoPE + KV append + attention
+            // 2c. Per-token 循环：bias + RoPE + KV append + attention
+            //     这部分无法批量化，因为 KV cache 写入和 attention 需要逐个位置更新
             {
                 std::snprintf(name, sizeof(name), "layer_%d.attn_loop", li);
                 ScopedTimer t(prof, name);
                 for (int c = 0; c < n; ++c) {
-                    const int pos = base_pos + c;
+                    const int pos = base_pos + c; // 当前 token 在序列中的绝对位置
+                    // 第 c 列的各向量起始地址
                     float *qc = q_batch.data() + static_cast<size_t>(c) * q_dim_;
                     float *kc = k_batch.data() + static_cast<size_t>(c) * kv_dim_;
                     float *vc = v_batch.data() + static_cast<size_t>(c) * kv_dim_;
                     float *ac = attn_batch.data() + static_cast<size_t>(c) * q_dim_;
 
-                    // bias
+                    // bias 加法（Qwen2.x 特有，在 RoPE 之前）
                     if (w.q_bias) for (int j = 0; j < q_dim_; ++j) qc[j] += w.q_bias[j];
                     if (w.k_bias) for (int j = 0; j < kv_dim_; ++j) kc[j] += w.k_bias[j];
                     if (w.v_bias) for (int j = 0; j < kv_dim_; ++j) vc[j] += w.v_bias[j];
 
-                    // RoPE
+                    // RoPE 旋转位置编码：将位置 pos 的信息注入 Q 和 K
                     backend_->rope(qc, kc, n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
 
-                    // KV append
+                    // KV append：将当前 token 的 K 和 V 写入 KV cache
+                    // 平面布局：每个 head 的平面是 [max_seq_len, head_dim]
                     const size_t pos_off = static_cast<size_t>(pos) * head_dim;
                     const size_t head_plane = static_cast<size_t>(max_seq_len_) * head_dim;
                     float *k_layer = kv_.k(static_cast<int>(li));
                     float *v_layer = kv_.v(static_cast<int>(li));
                     for (int h = 0; h < n_kv_heads; ++h) {
+                        // 写入第 h 个头、第 pos 个位置的 K
                         std::memcpy(k_layer + h * head_plane + pos_off,
                                     kc + h * head_dim, head_dim * sizeof(float));
+                        // 写入第 h 个头、第 pos 个位置的 V
                         std::memcpy(v_layer + h * head_plane + pos_off,
                                     vc + h * head_dim, head_dim * sizeof(float));
                     }
 
-                    // Attention
+                    // Attention：Q 对 KV cache 中 [0..pos] 所有位置加权求和
+                    // seq_len = pos + 1（包含当前 token 自身）
                     backend_->attention_decode(qc, kv_.k(static_cast<int>(li)),
                                      kv_.v(static_cast<int>(li)), pos + 1, max_seq_len_,
                                      n_heads, n_kv_heads, head_dim, attn_scale, ac);
                 }
             }
 
-            // 2d. O projection via GEMM + residual
+            // 2d. O 投影：通过 GEMM 批量计算 + 残差连接
             {
                 std::snprintf(name, sizeof(name), "layer_%d.o_proj", li);
                 ScopedTimer t(prof, name);
                 mm(w.o_proj, attn_batch.data(), o_batch.data(), hidden, q_dim_, n);
             }
+            // 残差连接：x = x + attention(x)
             {
                 std::snprintf(name, sizeof(name), "layer_%d.residual_attn", li);
                 ScopedTimer t(prof, name);
@@ -164,7 +221,7 @@ namespace tinyqwen {
                     hid_batch[j] += o_batch[j];
             }
 
-            // 2e. Post-attention RMSNorm
+            // 2e. Post-attention RMSNorm：所有 token 的 attention 后归一化
             {
                 std::snprintf(name, sizeof(name), "layer_%d.post_attn_layernorm", li);
                 ScopedTimer t(prof, name);
@@ -175,7 +232,7 @@ namespace tinyqwen {
                 }
             }
 
-            // 2f. FFN gate/up via GEMM
+            // 2f. FFN gate/up 投影：通过 GEMM 批量计算
             {
                 std::snprintf(name, sizeof(name), "layer_%d.gate_up_proj", li);
                 ScopedTimer t(prof, name);
@@ -183,7 +240,7 @@ namespace tinyqwen {
                 mm(w.up, norm_batch.data(), up_batch.data(), inter, hidden, n);
             }
 
-            // 2g. SwiGLU (per-token)
+            // 2g. SwiGLU 激活：逐 token 计算（gate 就地复用为融合结果）
             {
                 std::snprintf(name, sizeof(name), "layer_%d.swiglu", li);
                 ScopedTimer t(prof, name);
@@ -193,12 +250,13 @@ namespace tinyqwen {
                 }
             }
 
-            // 2h. Down projection via GEMM + residual
+            // 2h. Down 投影：通过 GEMM 批量计算 + 残差连接
             {
                 std::snprintf(name, sizeof(name), "layer_%d.down_proj", li);
                 ScopedTimer t(prof, name);
                 mm(w.down, gate_batch.data(), ffn_batch.data(), hidden, inter, n);
             }
+            // 残差连接：x = x + ffn(x)
             {
                 std::snprintf(name, sizeof(name), "layer_%d.residual_ffn", li);
                 ScopedTimer t(prof, name);
@@ -207,35 +265,43 @@ namespace tinyqwen {
             }
         }
 
-        // Step 3: Final norm + lm_head (last token only)
+        // =====================================================================
+        // Step 3: 最终 norm + lm_head（仅取最后一个 token 的 hidden state）
+        // =====================================================================
+        // 批量 prefill 只关心最后一个 token 的输出（即第一个生成 token）
         const float *last_hidden = hid_batch.data() + static_cast<size_t>(n - 1) * hidden;
         {
             ScopedTimer t(prof, "final_norm");
             backend_->rmsnorm(last_hidden, final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
         }
+        // lm_head：将 hidden 向量投影到词表空间得到 logits
         {
             ScopedTimer t(prof, "lm_head");
             if (lm_head_is_f32_) {
+                // I4 tied embeddings：embed 是 fp32，lm_head 走 f32 matvec
                 matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
                            logits_.data(), vocab, hidden);
             } else {
+                // 正常路径：通过 backend 的 matvec
                 mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
             }
         }
 
-        // Step 4: argmax
+        // =====================================================================
+        // Step 4: argmax — 取 logits 中分数最高的 token 作为下一个生成
+        // =====================================================================
         int next = 0;
         {
             ScopedTimer t(prof, "topk_argmax");
             if (topk) {
                 top_k_logits(logits_.data(), vocab, topk_k, topk);
-                next = topk->indices.empty() ? 0 : topk->indices[0];
+                next = topk->indices.empty() ? 0 : topk->indices[0]; // 第一个就是 argmax
             } else {
-                next = argmax(logits_.data(), vocab);
+                next = argmax(logits_.data(), vocab); // 直接取最大值索引
             }
         }
 
-        // Advance KV cache and token counter for all N tokens
+        // 推进 KV cache 和 token 计数器（所有 N 个 token 都已写入 cache）
         kv_.advance(n);
         token_count_ += n;
         return next;

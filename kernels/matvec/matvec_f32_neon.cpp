@@ -1,4 +1,6 @@
-// 矩阵乘向量：y = W @ x —— NEON SIMD 版（aarch64）。
+// ============================================================================
+// matvec_f32_neon.cpp — 矩阵乘向量：y = W @ x —— NEON SIMD 版（aarch64）
+// ============================================================================
 //
 // ============================================================================
 // 先建立直觉：什么是 SIMD，为什么它快
@@ -92,30 +94,35 @@
 //
 // 选用：--matvec-impl neon / tinyqwen.conf 里 matvec_impl = neon。
 // 注意：这里不加 bias；与 ref 相同。
+// ============================================================================
 
 #include "dispatch.h" // TINYQWEN_MATVEC_VARIANT 自注册宏
-#include "ref_ops.h"
+#include "ref_ops.h"  // 辅助函数声明
 
 // 平台开关：只有 aarch64（GCC/Clang 定义 __aarch64__，MSVC 定义 _M_ARM64）
 // 才编译下面的实现；其他平台整个文件被预处理器删掉，等于空文件——
 // 那里没有 <arm_neon.h>，硬编会直接编译失败。
 #if defined(__aarch64__) || defined(_M_ARM64)
 
-#include <arm_neon.h> // NEON intrinsic  declarations（编译器自带，非第三方）
+#include <arm_neon.h> // NEON intrinsic declarations（编译器自带，非第三方）
 
-#include <cstddef>
+#include <cstddef>    // size_t
 
 namespace tinyqwen {
   namespace {
     // ========================================================================
-    // W 的一行与 x 的点积：整个 kernel 的内循环，所有优化都发生在这里。
-    //
+    // dot_row_neon() — W 的一行与 x 的点积：NEON 4 链 FMA
+    // ========================================================================
+    // 整个 kernel 的内循环，所有优化都发生在这里。
     // 计算的是 row[0]*x[0] + row[1]*x[1] + ... + row[n-1]*x[n-1]，
     // 和标量版完全同一个数学结果，只是把元素 16 个一批地喂给硬件。
-    // ========================================================================
+    // 参数：
+    //   row — 权重行的起始地址（fp32）
+    //   x   — 输入向量（fp32）
+    //   n   — 向量长度（in_dim）
+    // 返回值：点积结果（fp32）
     inline float dot_row_neon(const float *row, const float *x, int n) {
       // ==== 【累加结构·初始化】4 个独立累加器 ============================
-      // 这是"累加"三件事里的第一件：给部分和准备落脚的地方。
       // vdupq_n_f32(v)：dup = duplicate，把标量 v 复制进 4 个 lane，
       // 即构造向量 [v, v, v, v]。这里就是 4 个全零累加器。
       //
@@ -127,10 +134,10 @@ namespace tinyqwen {
       //   把 4 条链交错起来，每个周期都有 FMA 在流水线上跑，
       //   延迟被完全重叠——吞吐量顶满。
       // 代价：最后要把 4 个部分和合并起来（见函数末尾，很便宜）。
-      float32x4_t acc0 = vdupq_n_f32(0.0f);
-      float32x4_t acc1 = vdupq_n_f32(0.0f);
-      float32x4_t acc2 = vdupq_n_f32(0.0f);
-      float32x4_t acc3 = vdupq_n_f32(0.0f);
+      float32x4_t acc0 = vdupq_n_f32(0.0f); // 累加器 0：全零 [0,0,0,0]
+      float32x4_t acc1 = vdupq_n_f32(0.0f); // 累加器 1
+      float32x4_t acc2 = vdupq_n_f32(0.0f); // 累加器 2
+      float32x4_t acc3 = vdupq_n_f32(0.0f); // 累加器 3
 
       int i = 0;
       // ---- 主循环：一次迭代吃 16 个元素（4 条链 × 每条 4 个 lane）----
@@ -159,10 +166,10 @@ namespace tinyqwen {
         //
         // 四条链互不依赖（各写各的 acc），让 CPU 重叠 FMA 延迟
         // （为什么是 4 个累加器，见上面"累加结构"的咖啡机类比）。
-        acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(row + i + 4), vld1q_f32(x + i + 4));
-        acc2 = vfmaq_f32(acc2, vld1q_f32(row + i + 8), vld1q_f32(x + i + 8));
-        acc3 = vfmaq_f32(acc3, vld1q_f32(row + i + 12), vld1q_f32(x + i + 12));
+        acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));         // 链0: elem[i..i+3]
+        acc1 = vfmaq_f32(acc1, vld1q_f32(row + i + 4), vld1q_f32(x + i + 4)); // 链1: elem[i+4..i+7]
+        acc2 = vfmaq_f32(acc2, vld1q_f32(row + i + 8), vld1q_f32(x + i + 8)); // 链2: elem[i+8..i+11]
+        acc3 = vfmaq_f32(acc3, vld1q_f32(row + i + 12), vld1q_f32(x + i + 12)); // 链3: elem[i+12..i+15]
       }
       // ==== 向量尾段：还剩 4~15 个元素（n 不是 16 的倍数时）====
       // 和主循环同一套 SIMD+FMA+累加，只是每次只开一条链吃 4 个。
@@ -174,22 +181,21 @@ namespace tinyqwen {
         acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
       }
       // ==== 【累加结构·收敛】把 16 路部分和攒成一个标量 ====
-      // 这是"累加"的第二件大事：到目前为止部分和散落在 4 个寄存器 ×
-      // 4 个 lane 里（16 路并行攒出来的），现在要把它们全部加起来。
-      // 注意这两步只做加法、没有乘法——纯累加，不含 FMA。
+      // 到目前为止部分和散落在 4 个寄存器 × 4 个 lane 里（16 路并行攒出来的），
+      // 现在要把它们全部加起来。注意这两步只做加法、没有乘法——纯累加，不含 FMA。
       //
       // vaddq_f32(a, b)：逐 lane 相加，[a0+b0, a1+b1, a2+b2, a3+b3]。
       //   先两两合并：sum01 的每个 lane = 链0 与链1 对应 lane 之和。
       //   （lane 之间互不 mixing，还是 SIMD：一条指令加 4 对。）
-      const float32x4_t sum01 = vaddq_f32(acc0, acc1);
-      const float32x4_t sum23 = vaddq_f32(acc2, acc3);
+      const float32x4_t sum01 = vaddq_f32(acc0, acc1); // sum01[lane] = acc0[lane] + acc1[lane]
+      const float32x4_t sum23 = vaddq_f32(acc2, acc3); // sum23[lane] = acc2[lane] + acc3[lane]
       // vaddvq_f32(v)：多了个 "v" = across Vector，横向归约——
       //   把一个向量里的 4 个 lane 加成一个标量：v0+v1+v2+v3。
       //   这一步从"4 路并行"收敛到"1 个数"，SIMD 到此为止。
-      float total = vaddvq_f32(vaddq_f32(sum01, sum23));
+      float total = vaddvq_f32(vaddq_f32(sum01, sum23)); // total = Σ all 16 partial sums
       // ==== 标量尾段：还剩 0~3 个元素（n 不是 4 的倍数的零头）====
       // 例：n = 4103 → 上面吃到 4100，这里补最后 3 个。
-      // 逐个乘加：这里回到标量世界——没有 SIMD（一次 1 个元素），
+      // 逐个乘加：回到标量世界——没有 SIMD（一次 1 个元素），
       // 累加也是普通标量累加（编译器可能顺手融合成标量 FMA，
       // 但那是它的事，逻辑上就是乘 + 加 + 攒）。不值得再动向量指令，
       // 也绝不会越界读。
@@ -204,14 +210,22 @@ namespace tinyqwen {
   } // namespace
 
   // ========================================================================
-  // 外层：对 W 的每一行算一个点积，得到 y 的一个分量。
-  // 结构与 matvec_f32_ref 完全一致——优化全部封装在 dot_row_neon 里，
-  // 这也是"变体与 ref 签名/语义完全相同"纪律的体现：调用方无感。
+  // matvec_f32_neon() — 外层入口
   // ========================================================================
+  // 功能：计算 y = W @ x（fp32，NEON 4 链 FMA）
+  // 参数：
+  //   w       — 权重矩阵，行主序 [out_dim, in_dim]
+  //   x       — 输入向量（长度 in_dim）
+  //   y       — 输出向量（长度 out_dim）
+  //   out_dim — 输出维度
+  //   in_dim  — 输入维度
+  // 说明：结构与 matvec_f32_ref 完全一致——优化全部封装在 dot_row_neon 里，
+  //       这也是"变体与 ref 签名/语义完全相同"纪律的体现：调用方无感。
   void matvec_f32_neon(const float *w, const float *x, float *y, int out_dim, int in_dim) {
     for (int o = 0; o < out_dim; ++o) {
-      // 第 o 行起点：跳过前面 o 行（每行 in_dim 个 float）。
+      // 第 o 行起点：跳过前面 o 行（每行 in_dim 个 float）
       const float *row = w + static_cast<size_t>(o) * in_dim;
+      // 用 NEON 点积计算该行的输出分量
       y[o] = dot_row_neon(row, x, in_dim);
     }
   }

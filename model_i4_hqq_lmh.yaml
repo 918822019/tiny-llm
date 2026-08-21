@@ -1,38 +1,55 @@
+# =============================================================================
+# model_i4_hqq_lmh.yaml —— Qwen2.5-0.5B INT4 HQQ 全量化模型注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件记录 INT4 HQQ 全量化模型（含 lm_head 量化）的元数据。
+#   与 model_i4_hqq 的区别是 lm_head 也被量化为 INT4，
+#   将 lm_head 的流量从 544 MB/token 降低到 70 MB/token，
+#   大幅减少了 decode 阶段的带宽瓶颈。
+#
+#   W4A8 SDOT 配方：权重 INT4 + 激活对称 INT8 量化 + 整数点积，
+#   是当前 INT4 路线的最佳配方，在机器发热时能追平 FP16 满血性能。
+# =============================================================================
+
 # Model registry: model_i4_hqq_lmh.tqwen（Qwen2.5-0.5B i4 HQQ@64 + lm_head i4）
 name: model_i4_hqq_lmh
 architecture: qwen2.5
 source: Qwen/Qwen2.5-0.5B
-dtype: i4
+dtype: i4                    # 权重数据类型：INT4
 file: model_i4_hqq_lmh.tqwen
-size_mb: 784.6
+size_mb: 784.6               # 比未量化 lm_head 版本略大（独立 lm_head 副本）
 
+# 模型结构参数
 params:
-  n_layers: 24
-  hidden_size: 896
-  intermediate_size: 4864
-  n_heads: 14
-  n_kv_heads: 2
-  head_dim: 64
-  vocab_size: 151936
-  tied_embeddings: true
+  n_layers: 24               # Transformer 层数
+  hidden_size: 896           # 隐藏层维度
+  intermediate_size: 4864    # FFN 中间层维度
+  n_heads: 14                # Query 注意力头数
+  n_kv_heads: 2              # Key/Value 注意力头数（GQA）
+  head_dim: 64               # 每个注意力头的维度
+  vocab_size: 151936         # 词表大小
+  tied_embeddings: true      # 嵌入层和输出层共享权重
 
+# 量化配置：HQQ@64，lm_head 也量化
 quantization:
-  method: hqq
-  group_size: 64
-  lm_head_quantized: true
+  method: hqq                # 量化方法：HQQ（Half-Quadratic Quantization）
+  group_size: 64             # 量化组大小：每 64 个权重共享一组 scale/zero
+  lm_head_quantized: true    # lm_head 也量化为 INT4（关键优化）
   note: tied 模型导出独立 lm_head i4 副本（embed 保持 fp32 lookup），流量 544→70MB/token
 
+# 推荐的计算配方：W4A8 SDOT 多线程（当前最佳 INT4 配方）
 recipe:
-  matvec_impl: sdot_mt
-  ops_impl: neon
+  matvec_impl: sdot_mt       # 矩阵乘：W4A8 SDOT（激活 int8 + SDOT 整数点积）
+  ops_impl: neon             # 非 matvec 算子：NEON 向量化
   note: W4A8 SDOT（激活 int8 + SDOT 整数点积），i4 最佳配方
 
+# 基准测试结果
 benchmark:
   android:
-    topt_ms: 22.35
-    ttft_ms: 1119.19
-    peak_rss_mb: 791.3
-    pmu_dram_bw_gbps: null
+    topt_ms: 22.35           # 每个 token 生成时间（vs f16 满血 17.05 = 0.76×）
+    ttft_ms: 1119.19         # 首个 token 时间
+    peak_rss_mb: 791.3       # 峰值内存占用
+    pmu_dram_bw_gbps: null   # DRAM 带宽未测量
     device: PLK110
     commit: 54d05f4+
     note: vs f16 满血 17.05 = 0.76×（追平过热 f16 21.16）；i4 的价值是内存+热稳定

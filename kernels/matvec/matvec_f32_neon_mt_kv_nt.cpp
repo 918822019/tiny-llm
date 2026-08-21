@@ -1,5 +1,7 @@
-// 矩阵乘向量：y = W @ x —— NEON + 多线程 + k/v 融合 + 流式加载（LDNP）版。
-//
+// ============================================================================
+// matvec_f32_neon_mt_kv_nt.cpp — 矩阵乘向量：y = W @ x
+//                  NEON + 多线程 + k/v 融合 + 流式加载（LDNP）版
+// ============================================================================
 // 在 neon_mt_kv 之上只改一件事：**权重加载指令**。
 //
 // ============================================================================
@@ -23,19 +25,19 @@
 //    加载**静默丢弃提示**（实测 codegen 仍出普通 ldp），所以 LDNP 用
 //    内联汇编显式发射：`ldnp q0, q1, [ptr]` 一条指令加载 32B = 8 float，
 //    顺带把加载指令数减半（16 float 从 4 条 ldp 变 2 条 ldnp）；
-// 2. **LDNP 要求地址 16B 对齐**（SIMD&FP load pair 不对齐即 fault，
-//    不像标量 LDP 容忍非对齐）。真实模型里所有权重的行起点都满足：
-//    tensor 基址 64B 对齐（.tqwen 格式保证）× in_dim 是 4 的倍数
-//    （896/4864/128...）→ 行步长是 16 的倍数。但 kernel 不假设调用方，
+// 2. **LDNP 要求地址 16B 对齐**（SIMD&FP load pair 不对齐即 fault）。
+//    真实模型里所有权重的行起点都满足对齐，但 kernel 不假设调用方，
 //    逐行检查对齐：不对齐的行退回普通 vld1q 点积（与 neon 逐位一致）；
-// 3. x 向量的加载**保持普通 vld1q**——x 每行都要重用（3.5KB，热数据），
+// 3. x 向量的加载**保持普通 vld1q**——x 每行都要重用（热数据），
 //    恰恰要留在 cache 里，只有权重流适用非时间提示；
-// 4. 除加载指令外，累加结构（4 链 FMA）、尾段处理、线程池、pair 融合
+// 4. 除加载指令外，累加结构（4 链 FMA）、尾段处理、线程池、pair/QKV 融合
 //    与 neon_mt_kv 完全一致，所以对齐门禁相同。
 //
+// 提供三个入口：单矩阵 / 成对(pair) / QKV 三矩阵融合。
 // 选用：--matvec-impl neon_mt_kv_nt（仅 aarch64 构建注册；其他平台编译为空）。
+// ============================================================================
 
-#include "dispatch.h" // TINYQWEN_MATVEC_VARIANT / TINYQWEN_MATVEC_PAIR_VARIANT
+#include "dispatch.h" // TINYQWEN_MATVEC_VARIANT / _PAIR_VARIANT / _QKV_VARIANT
 #include "ref_ops.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -55,43 +57,55 @@
 
 namespace tinyqwen {
   namespace {
-    // ---- 普通行点积：与 neon_mt 逐位一致（对齐兜底 / x 的加载用它）----
+    // ========================================================================
+    // dot_row_neon() — 普通行点积：与 neon_mt 逐位一致（对齐兜底路径）
+    // ========================================================================
     inline float dot_row_neon(const float *row, const float *x, int n) {
-      float32x4_t acc0 = vdupq_n_f32(0.0f);
-      float32x4_t acc1 = vdupq_n_f32(0.0f);
-      float32x4_t acc2 = vdupq_n_f32(0.0f);
-      float32x4_t acc3 = vdupq_n_f32(0.0f);
+      float32x4_t acc0 = vdupq_n_f32(0.0f); // 累加器 0
+      float32x4_t acc1 = vdupq_n_f32(0.0f); // 累加器 1
+      float32x4_t acc2 = vdupq_n_f32(0.0f); // 累加器 2
+      float32x4_t acc3 = vdupq_n_f32(0.0f); // 累加器 3
       int i = 0;
-      const int n16 = n & ~15;
+      const int n16 = n & ~15; // 主循环边界：16 的倍数
       for (; i < n16; i += 16) {
+        // 4 条独立 FMA 链，各处理 4 个连续元素
         acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
         acc1 = vfmaq_f32(acc1, vld1q_f32(row + i + 4), vld1q_f32(x + i + 4));
         acc2 = vfmaq_f32(acc2, vld1q_f32(row + i + 8), vld1q_f32(x + i + 8));
         acc3 = vfmaq_f32(acc3, vld1q_f32(row + i + 12), vld1q_f32(x + i + 12));
       }
-      const int n4 = n & ~3;
+      const int n4 = n & ~3; // 向量尾段边界：4 的倍数
       for (; i < n4; i += 4) {
         acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
       }
+      // 合并 4 个累加器 + 横向归约
       const float32x4_t sum01 = vaddq_f32(acc0, acc1);
       const float32x4_t sum23 = vaddq_f32(acc2, acc3);
       float total = vaddvq_f32(vaddq_f32(sum01, sum23));
+      // 标量尾段
       for (; i < n; ++i) {
         total += row[i] * x[i];
       }
       return total;
     }
 
-    // LDNP 一次读一对 q 寄存器（32B = 8 float），带非时间提示。
-    // 内联汇编：q 编号由编译器通过 %q 分配；early-clobber（=&w）防止
-    // 输出与输入指针寄存器冲突。
+    // ========================================================================
+    // ldnp_pair() — LDNP 流式加载一对 q 寄存器（32B = 8 float）
+    // ========================================================================
+    // 功能：用 LDNP 指令从地址 p 加载 32 字节到两个 128 位 NEON 寄存器，
+    //       带非时间提示（不污染 cache）。
+    // 参数：p — 源地址（必须 16B 对齐）, lo/hi — 输出寄存器
+    // 说明：内联汇编中 %q 让编译器分配 q 寄存器编号；=&w 是 early-clobber
+    //       约束，防止输出寄存器与输入指针寄存器冲突。
     inline void ldnp_pair(const float *p, float32x4_t &lo, float32x4_t &hi) {
       __asm__("ldnp %q[lo], %q[hi], [%[p]]"
               : [lo] "=&w"(lo), [hi] "=&w"(hi)
               : [p] "r"(p));
     }
 
-    // ---- 流式行点积：权重走 LDNP，x 走普通加载 ----
+    // ========================================================================
+    // dot_row_neon_nt() — 流式行点积：权重走 LDNP，x 走普通加载
+    // ========================================================================
     // 主循环每次迭代吃 32 个元素：4 条 LDNP（各 8 float）喂给 4 条累加链，
     // 每条链两次 FMA。尾段（<32）退回普通加载的向量/标量处理。
     inline float dot_row_neon_nt(const float *row, const float *x, int n) {
@@ -100,13 +114,15 @@ namespace tinyqwen {
       float32x4_t acc2 = vdupq_n_f32(0.0f);
       float32x4_t acc3 = vdupq_n_f32(0.0f);
       int i = 0;
-      const int n32 = n & ~31;
+      const int n32 = n & ~31; // 主循环边界：32 的倍数
       for (; i < n32; i += 32) {
+        // 用 LDNP 加载 8 组各 4 个 float（共 32 float = 128 字节权重）
         float32x4_t w0, w1, w2, w3, w4, w5, w6, w7;
-        ldnp_pair(row + i, w0, w1);
-        ldnp_pair(row + i + 8, w2, w3);
-        ldnp_pair(row + i + 16, w4, w5);
-        ldnp_pair(row + i + 24, w6, w7);
+        ldnp_pair(row + i, w0, w1);      // LDNP: float[i..i+7]
+        ldnp_pair(row + i + 8, w2, w3);  // LDNP: float[i+8..i+15]
+        ldnp_pair(row + i + 16, w4, w5); // LDNP: float[i+16..i+23]
+        ldnp_pair(row + i + 24, w6, w7); // LDNP: float[i+24..i+31]
+        // 每条链消费 2 个 LDNP 结果，x 用普通 vld1q_f32
         acc0 = vfmaq_f32(acc0, w0, vld1q_f32(x + i));
         acc0 = vfmaq_f32(acc0, w1, vld1q_f32(x + i + 4));
         acc1 = vfmaq_f32(acc1, w2, vld1q_f32(x + i + 8));
@@ -116,7 +132,7 @@ namespace tinyqwen {
         acc3 = vfmaq_f32(acc3, w6, vld1q_f32(x + i + 24));
         acc3 = vfmaq_f32(acc3, w7, vld1q_f32(x + i + 28));
       }
-      // 尾段（0~31 个元素）：普通加载，向量 4 个一批 + 标量收尾。
+      // 尾段：普通加载
       const int n4 = n & ~3;
       for (; i < n4; i += 4) {
         acc0 = vfmaq_f32(acc0, vld1q_f32(row + i), vld1q_f32(x + i));
@@ -131,14 +147,14 @@ namespace tinyqwen {
     }
 
     // 行点积入口：行起点 16B 对齐走 LDNP 路径，否则兜底普通路径
-    // （LDNP 非对齐会 fault，不能假设调用方）。
     inline float dot_row(const float *row, const float *x, int n) {
       if ((reinterpret_cast<std::uintptr_t>(row) & 15) != 0) {
-        return dot_row_neon(row, x, n);
+        return dot_row_neon(row, x, n); // 未对齐：退回普通路径
       }
-      return dot_row_neon_nt(row, x, n);
+      return dot_row_neon_nt(row, x, n); // 对齐：走 LDNP
     }
 
+    // 自旋等待
     inline void spin_until(const std::atomic<std::uint64_t> &a, std::uint64_t target) {
       int spins = 0;
       while (a.load(std::memory_order_acquire) != target) {
@@ -152,6 +168,7 @@ namespace tinyqwen {
       }
     }
 
+    // 默认并行度
     inline int default_parallelism() {
       if (const char *env = std::getenv("TINYQWEN_MT_THREADS")) {
         const long v = std::strtol(env, nullptr, 10);
@@ -170,7 +187,9 @@ namespace tinyqwen {
       return p > 16 ? 16 : p;
     }
 
-    // 常驻行切分线程池：与 neon_mt_kv 完全相同（单矩阵 + pair 任务）。
+    // ========================================================================
+    // RowPool — 常驻行切分线程池（支持 single/pair/QKV 三种模式）
+    // ========================================================================
     struct RowPool {
       const float *w = nullptr;
       const float *w2 = nullptr;
@@ -204,9 +223,7 @@ namespace tinyqwen {
       ~RowPool() {
         shutdown.store(true, std::memory_order_release);
         job_gen.fetch_add(1, std::memory_order_release);
-        for (auto &t : workers) {
-          t.join();
-        }
+        for (auto &t : workers) { t.join(); }
       }
 
       void worker_main(int idx) {
@@ -220,6 +237,7 @@ namespace tinyqwen {
         }
       }
 
+      // 第 idx 块行区间上的逐行点积（根据 mode 选择矩阵和输出）
       void do_chunk(int idx) const {
         const int p = static_cast<int>(workers.size()) + 1;
         int total;
@@ -230,17 +248,11 @@ namespace tinyqwen {
         const int begin = idx * base + (idx < rem ? idx : rem);
         const int end = begin + base + (idx < rem ? 1 : 0);
         for (int r = begin; r < end; ++r) {
-          const float *wm;
-          float *ym;
-          int o;
+          const float *wm; float *ym; int o;
           if (mode == kQkv) {
-            if (r < qkv_q_dim) {
-              o = r; wm = w; ym = y;
-            } else if (r < qkv_q_dim + qkv_kv_dim) {
-              o = r - qkv_q_dim; wm = w2; ym = y2;
-            } else {
-              o = r - qkv_q_dim - qkv_kv_dim; wm = w3; ym = y3;
-            }
+            if (r < qkv_q_dim) { o = r; wm = w; ym = y; }
+            else if (r < qkv_q_dim + qkv_kv_dim) { o = r - qkv_q_dim; wm = w2; ym = y2; }
+            else { o = r - qkv_q_dim - qkv_kv_dim; wm = w3; ym = y3; }
           } else if (pair && r >= out_dim) {
             o = r - out_dim; wm = w2; ym = y2;
           } else {
@@ -259,58 +271,32 @@ namespace tinyqwen {
       }
 
       void run(const float *w_, const float *x_, float *y_, int out_dim_, int in_dim_) {
-        w = w_;
-        w2 = nullptr;
-        x = x_;
-        y = y_;
-        y2 = nullptr;
-        out_dim = out_dim_;
-        in_dim = in_dim_;
-        pair = false;
-        mode = kSingle;
+        w = w_; w2 = nullptr; x = x_; y = y_; y2 = nullptr;
+        out_dim = out_dim_; in_dim = in_dim_; pair = false; mode = kSingle;
         publish_and_run();
       }
 
       void run_pair(const float *w1_, const float *w2_, const float *x_, float *y1_,
                     float *y2_, int out_dim_, int in_dim_) {
-        w = w1_;
-        w2 = w2_;
-        x = x_;
-        y = y1_;
-        y2 = y2_;
-        out_dim = out_dim_;
-        in_dim = in_dim_;
-        pair = true;
-        mode = kPair;
+        w = w1_; w2 = w2_; x = x_; y = y1_; y2 = y2_;
+        out_dim = out_dim_; in_dim = in_dim_; pair = true; mode = kPair;
         publish_and_run();
       }
 
       void run_qkv(const float *wq_, const float *wk_, const float *wv_,
                    const float *x_, float *yq_, float *yk_, float *yv_,
                    int q_dim_, int kv_dim_, int in_dim_) {
-        w = wq_;
-        w2 = wk_;
-        w3 = wv_;
-        x = x_;
-        y = yq_;
-        y2 = yk_;
-        y3 = yv_;
-        qkv_q_dim = q_dim_;
-        qkv_kv_dim = kv_dim_;
-        in_dim = in_dim_;
-        pair = false;
-        mode = kQkv;
+        w = wq_; w2 = wk_; w3 = wv_; x = x_; y = yq_; y2 = yk_; y3 = yv_;
+        qkv_q_dim = q_dim_; qkv_kv_dim = kv_dim_; in_dim = in_dim_;
+        pair = false; mode = kQkv;
         publish_and_run();
       }
     };
 
-    RowPool &pool() {
-      static RowPool p;
-      return p;
-    }
+    RowPool &pool() { static RowPool p; return p; }
 
-    constexpr std::size_t kMinParallelElems = 262144;     // 单矩阵阈值（同 neon_mt）
-    constexpr std::size_t kMinPairParallelElems = 131072; // pair 阈值（同 neon_mt_kv）
+    constexpr std::size_t kMinParallelElems = 262144;
+    constexpr std::size_t kMinPairParallelElems = 131072;
 
     inline void matvec_inline(const float *w, const float *x, float *y, int out_dim,
                               int in_dim) {
@@ -321,6 +307,7 @@ namespace tinyqwen {
     }
   } // namespace
 
+  // 单矩阵入口
   void matvec_f32_neon_mt_kv_nt(const float *w, const float *x, float *y, int out_dim,
                                 int in_dim) {
     RowPool &p = pool();
@@ -332,6 +319,7 @@ namespace tinyqwen {
     p.run(w, x, y, out_dim, in_dim);
   }
 
+  // 成对入口
   void matvec_pair_f32_neon_mt_kv_nt(const float *w1, const float *w2, const float *x,
                                      float *y1, float *y2, int out_dim, int in_dim) {
     RowPool &p = pool();
@@ -344,6 +332,7 @@ namespace tinyqwen {
     p.run_pair(w1, w2, x, y1, y2, out_dim, in_dim);
   }
 
+  // QKV 三矩阵融合入口
   void matvec_qkv_f32_neon_mt_kv_nt(const float *wq, const float *wk, const float *wv,
                                     const float *x, float *yq, float *yk, float *yv,
                                     int q_dim, int kv_dim, int in_dim) {
@@ -358,7 +347,7 @@ namespace tinyqwen {
     p.run_qkv(wq, wk, wv, x, yq, yk, yv, q_dim, kv_dim, in_dim);
   }
 
-  // 自注册：matvec 主入口 + pair 入口 + qkv 入口同名登记。仅 aarch64 构建存在。
+  // 自注册：仅 aarch64 构建存在
   TINYQWEN_MATVEC_VARIANT(matvec_f32_neon_mt_kv_nt, "neon_mt_kv_nt");
   TINYQWEN_MATVEC_PAIR_VARIANT(matvec_pair_f32_neon_mt_kv_nt, "neon_mt_kv_nt");
   TINYQWEN_MATVEC_QKV_VARIANT(matvec_qkv_f32_neon_mt_kv_nt, "neon_mt_kv_nt");

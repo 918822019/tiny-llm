@@ -1,5 +1,6 @@
-// 矩阵乘向量：y = W @ x —— NEON 向量化版，**故意不用 FMA**。
-//
+// ============================================================================
+// matvec_f32_neon_nofma.cpp — 矩阵乘向量：y = W @ x
+//                  NEON 向量化版，**故意不用 FMA**
 // ============================================================================
 // 归因阶梯上的位置（每层只加一个技术，A/B 才能说清功劳归谁）：
 //
@@ -30,6 +31,7 @@
 // 平台说明：与 neon 相同，仅 aarch64 编译注册；其他平台本文件为空，
 // "neon_nofma" 不存在于注册表。
 // 选用：--matvec-impl neon_nofma。不加 bias；与 ref 相同。
+// ============================================================================
 
 #include "dispatch.h" // TINYQWEN_MATVEC_VARIANT 自注册宏
 #include "ref_ops.h"
@@ -42,37 +44,44 @@
 
 namespace tinyqwen {
   namespace {
-    // W 的一行与 x 的点积：NEON 4 链，乘加**不融合**。
+    // ========================================================================
+    // dot_row_neon_nofma() — W 的一行与 x 的点积：NEON 4 链，乘加不融合
+    // ========================================================================
+    // 功能：计算 row[0..n-1] 与 x[0..n-1] 的点积
+    // 参数：row — fp32 权重行, x — fp32 输入向量, n — 向量长度
+    // 返回值：点积结果（fp32）
+    // 说明：与 neon 唯一的区别是乘加分开（vmulq + vaddq 代替 vfmaq），
+    //       用于隔离 SIMD 宽度的贡献。
     inline float dot_row_neon_nofma(const float *row, const float *x, int n) {
-      // 4 个独立累加器（结构与 acc4/neon 完全相同）。
+      // 4 个独立累加器（结构与 acc4/neon 完全相同）
       float32x4_t acc0 = vdupq_n_f32(0.0f);
       float32x4_t acc1 = vdupq_n_f32(0.0f);
       float32x4_t acc2 = vdupq_n_f32(0.0f);
       float32x4_t acc3 = vdupq_n_f32(0.0f);
 
       int i = 0;
-      // 主循环：一次迭代吃 16 个元素（4 链 × 4 lane），与 neon 相同。
+      // 主循环：一次迭代吃 16 个元素（4 链 × 4 lane），与 neon 相同
       const int n16 = n & ~15;
       for (; i < n16; i += 16) {
         // 与 neon 唯一的区别就在这一类语句：
-        //   vmulq_f32(a, b)：逐 lane 相乘，a[lane]*b[lane]（只乘不加）；
-        //   vaddq_f32(acc, t)：逐 lane 相加，把乘积加进累加器。
-        // 两条指令、两次舍入——这就是"不用 FMA"的全部含义。
+        //   vmulq_f32(a, b)：逐 lane 相乘，a[lane]*b[lane]（只乘不加）
+        //   vaddq_f32(acc, t)：逐 lane 相加，把乘积加进累加器
+        // 两条指令、两次舍入——这就是"不用 FMA"的全部含义
         acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(row + i), vld1q_f32(x + i)));
         acc1 = vaddq_f32(acc1, vmulq_f32(vld1q_f32(row + i + 4), vld1q_f32(x + i + 4)));
         acc2 = vaddq_f32(acc2, vmulq_f32(vld1q_f32(row + i + 8), vld1q_f32(x + i + 8)));
         acc3 = vaddq_f32(acc3, vmulq_f32(vld1q_f32(row + i + 12), vld1q_f32(x + i + 12)));
       }
-      // 向量尾段：还剩 4~15 个元素时按 4 个处理（同 neon）。
+      // 向量尾段：还剩 4~15 个元素时按 4 个处理（同 neon）
       const int n4 = n & ~3;
       for (; i < n4; i += 4) {
         acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(row + i), vld1q_f32(x + i)));
       }
-      // 合并 + 横向归约：与 neon 完全相同（纯累加，不含乘法）。
+      // 合并 + 横向归约：与 neon 完全相同（纯累加，不含乘法）
       const float32x4_t sum01 = vaddq_f32(acc0, acc1);
       const float32x4_t sum23 = vaddq_f32(acc2, acc3);
       float total = vaddvq_f32(vaddq_f32(sum01, sum23));
-      // 标量尾段：不足 4 个的零头（同 neon）。
+      // 标量尾段：不足 4 个的零头（同 neon）
       for (; i < n; ++i) {
         total += row[i] * x[i];
       }
@@ -80,14 +89,18 @@ namespace tinyqwen {
     }
   } // namespace
 
+  // ========================================================================
+  // matvec_f32_neon_nofma() — 外层入口
+  // ========================================================================
+  // 功能：计算 y = W @ x（fp32，NEON 4 链，乘加分开）
   void matvec_f32_neon_nofma(const float *w, const float *x, float *y, int out_dim, int in_dim) {
     for (int o = 0; o < out_dim; ++o) {
-      const float *row = w + static_cast<size_t>(o) * in_dim;
-      y[o] = dot_row_neon_nofma(row, x, in_dim);
+      const float *row = w + static_cast<size_t>(o) * in_dim; // 定位行起点
+      y[o] = dot_row_neon_nofma(row, x, in_dim); // 用 nofma 点积计算
     }
   }
 
-  // 自注册进 dispatch：--matvec-impl neon_nofma 即可选用（仅 aarch64 构建存在）。
+  // 自注册进 dispatch：--matvec-impl neon_nofma 即可选用（仅 aarch64 构建存在）
   TINYQWEN_MATVEC_VARIANT(matvec_f32_neon_nofma, "neon_nofma");
 } // namespace tinyqwen
 
