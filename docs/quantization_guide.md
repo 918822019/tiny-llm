@@ -186,6 +186,53 @@ python tools/verify_i4_accuracy.py --model-i4 model_i4.tqwen --model-fp32 model_
 python tools/visualize.py all profile.json -o viz.html
 ```
 
+## i4 导出器的性能设计（2026-08 重构）
+
+大模型（4B+）的 i4 导出曾耗时 ~40 分钟，重构后降到 ~10 分钟量级。关键设计：
+
+1. **打包向量化**：nibble 打包用 numpy 三维视图一次组装（`pack_i4_groups`），
+   替代三重纯 Python 循环。lm_head 量级张量从 ~10 分钟降到秒级。
+2. **RTN 向量化**：min/max/scale/zero 按组轴批量计算，与旧逐组循环**逐位一致**
+   （取整链 round→int32→clip→uint4 完全相同，含 fp16 下溢/退化组边界）。
+3. **流式两遍写盘**：第一遍取 shape 定布局，第二遍边加载边量化边写——
+   内存峰值只与在途任务数相关，不再随模型大小线性膨胀（旧版一次性持有
+   全模型 fp32，4B ≈ 15GB，16GB 机器靠交换硬撑）。
+4. **并行量化**（`--workers`，默认自动 = 核数/3）：进程池量化 + "鲸鱼优先"
+   提交（lm_head 最先开跑，与其余张量重叠，消除串行长尾）。
+5. **行拆分（鲸鱼张量）**：超大张量按行拆成 ~64M 元素块分给多 worker。
+   必须拆的两个理由：a) 消除 lm_head 串行长尾；b) 内存——HQQ 整块量化
+   lm_head（635M 元素）单 worker 峰值 ~10GB（fp32 输入 + torch 副本 +
+   unpack 临时区），16GB 机器实测 OOM 被杀。RTN 拆分逐位可证；HQQ 拆分
+   有 fp16 ULP 级漂移（torch 归约顺序依赖行数）：全文件仅几十字节差异，
+   scale/q 一致、zero 偶有 ±1 ULP，质量等价（ULP ≪ 量化步长）。
+
+正确性回归手段（改导出器必跑）：
+
+```bash
+# 1. 新旧实现逐字节对照自测（随机数据 + 边界 + 拆分一致性）
+python tools/selftest_export_i4.py
+
+# 2. 真实模型字节级回归：重导出与既有文件 cmp（同时验证 HQQ 确定性）
+#    注意必须 --workers 1：并行 worker 内 torch 线程数不同，归约累加顺序
+#    会变，产生 fp16 ULP 级差异（全文件仅几十字节，质量等价但字节不同）。
+#    workers>1 的导出自身可复现（同 workers 配置逐位一致），只是与串行
+#    参考存在 ULP 差。
+python tools/export_qwen_to_tiny_i4.py --model models/Qwen3.5-0.8B \
+    --out /tmp/re.tqwen --method hqq --group-size 64 --workers 1
+cmp /tmp/re.tqwen model_qwen35_i4.tqwen
+```
+
+已知坑：
+- **HQQ 鲸鱼张量的 ULP 漂移**：并行拆分路径下 lm_head 输出与串行整块参考
+  存在几十字节的 ULP 级差异（质量等价）。需要字节级复现时统一用
+  `--workers 1`（串行路径不拆分、torch 默认线程，逐位可复现）。
+- **worker 内存峰值**：HQQ 量化的单 worker 峰值 ≈ 张量 fp32 × 4~5 倍
+  （输入 + torch Linear 副本 + unpack float32 临时区 + HQQ 内部量），
+  这是鲸鱼必须行拆分的硬约束，调大 SHARD_TARGET 前先算内存账。
+
+实测（M4，Qwen3.5-0.8B HQQ g64）：重构前 ~5 分钟 → 串行 86s → 并行 77s。
+4B 量级收益更大（打包循环从 ~15 分钟降到 ~1 分钟，层间量化再吃并行收益）。
+
 ## 参考资料
 
 - [GPTQ 论文](https://arxiv.org/abs/2210.17323)

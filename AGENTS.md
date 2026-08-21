@@ -31,6 +31,10 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
 
 ## 核心工作流
 
+- **接入新模型（一条命令）**：`./scripts/add_model.sh <HF 模型目录> [--dtype i4|f16] [--method hqq|rtn]`
+  —— 自动走完：编译 → 导出 → 文件头校验 → 冒烟生成+解码验证。i4 默认 HQQ（质量优先），
+  快速试跑用 `--method rtn`（快数倍）。导出器支持 `--workers` 并行量化 + 流式写盘，
+  4B 量级内存占用有界（旧版会把全模型 fp32 驻留内存）。
 - **导出真实权重**：先把 HF 权重下到本地目录，再
   `.venv/bin/python tools/export_qwen_to_tiny.py --model <本地目录> --out model_xxx.tqwen --dtype f16`。
   Qwen3.5 可用阿里 ModelScope 下载（`modelscope download --model Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B`）。
