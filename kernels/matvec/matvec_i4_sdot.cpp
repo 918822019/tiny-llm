@@ -34,6 +34,8 @@
 #include <arm_neon.h>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>   // fprintf（超限报错）
+#include <cstdlib>  // abort（超限报错）
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -42,7 +44,11 @@ namespace tinyqwen {
 namespace {
 
 constexpr int kGroupHeader = 4;    // 每组头部字节数
-constexpr int kMaxInDim = 8192;    // 支持的最大输入维度
+// 支持的最大输入维度。必须 >= 模型最大的 in_dim（FFN down_proj 的
+// intermediate_size）：Qwen2.5-0.5B=4864、Qwen3.5-0.8B=3584、
+// Qwen3.5-4B=9216。取 16384 留足余量；超限会直接 abort（见 quantize_x_i8），
+// 绝不能静默截断——截断会让高维权重乘上脏数据，产出乱码且极难排查。
+constexpr int kMaxInDim = 16384;
 
 // ========================================================================
 // 全局 scratch 缓冲区（串行调用，静态安全）
@@ -61,7 +67,16 @@ int32_t g_xq_prefix[kMaxInDim + 1]; // 前缀和：g_xq_prefix[i] = Σ_{j=0}^{i-
 // 说明：对称量化意味着 zero_point = 0，只需一个 scale。
 //       前缀和使得任意区间 [a,b) 的 x_q 之和可以 O(1) 查询。
 float quantize_x_i8(const float *x, int in_dim) {
-    const int n = in_dim < kMaxInDim ? in_dim : kMaxInDim; // 截断到最大维度
+    // 防御：激活缓冲区是固定大小的静态数组，in_dim 超限必须显式报错，
+    // 不能静默截断（截断 = 高维激活丢失，结果错误且无任何提示）
+    if (in_dim > kMaxInDim) {
+        fprintf(stderr,
+                "[matvec_i4_sdot] fatal: in_dim=%d 超过 kMaxInDim=%d，"
+                "请调大 kernels/matvec/matvec_i4_sdot.cpp 的 kMaxInDim\n",
+                in_dim, kMaxInDim);
+        abort();
+    }
+    const int n = in_dim;
     // 第一步：找绝对值最大值（amax）
     float amax = 0.0f;
     for (int i = 0; i < n; ++i) {
