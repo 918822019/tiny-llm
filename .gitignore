@@ -34,3 +34,6 @@ __pycache__/
 
 # 下载的数据集（不入库）
 datasets/
+
+# Python venv
+.venv/

@@ -74,6 +74,9 @@ def run_cpp(binary: Path, model: Path, tmp: Path):
            "--max-new-tokens", str(MAX_NEW),
            "--max-seq-len", "32",
            "--eos", "-1",
+           # 逐 token prefill：批量 GEMM prefill 不做逐位置 dump，拿不到 prompt
+           # 各位置的 logits；--verbose 强制逐 token 路径，恢复 dump 契约
+           "--verbose",
            "--dump-logits", str(logits_path)]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     gen_ids = [int(line.split()[2]) for line in out.splitlines()

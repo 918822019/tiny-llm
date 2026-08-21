@@ -149,6 +149,14 @@ def main() -> None:
 
     tiny = hf_to_tiny(state)
 
+    # 忠实模拟真实导出器：tied 模型不写独立 lm_head.weight（见
+    # export_qwen_to_tiny.py 的 `if not tie_word_embeddings` 守卫）。此前这里
+    # 把 HF state_dict 里 lm_head.weight（tied 模型也会列出该 key）原样写出，
+    # 其随机数据与 embed 不同，会让 runtime 的 tied 绑定逻辑（检测到独立
+    # lm_head 就优先用它）拿错权重，导致 C++ vs HF 的 logits 偏差。
+    if FAKE_CFG["tie_word_embeddings"]:
+        tiny.pop("lm_head.weight", None)
+
     header_cfg = {
         "n_layers": FAKE_CFG["num_hidden_layers"],
         "hidden_size": FAKE_CFG["hidden_size"],
