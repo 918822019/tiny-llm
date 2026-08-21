@@ -82,11 +82,14 @@ TEST(gptq_matches_ref) {
 
 ### INT4 (当前实现)
 
+每组（group_size 个元素）一个单元，组内交错（与 `runtime/tiny_format.h` 一致）：
+
 ```
-[data]      每行：ceil(cols/2) bytes，2 个 4-bit 值 packed
-[scale]     每行每组：1 个 fp16
-[zero]      每行每组：1 个 fp16
+[scale_fp16 2B][zero_fp16 2B][packed_uint4 group_size/2 B]
 ```
+
+低 nibble 在前；反量化 `float = (uint4 - zero) × scale`。
+完整规范见 `../docs/quantization_guide.md` 与 `../docs/weight_format.md`。
 
 ### GPTQ（未来）
 

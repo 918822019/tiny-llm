@@ -166,7 +166,8 @@ V: [n_layers][n_kv_heads][max_seq_len][head_dim]
 3. `runtime/tiny_format.h`（格式的 C++ 定义）
 4. `runtime/model_loader.cpp`（怎么把文件读进来并校验）
 5. `runtime/kv_cache.cpp`（缓存内存怎么摆）
-6. `runtime/qwen_model.cpp`（核心前向，对照 `docs/qwen_forward.md`）
-7. `runtime/main.cpp`（命令行怎么把上面串起来）
+6. `runtime/backend.h`（算子抽象接口，对照 `docs/architecture.md`）
+7. `runtime/qwen_forward_token.cpp`（核心前向，对照 `docs/qwen_forward.md`）
+8. `runtime/main.cpp`（命令行怎么把上面串起来）
 
 遇到看不懂的注释，先看它对应的本文小节。

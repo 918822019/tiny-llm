@@ -19,8 +19,8 @@
                ↓ 分发到具体后端
 ┌─────────────────────────────────────┐
 │  Concrete Backends                  │
-│  ├── CPUBackend (NEON)              │
-│  ├── CUDABackend (未来)              │
+│  ├── CPUBackend (NEON/SDOT，主线)     │
+│  ├── CUDABackend (已实现，逐算子 A/B)   │
 │  ├── MetalBackend (未来)             │
 │  └── VulkanBackend (未来)            │
 └──────────────┬──────────────────────┘
@@ -39,8 +39,9 @@
 ```
 tinyqwen/
 ├── runtime/
-│   ├── backend.h              # IBackend 抽象接口
-│   ├── backend_cpu.h/cpp      # CPUBackend 实现
+│   ├── backend.h              # IBackend 抽象接口 + WeightTensor
+│   ├── backend_cpu.h/cpp      # CPUBackend 实现（包装 dispatch，主线）
+│   ├── backend_cuda.h/cpp     # CUDABackend 实现（逐算子，需 CUDA 构建）
 │   ├── qwen_model.h           # QwenModel 接口
 │   ├── qwen_model.cpp         # create() + 公共逻辑
 │   ├── qwen_forward_token.cpp # forward_token（decode 路径）
@@ -48,7 +49,7 @@ tinyqwen/
 │   ├── model_loader.cpp       # 权重文件加载
 │   ├── kv_cache.cpp           # KV cache 管理
 │   ├── gdn_state.cpp          # GDN 状态管理（Qwen3.5）
-│   └── main.cpp               # CLI 入口
+│   └── main.cpp               # CLI 入口（后端/engine 选择）
 │
 ├── kernels/
 │   ├── dispatch.h/cpp         # 通用入口 + 自注册
@@ -136,6 +137,18 @@ TINYQWEN_MATVEC_VARIANT(matvec_f32_neon, "neon");
 - 可以按名字选择实现（`--matvec-impl neon`）
 - 未注册的变体自动兜底到 ref
 
+### 4. Backend ≠ Engine（两条 GPU 路径，易混淆）
+
+| | `--backend cuda`（CUDABackend） | `--engine cuda`（gpu_engine） |
+|---|---|---|
+| 形态 | 实现 IBackend，**逐算子**调 CUDA kernel | **整段 forward** 常驻显存、单 stream |
+| 数据流 | 每算子 H2D/D2H + cudaMalloc | 权重/激活/KV 常驻，每步仅 4B argmax 过 PCIe |
+| 定位 | A/B 测试、单算子调试 | GPU 性能路径（A10 实测 4.89 ms/tok） |
+| 覆盖 | INT4/partial RoPE/top_k/GDN 未实现（触发即 abort） | 仅 Qwen2.x + greedy，无 topk/dump-logits |
+| 位置 | `runtime/backend_cuda.*` | `kernels/cuda/gpu_engine.cu`（不走 IBackend） |
+
+CPU 主线没有这个区分：CPUBackend 就是唯一路径。
+
 ## 数据流
 
 ### 导出（Python）
@@ -155,15 +168,15 @@ tools/export_qwen_to_tiny*.py（量化）
     ↓
 model_loader.cpp 加载
     ↓
-QwenModel::create() 创建后端
+main.cpp 按 --backend 创建后端（默认 CPU），传入 QwenModel::create()
     ↓
 forward_token() / forward_prefill()
     ↓
-IBackend::matvec() / rmsnorm() / ...
+IBackend::matvec() / rmsnorm() / ...（WeightTensor 携带 quant_type）
     ↓
 CPUBackend::matvec() → matvec_f32() / matvec_f16() / matvec_i4()
     ↓
-具体 kernel（dispatch 分发）
+具体 kernel（dispatch 按名字分发，未命中兜底 _ref）
 ```
 
 ## 扩展指南

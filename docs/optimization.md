@@ -51,12 +51,14 @@ kernels/
 
 ## 3. dispatch 自注册：model 不感知具体实现
 
-model（`qwen_model.cpp`）只调**通用入口** `matvec_f32(...)`，不直接调
-`matvec_f32_ref`。实现按名字注册进 dispatch 的注册表，运行时查表调用：
+model（`qwen_forward_*.cpp`）只调 `IBackend` 接口（`backend_->matvec(WeightTensor, ...)`），
+CPUBackend 按权重的 quant_type 选 dtype 入口（`matvec_f32/f16/i4`），再由
+dispatch 查注册表调用具体实现——model 既不感知 dtype，也不感知变体：
 
 ```text
-qwen_model.cpp ──> matvec_f32()  ──dispatch──> matvec_f32_ref()            (默认)
-                                             └──> matvec_f32_double_2_float() / 将来的 neon 等
+forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f16()  （按 dtype）
+                                                    ──dispatch──> _ref()          (默认/兜底)
+                                                              └──> neon_mt_kv_nt / sdot2_mt / ...
 ```
 
 好处：

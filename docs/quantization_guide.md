@@ -117,13 +117,16 @@ TEST (gptq_matches_fp32) {
 
 ### INT4 (当前实现)
 
+每组（group_size 个元素）一个单元，**组内交错存储**（与
+`runtime/tiny_format.h` 的 `kI4Group*` 常量一致）：
+
 ```
-[data]      每行：ceil(cols/2) bytes，2 个 4-bit 值 packed
-[scale]     每行每组：1 个 fp16
-[zero]      每行每组：1 个 fp16
+[scale_fp16 2B][zero_fp16 2B][packed_uint4 group_size/2 B]
 ```
 
-**布局**：`[data][scale][zero]` 交错存储，便于 NEON 加载。
+- 低 nibble 在前：`byte & 0x0F` = 偶数下标元素，`byte >> 4` = 奇数下标元素；
+- 反量化：`float_val = (uint4_val - zero) * scale`；
+- group_size 典型 64（HQQ@64，已验证 recipe）；格式默认常量 128。
 
 ### GPTQ（未来）
 
@@ -166,9 +169,12 @@ python tools/export_qwen_to_tiny.py --model Qwen/Qwen2.5-0.5B --out model_f32.tq
 # 导出量化版本
 python tools/export_qwen_to_tiny_i4.py --model Qwen/Qwen2.5-0.5B --out model_i4.tqwen
 
-# 对比 logits
-python tools/align_fake_model.py --model-f32 model_f32.tqwen --model-i4 model_i4.tqwen
+# 精度审计：i4 反量化权重 vs fp32 逐层 MSE / max-abs / cosine
+python tools/verify_i4_accuracy.py --model-i4 model_i4.tqwen --model-fp32 model_f32.tqwen
 ```
+
+端到端数值对齐（C++ vs HF logits）走随机权重假模型链路：
+`tools/make_fake_model.py` + `tools/align_fake_model.py`。
 
 ### 性能分析
 

@@ -1,6 +1,8 @@
 # Qwen forward 数学定义与 shape 约定
 
-对应实现：`runtime/qwen_model.cpp`（token-by-token，batch=1，fp32）。
+对应实现：`runtime/qwen_forward_token.cpp`（decode，token-by-token）与
+`runtime/qwen_forward_prefill.cpp`（批量 prefill）；激活全程 fp32，权重可为
+f32/f16/i4（经 IBackend 分发，见 `architecture.md`）。
 符号：`H`=hidden_size(896)，`I`=intermediate_size(4864)，`V`=vocab_size(151936)，
 `nh`=n_heads(14)，`nkv`=n_kv_heads(2)，`hd`=head_dim(64)，`qd=nh*hd`，`kvd=nkv*hd`。
 
@@ -89,7 +91,7 @@ attention 读取 `seq_len = p + 1`（含当前 token，先 append 再 attend）�
 
 Qwen3.5 用 **Gated DeltaNet（linear attention）+ full attention** 按
 `full_attention_interval`（3:1 → 4）交替。FFN/residual/norm 结构与上面一致，
-差异只在 token mixer。对应实现仍在 `runtime/qwen_model.cpp`。
+差异只在 token mixer。对应实现仍在 `runtime/qwen_forward_token.cpp`。
 
 ### full attention 层（无 bias，有 QK-norm / partial RoPE / 输出门）
 
@@ -147,5 +149,5 @@ GDN 无 KV cache：`conv_state`（最近 kernel-1 个输入）与递归矩阵 `S
 
 ---
 
-相关文档：实现见 `runtime/qwen_model.cpp`（op 顺序与本文一一对应）；
+相关文档：实现见 `runtime/qwen_forward_token.cpp`（op 顺序与本文一一对应）；
 数值验收见 `pytorch_alignment.md`；概念背景见 `infra_primer.md`。
