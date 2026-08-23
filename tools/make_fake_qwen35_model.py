@@ -44,7 +44,7 @@ FAKE_CFG = dict(
     num_key_value_heads=1,             # full attention 的 KV head 数（GQA）
     head_dim=16,                       # full attention 每个 head 的维度
     vocab_size=64,                     # 词表大小
-    max_position_embeddings=32,        # 最大位置编码长度
+    max_position_embeddings=64,        # 最大位置编码长度（批量 prefill 对齐需 >=32 prompt）
     rms_norm_eps=1e-6,                 # RMSNorm epsilon
     linear_num_key_heads=2,            # 线性注意力 QK head 数
     linear_num_value_heads=2,          # 线性注意力 V head 数

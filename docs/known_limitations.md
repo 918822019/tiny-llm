@@ -12,6 +12,8 @@
 - 单 batch，无 continuous batching（`--batch-tokens-jsonl` 是一次进程顺序跑
   多条 prompt，逐条独立 prefill+decode，不是并行批处理）;
 - prefill 已是批量 GEMM（`forward_prefill`），但无 chunked prefill；
+  Qwen3.5 混合架构亦有批量 prefill（`forward_prefill_qwen35_batch`，GEMM 路径，
+  ≥`kBatchPrefillMinQwen35` token 才启用，否则回退逐 token）；
   GPU engine 路径无批量 prefill 入口（逐 token 喂）；
 - C++ 侧无 tokenizer：token ids 由 Python 工具提供；
 - loader 一次性 fread 整个文件进内存（未用 mmap）；
@@ -35,6 +37,10 @@
   embed/norm/bias 保留 fp32）；i8 已在 header 中预留但 loader 拒绝；
 - f16/i4 的数值验收只做过 canonical prompt 的 greedy 对照与随机权重假模型
   logits 对齐，长文本/敏感任务未覆盖；
+- **i4 批量 prefill 与逐 token decode 数值不一致（已知且刻意）**：批量路径
+  反量化权重后激活走 fp32（weight-only，更贴近 HF）；decode 逐 token 走
+  W4A8（激活量化 int8，提速）。末位 prefill logits 可差 ~1 量级，临界
+  argmax 偶发翻转——同一 prompt 贪心输出可能因长度跨过批量阈值而不同；
 - tensor name 上限 64 字符；
 - 小端假设（目标设备 ARM64 均为小端）。
 
@@ -47,11 +53,12 @@
 
 ## 未实现（路线图，不在 v1）
 
-- INT4 继续：sdot4 已兑现硬件组头转换（4B 46.9→36.5 ms/tok），TTFT 侧
-  已跳过非末位 prefill 的 logits（长 prompt 1.14×）；下一刀候选
-  = **Qwen3.5 批量 prefill**（投影/FFN GEMM 化 + GDN 态顺序扫描，长 prompt
-  量级级改善）/ 4-row 内循环 / i4 gate_up·qkv 融合 / 激活量化 SIMD；
-  Android 真机验证 sdot3/sdot4 未做；
+- INT4 继续：sdot4 已兑现硬件组头转换（4B 46.9→36.5 ms/tok）；TTFT 侧已跳过
+  非末位 prefill logits（1.14×）+ Qwen3.5 批量 prefill GEMM 化（4B-61tok 1.72×、
+  0.8B-33tok 1.38×）；下一刀候选 = **反量化并行化**（批量路径固定开销 ~0.7s，
+  当前单线程）/ **反量化到 fp16**（流量减半）/ 4-row 内循环 / i4 gate_up·qkv
+  融合 / 激活量化 SIMD；Android 真机验证 sdot3/sdot4 与批量 prefill 未做
+  （无 BLAS 后端时自动回退逐 token）；
 - INT8 weight-only reference quantization；
 - KronQ packing；
 - GPTQ / AWQ 等量化算法（接入流程见 `quantization_guide.md`）；

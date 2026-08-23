@@ -85,12 +85,18 @@ namespace tinyqwen {
         const int base_pos = kv_.seq_len(); // 当前 KV cache 中已存储的序列长度
         const bool is_qwen35 = cfg_.model_type == ModelType::kQwen35;
 
-        // GDN (linear attention) layers need sequential state updates — fall back
-        // 如果模型是 Qwen3.5，GDN 的状态更新必须顺序进行，退回到逐 token 处理。
-        // 非末位 token 的 logits 会被丢弃 → need_logits=false 跳过
-        // final_norm + lm_head + argmax（4B 上省 ~16% 单 token 开销，
-        // 长 prompt 线性累计）；末位保留，产出第一个生成 token。
+        // GDN (linear attention) layers need sequential state updates — but the
+        // 线性投影部分仍可批量。批量路径（qwen_forward_prefill_qwen35.cpp）：
+        // 投影/FFN 走 GEMM（权重每层只读一遍），GDN 递归与因果 attention
+        // 保留逐 token 顺序扫描。长 prompt 的 TTFT 大幅下降。
+        // 无法处理时（无 BLAS 后端 / dtype 不支持 / 开关关闭 / token 太少）
+        // 返回 -2，回退到逐 token。
         if (is_qwen35) {
+            if (batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35) {
+                const int r = forward_prefill_qwen35_batch(token_ids, n, topk, topk_k);
+                if (r != -2) return r;
+                // fallthrough：逐 token 回退
+            }
             int last = -1;
             for (int i = 0; i < n; ++i)
                 last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k,

@@ -51,13 +51,15 @@ quantization:
 recipe:
   matvec_impl: sdot4_mt
   ops_impl: neon
-  note: W4A8 SDOT v4 多线程；0.8B 上 vs sdot3_mt 1.26×（8.08 vs 10.19）
+  note: W4A8 SDOT v4 多线程；0.8B 上 vs sdot3_mt 1.26×（8.08 vs 10.19）；
+    prefill ≥32 token 自动走批量 GEMM 路径
 
 # 基准测试结果
 benchmark:
   macos_m4:
     topt_ms: 8.08            # decode 中位（同场 2 轮；sdot3_mt 10.19）
-    ttft_ms: 21.39           # canonical 3-token prefill（非末位跳过 logits 后）
+    ttft_ms: 21.39           # canonical 3-token prefill（逐 token 路径，<阈值 32）
+    ttft_33tok_ms: 155.9     # 33-token prompt 批量 prefill（vs 逐 token 214.5 = 1.38×）
     peak_rss_mb: null
     device: Mac16,10（Apple M4，4P+6E，16GB）
     commit: ea3aba3+

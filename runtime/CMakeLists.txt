@@ -27,7 +27,8 @@ add_library(tinyqwen_runtime OBJECT
         backend_cpu.cpp         # CPU 后端实现
         qwen_model.cpp          # Qwen 模型结构定义 + 参数绑定
         qwen_forward_token.cpp  # Decode 阶段单 token forward
-        qwen_forward_prefill.cpp # Prefill 阶段 prompt forward
+        qwen_forward_prefill.cpp # Prefill 阶段 prompt forward（Qwen2.x 批量 + 分发）
+        qwen_forward_prefill_qwen35.cpp # Qwen3.5 批量 prefill（GEMM 路径，权重只读一遍）
         ../quantization/quant.cpp # 量化子系统实现（放在 quantization/ 目录）
 )
 
@@ -45,6 +46,21 @@ target_include_directories(tinyqwen_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # 链接 kernels OBJECT 库（runtime 调用 kernel dispatch 函数）
 target_link_libraries(tinyqwen_runtime PUBLIC tinyqwen_kernels)
+
+# Qwen3.5 批量 prefill 的 GEMM 后端：Apple Silicon 用 Accelerate（cblas_sgemm，
+# 自动走 AMX/多核）。框架经 OBJECT 库的 PUBLIC 接口传播给所有链接方
+# （tinyqwen / tinyqwen_tests）。其他平台（如 Android）无此后端，
+# forward_prefill_qwen35_batch 运行期返回 -2 回退逐 token 路径。
+if (APPLE)
+    target_link_libraries(tinyqwen_runtime PUBLIC "-framework Accelerate")
+endif ()
+
+# 批量 prefill 文件里的 fp16→fp32 组头转换走硬件指令，需要 +fp16
+# （守卫宏 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC，同 sdot4 的教训）。
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set_source_files_properties(qwen_forward_prefill_qwen35.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+fp16")
+endif ()
 
 # ---------------------------------------------------------------------------
 # CLI 可执行文件：tinyqwen

@@ -63,6 +63,7 @@ namespace {
         bool verbose = false;           // 是否输出详细调试信息
         bool no_fuse_gate_up = false;   // 禁用 gate/up 投影融合
         bool no_fuse_qkv = false;       // 禁用 Q/K/V 投影融合
+        bool no_batch_prefill = false;  // 禁用 Qwen3.5 批量 prefill（A/B 对照用）
         std::string config;             // 配置文件路径（可选）
         std::string matvec_impl;        // matvec 实现选择；空 = 未指定
         std::string ops_impl;           // 非 matvec 算子实现；空 = 未指定
@@ -133,6 +134,7 @@ namespace {
             else if (a == "--backend") out->backend = value("--backend");
             else if (a == "--no-fuse-gate-up") out->no_fuse_gate_up = true;
             else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
+            else if (a == "--no-batch-prefill") out->no_batch_prefill = true;
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
                 usage(argv[0]);
@@ -549,6 +551,10 @@ int main(int argc, char **argv) {
                            : config.get("fuse_qkv", "true") != "false";
     model->set_fuse_gate_up(fuse_gate_up);
     model->set_fuse_qkv(fuse_qkv);
+    // Qwen3.5 批量 prefill 开关：CLI > 配置文件 > 默认 true
+    const bool batch_prefill = args.no_batch_prefill ? false
+                               : config.get("batch_prefill", "true") != "false";
+    model->set_batch_prefill(batch_prefill);
     model->set_prompt_len(static_cast<int>(tokens.size()));
 
     // 打开 logits 输出文件（如果指定了 --dump-logits）
@@ -605,6 +611,9 @@ int main(int argc, char **argv) {
         next = model->forward_prefill(tokens.data(), static_cast<int>(tokens.size()),
                                       need_topk ? &topk : nullptr, args.topk);
         profiler.end_token();
+        // --dump-logits 时补一份 prefill 末位 logits（批量 prefill 对齐验证用；
+        // 此前非 verbose 路径只 dump decode 位。现有对齐脚本走 --verbose，不受影响）
+        dump();
     }
     std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
     if (args.topk > 0) print_topk(topk);

@@ -37,3 +37,4 @@ datasets/
 
 # Python venv
 .venv/
+.scratch/

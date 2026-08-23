@@ -28,6 +28,7 @@
 
 #include "dispatch.h"   // set_matvec_i4_impl_by_name / matvec_i4 / matmul_i4
 #include "ref_ops.h"    // float_to_half / half_to_float
+#include "qwen_model.h" // tinyqwen::dequant_i4_to_f32（批量 prefill 的反量化，回归对照）
 
 #include <algorithm>    // std::min, std::max
 #include <cmath>        // std::fabs, std::lround
@@ -462,4 +463,84 @@ TEST(matvec_i4_dispatch_unknown_fails) {
     EXPECT_TRUE(!tinyqwen::set_matvec_i4_impl_by_name("no_such_impl"));  // 无效名 → false
     EXPECT_TRUE(tinyqwen::set_matvec_i4_impl_by_name("ref"));            // 有效名 → true
     EXPECT_EQ(std::string(tinyqwen::matvec_i4_impl_name()), std::string("ref"));  // 确认当前实现
+}
+
+// ---------------------------------------------------------------------------
+// dequant_i4_to_f32（Qwen3.5 批量 prefill 的权重反量化）
+//
+// 独立对照：直接从 pack_i4_rtn 产出的 interleaved 字节逐组读 scale/zero +
+// nibble，按 (q - zero) * scale 计算期望值，与 dequant 输出逐元素比对。
+// 重点回归"组内偏移写到行内正确列"——曾出过每组都覆盖行首（out+col+i 写成
+// out+i）导致整批 logits 错乱的 bug。
+// ---------------------------------------------------------------------------
+TEST(dequant_i4_to_f32_matches_naive) {
+    const int out_dim = 40, in_dim = 192, group_size = 64;  // 192/64=3 组，整除
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 777);
+    const std::vector<uint8_t> packed = pack_i4_rtn(w, out_dim, in_dim, group_size);
+    std::vector<float> got(static_cast<size_t>(out_dim) * in_dim);
+    tinyqwen::dequant_i4_to_f32(packed.data(), got.data(), out_dim, in_dim, group_size);
+    // 逐组逐元素从字节独立还原期望值
+    const int groups_per_row = (in_dim + group_size - 1) / group_size;
+    const int group_total = kHdr + group_size / 2;
+    const int row_bytes = groups_per_row * group_total;
+    double max_err = 0.0;
+    for (int o = 0; o < out_dim; ++o) {
+        for (int g = 0; g < groups_per_row; ++g) {
+            const uint8_t *gp = packed.data() + static_cast<size_t>(o) * row_bytes + g * group_total;
+            uint16_t scale_h, zero_h;
+            std::memcpy(&scale_h, gp, 2);
+            std::memcpy(&zero_h, gp + 2, 2);
+            const float s = half_to_float(scale_h);
+            const float z = half_to_float(zero_h);
+            const int start = g * group_size;
+            const int end = std::min(start + group_size, in_dim);
+            for (int i = start; i < end; ++i) {
+                const int li = i - start;                       // 组内下标
+                const uint8_t byte = gp[kHdr + li / 2];
+                const int q = (li % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+                const float expect = (static_cast<float>(q) - z) * s;
+                const double err = std::fabs(static_cast<double>(got[o * in_dim + i]) - expect);
+                max_err = std::max(max_err, err);
+            }
+        }
+    }
+    if (max_err >= 1e-5) {
+        TQ_FAIL("dequant_i4_to_f32 max_err=" + std::to_string(max_err));
+    }
+}
+
+// 尾部组（in_dim 非 group_size 整除）也要对——验证最后一组 elems 截断正确
+TEST(dequant_i4_to_f32_partial_group) {
+    const int out_dim = 24, in_dim = 200, group_size = 64;  // 200/64=3 余 8
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 778);
+    const std::vector<uint8_t> packed = pack_i4_rtn(w, out_dim, in_dim, group_size);
+    std::vector<float> got(static_cast<size_t>(out_dim) * in_dim);
+    tinyqwen::dequant_i4_to_f32(packed.data(), got.data(), out_dim, in_dim, group_size);
+    const int groups_per_row = (in_dim + group_size - 1) / group_size;
+    const int group_total = kHdr + group_size / 2;
+    const int row_bytes = groups_per_row * group_total;
+    double max_err = 0.0;
+    for (int o = 0; o < out_dim; ++o) {
+        for (int g = 0; g < groups_per_row; ++g) {
+            const uint8_t *gp = packed.data() + static_cast<size_t>(o) * row_bytes + g * group_total;
+            uint16_t scale_h, zero_h;
+            std::memcpy(&scale_h, gp, 2);
+            std::memcpy(&zero_h, gp + 2, 2);
+            const float s = half_to_float(scale_h);
+            const float z = half_to_float(zero_h);
+            const int start = g * group_size;
+            const int end = std::min(start + group_size, in_dim);
+            for (int i = start; i < end; ++i) {
+                const int li = i - start;
+                const uint8_t byte = gp[kHdr + li / 2];
+                const int q = (li % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+                const float expect = (static_cast<float>(q) - z) * s;
+                const double err = std::fabs(static_cast<double>(got[o * in_dim + i]) - expect);
+                max_err = std::max(max_err, err);
+            }
+        }
+    }
+    if (max_err >= 1e-5) {
+        TQ_FAIL("dequant_i4_to_f32 partial max_err=" + std::to_string(max_err));
+    }
 }

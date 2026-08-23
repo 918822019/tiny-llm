@@ -69,6 +69,15 @@ namespace tinyqwen {
     //     2. 初始化 KV cache 和 workspace buffers
     //     3. 绑定权重指针到 LayerWeights 结构
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // dequant_i4_to_f32: 按组把 [M,K] INT4 权重反量化为 fp32（批量 prefill 用）
+    //
+    // 磁盘布局（每行每组）：[scale_fp16(2B) | zero_fp16(2B) | packed(K/2 B)]
+    // 反量化语义（与导出器 / HF 一致）：value = (uint4 - zero) * scale
+    // 暴露为自由函数以便单元测试直接对照（见 test_matvec_i4.cpp）。
+    // -------------------------------------------------------------------------
+    void dequant_i4_to_f32(const uint8_t *w, float *dst, int M, int K, int group_size);
+
     class QwenModel {
     public:
         // ---------------------------------------------------------------------
@@ -141,6 +150,29 @@ namespace tinyqwen {
         //     - prefill 结束后 KV cache 中已有 n 个 token 的 K/V
         // ---------------------------------------------------------------------
         int forward_prefill(const int *token_ids, int n, TopKResult *topk = nullptr, int topk_k = 5);
+
+        // ---------------------------------------------------------------------
+        // forward_prefill_qwen35_batch: Qwen3.5 批量 prefill（GEMM 路径）
+        //
+        // 权重每层只读一遍（i4 按组反量化到 fp32 / f16 转换 / f32 直用），
+        // 线性投影走 BLAS GEMM 摊薄到全部 token；GDN 递归与因果 attention
+        // 保留逐 token 顺序扫描。详见 qwen_forward_prefill_qwen35.cpp 头注。
+        //
+        // 返回值: 末位 prompt token 的 greedy 下一 token；-2 = 无法处理
+        // （平台无 GEMM 后端 / dtype 不支持），调用方回退逐 token 路径。
+        // ---------------------------------------------------------------------
+        int forward_prefill_qwen35_batch(const int *token_ids, int n,
+                                         TopKResult *topk = nullptr, int topk_k = 5);
+
+        // 批量 prefill 的最小 token 数（低于此值走逐 token）。
+        // 反量化全部权重到 fp32 是一笔固定开销（单线程，~0.7s @4B），
+        // 需要足够多的 token 才能摊平。4B 实测 crossover ≈ 30 token：
+        // L=8/16/24 时批量反而慢（0.5-0.9×），L=33 起开始赚（1.1×），
+        // 越长越赚（L=61 ≈1.8×）。阈值依据见优化日志。
+        static constexpr int kBatchPrefillMinQwen35 = 32;
+
+        // 开关：--no-batch-prefill 关闭（A/B 对照与回退用）
+        void set_batch_prefill(bool v) { batch_prefill_enabled_ = v; }
 
         // ---------------------------------------------------------------------
         // reset: 清空 KV cache 和 token 计数
@@ -381,5 +413,28 @@ namespace tinyqwen {
         std::vector<float> b_;       // GDN 的 beta 标量投影（linear_num_v_heads）
         std::vector<float> a_;       // GDN 的 a（dt）标量投影（linear_num_v_heads）
         std::vector<float> gdn_out_; // GDN 递归输出（gdn_value_dim）
+
+        // ==================== Qwen3.5 批量 prefill workspace ====================
+        // 全部 token 主序 [dim, N]（第 c 个 token 的向量在 c*dim）。
+        // 按需扩容（resize 保留 capacity），跨 prefill 复用。
+        struct BatchPrefillBufs {
+            std::vector<float> hid;      // 残差流 [hidden, N]
+            std::vector<float> normed;   // norm 后 [hidden, N]
+            std::vector<float> out;      // o_proj / ffn 输出 [hidden, N]（复用）
+            std::vector<float> mixed;    // GDN 混合 qkv [conv_dim, N]
+            std::vector<float> z;        // GDN 门控 z [value_dim, N]
+            std::vector<float> b;        // GDN beta 投影 [n_v_heads, N]
+            std::vector<float> a;        // GDN a 投影 [n_v_heads, N]
+            std::vector<float> gdn_out;  // GDN 递归输出 [value_dim, N]
+            std::vector<float> q_full;   // q+gate 交错 [2*q_dim, N]
+            std::vector<float> k;        // key [kv_dim, N]
+            std::vector<float> v;        // value [kv_dim, N]
+            std::vector<float> attn;     // attention 输出 [q_dim, N]
+            std::vector<float> gate;     // FFN gate [inter, N]
+            std::vector<float> up;       // FFN up [inter, N]
+            std::vector<float> deq;      // 权重反量化 fp32 scratch [max M*K]
+        };
+        BatchPrefillBufs bp_;
+        bool batch_prefill_enabled_ = true;  // --no-batch-prefill 可关闭
     };
 } // namespace tinyqwen
