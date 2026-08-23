@@ -544,3 +544,40 @@ TEST(dequant_i4_to_f32_partial_group) {
         TQ_FAIL("dequant_i4_to_f32 partial max_err=" + std::to_string(max_err));
     }
 }
+
+// 大矩阵走线程池路径（>= 262144 元素）：验证并行反量化与朴素参考逐位一致
+// （并行只改执行顺序，不改任何一组的数值）
+TEST(dequant_i4_to_f32_parallel_pool_path) {
+    const int out_dim = 512, in_dim = 896, group_size = 64;  // 458752 元素 > 阈值
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 779);
+    const std::vector<uint8_t> packed = pack_i4_rtn(w, out_dim, in_dim, group_size);
+    std::vector<float> got(static_cast<size_t>(out_dim) * in_dim);
+    tinyqwen::dequant_i4_to_f32(packed.data(), got.data(), out_dim, in_dim, group_size);
+    const int groups_per_row = (in_dim + group_size - 1) / group_size;
+    const int group_total = kHdr + group_size / 2;
+    const int row_bytes = groups_per_row * group_total;
+    double max_err = 0.0;
+    for (int o = 0; o < out_dim; ++o) {
+        for (int g = 0; g < groups_per_row; ++g) {
+            const uint8_t *gp = packed.data() + static_cast<size_t>(o) * row_bytes + g * group_total;
+            uint16_t scale_h, zero_h;
+            std::memcpy(&scale_h, gp, 2);
+            std::memcpy(&zero_h, gp + 2, 2);
+            const float s = half_to_float(scale_h);
+            const float z = half_to_float(zero_h);
+            const int start = g * group_size;
+            const int end = std::min(start + group_size, in_dim);
+            for (int i = start; i < end; ++i) {
+                const int li = i - start;
+                const uint8_t byte = gp[kHdr + li / 2];
+                const int q = (li % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+                const float expect = (static_cast<float>(q) - z) * s;
+                const double err = std::fabs(static_cast<double>(got[o * in_dim + i]) - expect);
+                max_err = std::max(max_err, err);
+            }
+        }
+    }
+    if (max_err >= 1e-5) {
+        TQ_FAIL("dequant_i4_to_f32 pool max_err=" + std::to_string(max_err));
+    }
+}

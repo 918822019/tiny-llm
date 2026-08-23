@@ -53,7 +53,8 @@
 | qwen35-4b-i4-sdot3_mt（macOS M4） | 04788a5 | **46.73** | 48.57 | —（4B 阶梯内部对比） | **1.08×**（同场交替 3 轮 vs sdot2_mt 50.30） | sdot3：work-stealing 动态行调度（消异构核拖尾）+ 砍预计算缓存改内联组头硬件 FCVT（流量 −18%、RSS −525MB）+ 128 位解包（−37% 指令）。**副产物：TTFT 456→180ms（2.53×）**——Qwen3.5 prefill 逐 token 回退走 matvec，sdot2 的懒预计算原来记在首 token 上。0.8B 同场 10.74→10.53（1.02×，模型小收益温和）。数值与 sdot2 逐位一致 |
 | qwen35-4b-i4-sdot4_mt（macOS M4） | 8d5447f | **36.50** | 38.51 | 1.38×（4B 内，vs sdot2_mt 50.30） | **1.29×**（同场交替 3 轮 vs sdot3_mt 46.91） | 修组头转换特性守卫：clang +fp16 根本不定义 `__ARM_FEATURE_FP16`（实际是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），**sdot3 的硬件 FCVT 从未生效**，热循环静默跑软件转换（~4.6G 条指令/token，sample 第一大头）。改 `_Float16` cast（fmov+fcvt 2 条）。单核 160→119（1.35×）；有效带宽 50.5→64.8 GB/s；**E 核由负转正**：10 线程 36.0 < 4 线程 39.6。0.8B 同场 10.19→8.08（1.26×）。数值与 sdot3 逐位一致 |
 | prefill_skip_logits（macOS M4，TTFT 专项） | 7fa8c9a | 36.49（TOPT 不变） | 38.42 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT 1.14×**（33-tok prompt 1320→1158ms） | Qwen3.5 prefill 逐 token 回退中，非末位 token 的 logits 被丢弃却全量计算 lm_head（4B 占单 token 16%）。forward_token 加 need_logits 门控跳过 final_norm+lm_head+argmax。微观证据：同 profile 内跳过位 29.96 vs 末位 35.77（Δ5.81≈lm_head 5.87ms）；0.8B TTFT ~21.4。对齐契约（--verbose 逐位置 dump）不受影响。TOPT 逐位不变 |
-| qwen35_batch_prefill（macOS M4，TTFT 专项） | 本次 | 35.72（TOPT 不变） | 37.23 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT：4B-61tok 2072→1206ms（1.72×）、0.8B-33tok 214→156ms（1.38×）** | Qwen3.5 prefill GEMM 路径（`forward_prefill_qwen35_batch`）：权重每层反量化到 fp32 一次 + Accelerate/AMX sgemm，把全部线性投影摊薄到 N 个 token；GDN 递归与因果 attention 保留逐 token 顺序扫描。反量化是固定开销（~0.9s@4B），crossover≈30 token，阈值 32（低于阈值仍走逐 token，canonical 3-tok 不受影响）。⚠️ i4 数值：批量路径激活走 fp32（weight-only int4），decode 逐 token 走 W4A8（int8 激活），二者非逐位一致，临界 argmax 偶发不同（批量更贴近 HF） |
+| qwen35_batch_prefill（macOS M4，TTFT 专项） | e25e9ae | 35.72（TOPT 不变） | 37.23 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT：4B-61tok 2072→1206ms（1.72×）、0.8B-33tok 214→156ms（1.38×）** | Qwen3.5 prefill GEMM 路径（`forward_prefill_qwen35_batch`）：权重每层反量化到 fp32 一次 + Accelerate/AMX sgemm，把全部线性投影摊薄到 N 个 token；GDN 递归与因果 attention 保留逐 token 顺序扫描。反量化是固定开销（~0.9s@4B），crossover≈30 token，阈值 32（低于阈值仍走逐 token，canonical 3-tok 不受影响）。⚠️ i4 数值：批量路径激活走 fp32（weight-only int4），decode 逐 token 走 W4A8（int8 激活），二者非逐位一致，临界 argmax 偶发不同（批量更贴近 HF） |
+| dequant_mt（macOS M4，TTFT 专项） | 本次 | 35.72（TOPT 不变） | — | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**批量 prefill TTFT 1.08×**（4B-33tok 1116→1037ms，同二进制交替 4 轮中位） | 批量 prefill 的 i4 反量化（每权重矩阵一遍、行独立）从串行改为常驻线程池工作窃取（结构同 RowPool；<262144 元素的小矩阵仍串行）。**关键实测：反量化并非批量路径大头**——串行化它只慢 79ms；真正瓶颈是 sgemm 小 N 的访存（权重反量化写 fp32 + 读 fp32 = 8B/权重）。跨构建 A/B 受热污染只有 1.01-1.04×，同二进制交替（唯一可信判据）才显出 1.08× |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
@@ -1930,6 +1931,47 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
      后续迁 `ACCELERATE_NEW_LAPACK` 新接口。
 - **复现**：`./build/runtime/tinyqwen --model model_qwen35_4b_i4.tqwen --tokens-json <长prompt> --matvec-impl sdot4_mt --ops-impl neon [--no-batch-prefill 对照] --profile-out ...`；
   对齐：`.venv/bin/python tools/align_fake_qwen35_model.py --batch`。
+
+---
+
+### dequant_mt（2026-08-24，macOS M4，反量化并行化——以及"反量化不是大头"的实测）
+
+- **优化栈**：qwen35_batch_prefill 之上，`dequant_i4_to_f32` 内部并行化
+  （`runtime/qwen_forward_prefill_qwen35.cpp`，无接口变化）。
+- **是什么**：反量化按行独立——从串行循环改为常驻线程池工作窃取
+  （`DequantPool`，原子行计数器 + 自旋等待，结构同 matvec 的 RowPool；
+  块 = 总行/(4×核数)）。元素数 < 262144 的小矩阵（gdn_in_b/a 等）仍串行，
+  省同步开销。线程数沿用 `TINYQWEN_MT_THREADS` 约定。
+- **假设**：上一刀记录"反量化是批量路径 ~0.7s 固定开销、当前单线程"——
+  预期并行后大幅缩短。**假设对了一半**：见结果。
+- **结果**（M4；TOPT 不变，只动 prefill）：
+  - **同二进制交替 A/B（可信判据）**：`TINYQWEN_MT_THREADS=1`（串行）中位
+    1115.6ms vs 默认（并行）中位 **1037.0ms** = **1.076×**（4 轮交替，
+    4B-33tok）。串行化反量化只让整体慢 79ms。
+  - 跨构建 A/B（基线=上一 commit 串行版）：4B-61tok 1.02×、4B-33tok 1.01×、
+    0.8B-33tok 1.04×——**被热污染压低**，与同二进制交替的 1.08× 不一致时
+    以后者为准（又一次验证 §6.3 的教训：小幅优化只有同场交替可信）。
+- **验证**：127 单测全过（新增大矩阵池路径反量化对照，512×896 > 阈值）；
+  fake f32 批量对齐 1.8e-6、逐 token 对齐 1.16e-6 不变；4B 真模型
+  33/61-token 双路贪心仍逐位一致（并行只改执行顺序，不改数值）；
+  canonical decode 逐位不变。
+- **瓶颈转移（本条最重要的结论）**：反量化并行只值 79ms，说明批量路径
+  的大头不是反量化计算，而是 **sgemm 小 N 的访存**：每个权重矩阵
+  反量化写 fp32（4B/权重）+ sgemm 再读一遍（4B/权重）= 8B/权重，
+  4B 全模型 ~30GB 流量；且 N=33 太瘦，AMX 吃不满（bp_ffn 每矩阵
+  ~6ms，约为峰值算力理论的 6 倍）。下一刀候选：
+  ① **反量化到 fp16**（写流量减半，需 fp16 GEMM 后端——Accelerate
+  新接口/BNNS 调研）；② 融合 GEMM 调用（gate+up 拼一次）；
+  ③ 调研 `-DACCELERATE_NEW_LAPACK` 新接口是否更快（当前 cblas_sgemm
+  自 macOS 13.3 起 deprecated）。
+- **意外 / 教训**：
+  1. **上一轮的瓶颈归因错了**：日志曾写"反量化 ~0.7s 固定开销、下一刀
+     并行化"——实测串行反量化只占 ~0.15s。归因必须测量，不能靠估算
+     （这次错把单线程反量化的指令账当成了墙）。本条即为更正。
+  2. 1.08× 虽小但真实且无副作用，予以保留；若后续 fp16 反量化落地，
+     本线程池直接复用（只改反量化内核，不动池）。
+- **复现**：同二进制交替——默认 vs `TINYQWEN_MT_THREADS=1`，
+  4B-33tok `first_token_ms` 各 4 轮取中位。
 
 ---
 

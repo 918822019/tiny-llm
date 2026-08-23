@@ -31,11 +31,13 @@
 
 #include "qwen_model.h"
 
+#include <atomic>     // 反量化线程池的原子行计数 / job 代际
 #include <cmath>      // std::sqrt, std::exp, std::log1p
 #include <cstdint>
 #include <cstdio>     // fprintf
 #include <cstring>    // memcpy
 #include <numeric>    // std::iota
+#include <thread>     // 反量化线程池
 #include <vector>
 
 #include "dispatch.h"  // matvec_f32, argmax
@@ -114,12 +116,50 @@ bool gemm_wx(const float *w, const float *x, float *y, int M, int K, int N) {
 
 } // namespace
 
+namespace {
+
 // ========================================================================
-// dequant_i4_to_f32: 按组反量化 [M,K] i4 权重到 fp32（对外暴露供单测）
+// 并行反量化：行区间函数 + 常驻工作窃取线程池
 // ========================================================================
+// 反量化是批量 prefill 的固定开销（每层每个权重矩阵一遍），行之间天然
+// 独立——串行时是单线程瓶颈（4B 上 ~0.7s），按行切到常驻线程池后可打满
+// DRAM 墙。结构与 matvec 的 RowPool 同款（原子行计数 + 自旋等待）。
+
+// 低于此元素数走串行（池同步开销不划算；gdn_in_b/a 这类小矩阵）
+constexpr std::size_t kMinParallelElemsDq = 262144;
+
+// 自旋等待（与 matvec 池相同策略：先 YIELD 再让出）
+inline void spin_until_dq(const std::atomic<std::uint64_t> &a, std::uint64_t target) {
+    int spins = 0;
+    while (a.load(std::memory_order_acquire) != target) {
+        if (++spins <= 256) {
+#if defined(__aarch64__)
+            __builtin_arm_yield();
+#endif
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+// 并行度：与 matvec 池同约定（TINYQWEN_MT_THREADS 可覆盖，上限 16）
+inline int default_parallelism_dq() {
+    if (const char *env = std::getenv("TINYQWEN_MT_THREADS")) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v >= 1) return static_cast<int>(v > 16 ? 16 : v);
+    }
+    int p = static_cast<int>(std::thread::hardware_concurrency());
+    if (p <= 1) p = 2;
+    return p > 16 ? 16 : p;
+}
+
+// ------------------------------------------------------------------------
+// dequant_i4_rows: 反量化 [M,K] 权重的第 [row_begin, row_end) 行
+// ------------------------------------------------------------------------
 // 磁盘布局（每行每组）：[scale_fp16(2B) | zero_fp16(2B) | packed(K/2 B)]
 // 反量化语义（与导出器/HF 一致）：value = (uint4 - zero) * scale
-void dequant_i4_to_f32(const uint8_t *w, float *dst, int M, int K, int group_size) {
+void dequant_i4_rows(const uint8_t *w, float *dst, int K, int group_size,
+                     int row_begin, int row_end) {
     const int gpr = (K + group_size - 1) / group_size;      // 每行组数
     const int group_bytes = 4 + group_size / 2;             // 每组字节数
     const size_t row_bytes = static_cast<size_t>(gpr) * group_bytes;
@@ -128,7 +168,7 @@ void dequant_i4_to_f32(const uint8_t *w, float *dst, int M, int K, int group_siz
     const uint8x8_t m0F = vdup_n_u8(0x0F);
 #endif
 
-    for (int m = 0; m < M; ++m) {
+    for (int m = row_begin; m < row_end; ++m) {
         const uint8_t *row = w + static_cast<size_t>(m) * row_bytes;
         float *out = dst + static_cast<size_t>(m) * K;
         int col = 0;
@@ -184,6 +224,98 @@ void dequant_i4_to_f32(const uint8_t *w, float *dst, int M, int K, int group_siz
             col += group_size;
         }
     }
+}
+
+// ------------------------------------------------------------------------
+// DequantPool: 常驻行切分线程池（原子行计数器，工作窃取式取块）
+// ------------------------------------------------------------------------
+struct DequantPool {
+    const uint8_t *w = nullptr;
+    float *dst = nullptr;
+    int K = 0, group_size = 64;
+    int total_rows = 0, chunk_rows = 1;
+    std::atomic<int> next_row{0};             // 下一个未领取的行号
+
+    std::atomic<std::uint64_t> job_gen{0};
+    std::atomic<std::uint64_t> done_gen{0};
+    std::atomic<bool> shutdown{false};
+    std::vector<std::thread> workers;
+    std::uint64_t job_counter = 0;
+    std::uint64_t expected_done = 0;
+
+    DequantPool() {
+        const int p = default_parallelism_dq();
+        workers.reserve(static_cast<size_t>(p - 1));
+        for (int idx = 1; idx < p; ++idx) {
+            workers.emplace_back([this] { worker_main(); });
+        }
+    }
+
+    ~DequantPool() {
+        shutdown.store(true, std::memory_order_release);
+        job_gen.fetch_add(1, std::memory_order_release);
+        for (auto &t : workers) t.join();
+    }
+
+    void worker_main() {
+        std::uint64_t next_job = 1;
+        for (;;) {
+            spin_until_dq(job_gen, next_job);
+            if (shutdown.load(std::memory_order_acquire)) return;
+            do_work();
+            done_gen.fetch_add(1, std::memory_order_release);
+            ++next_job;
+        }
+    }
+
+    // 动态取块：领一段行区间反量化，直到领完（快线程多做）
+    void do_work() {
+        for (;;) {
+            const int begin = next_row.fetch_add(chunk_rows, std::memory_order_relaxed);
+            if (begin >= total_rows) break;
+            const int end = (begin + chunk_rows < total_rows) ? begin + chunk_rows
+                                                                : total_rows;
+            dequant_i4_rows(w, dst, K, group_size, begin, end);
+        }
+    }
+
+    // fork-join 入口
+    void run(const uint8_t *w_, float *dst_, int M, int K_, int group_size_) {
+        w = w_; dst = dst_; K = K_; group_size = group_size_;
+        total_rows = M;
+        const int p = static_cast<int>(workers.size()) + 1;
+        // 块大小：总行 / (4×核数)，下限 1（与 RowPool 同款再平衡粒度）
+        chunk_rows = M / (p * 4);
+        if (chunk_rows < 1) chunk_rows = 1;
+        next_row.store(0, std::memory_order_relaxed);
+        // release：上面的字段写入对看到 job_gen 的 worker 全部可见
+        job_gen.store(++job_counter, std::memory_order_release);
+        do_work();                            // master 同样参与取块
+        expected_done += workers.size();
+        spin_until_dq(done_gen, expected_done);
+    }
+};
+
+// Meyers singleton：进程内唯一常驻池
+DequantPool &dequant_pool() {
+    static DequantPool p;
+    return p;
+}
+
+} // namespace
+
+// ========================================================================
+// dequant_i4_to_f32: 按组反量化 [M,K] i4 权重到 fp32（对外暴露供单测）
+// ========================================================================
+// 大矩阵走常驻线程池（行间独立，工作窃取），小矩阵串行（省同步开销）。
+// 并行只改变执行顺序，不改变任何一组的数值。
+void dequant_i4_to_f32(const uint8_t *w, float *dst, int M, int K, int group_size) {
+    if (static_cast<std::size_t>(M) * K >= kMinParallelElemsDq &&
+        std::thread::hardware_concurrency() > 1) {
+        dequant_pool().run(w, dst, M, K, group_size);
+        return;
+    }
+    dequant_i4_rows(w, dst, K, group_size, 0, M);
 }
 
 namespace {
