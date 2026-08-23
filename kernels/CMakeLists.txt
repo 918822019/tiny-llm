@@ -64,6 +64,10 @@ add_library(tinyqwen_kernels OBJECT
         # SDOT v3：动态行调度（work-stealing，异构核无拖尾）+ 内联组头
         # 硬件 FCVT（砍掉预计算缓存的 +25% 流量）+ 128 位解包（-37% 指令）。
         matvec/matvec_i4_sdot3.cpp
+        # SDOT v4：修正组头转换的特性守卫——clang +fp16 不定义
+        # __ARM_FEATURE_FP16（sdot3 守卫失效，热循环静默跑软件转换），
+        # 改用 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC + _Float16（2 条指令）。
+        matvec/matvec_i4_sdot4.cpp
         matvec/matmul_ref.cpp
         matvec/matmul_i4_ref.cpp
         # Qwen3.5 Gated DeltaNet（GDN）算子：l2norm / causal conv1d 单步 /
@@ -90,6 +94,10 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     # Apple Silicon 与 Android arm64（armv8.2+dotprod 的芯片）均支持；
     # 源码里另有 __ARM_FEATURE_FP16 守卫，缺特性时退回软件转换（仍逐位一致）。
     set_source_files_properties(matvec/matvec_i4_sdot3.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16")
+    # sdot4 同开 +fp16（守卫修正为 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC，
+    # 这才是 clang 实际定义的宏；见文件头注释的翻车记录）。
+    set_source_files_properties(matvec/matvec_i4_sdot4.cpp PROPERTIES
             COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16")
 endif ()
 

@@ -180,6 +180,37 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 说明 matvec 是主攻方向。top op 是指南针——每加一个优化重新 profile，
 瓶颈会转移（Amdahl 的另一面）。
 
+### 6.7 指令级定位 + 快路径验尸（sdot4 一轮学到的）
+
+**top op 只告诉你"哪个算子慢"，不告诉你"慢在哪条指令"。** 端侧 kernel
+走到深水区（单核效率 < 能力的 30%）时，用系统采样器下到指令级：
+
+```bash
+# 1) 单线程长跑（排除并行噪声），后台跑住
+TINYQWEN_MT_THREADS=1 ./build/runtime/tinyqwen --model <m.tqwen> \
+    --tokens ... --max-new-tokens 200 --matvec-impl <impl> &
+PID=$!; sleep 12
+# 2) macOS sample 采样（输出含函数内偏移）
+sample $PID 8 -file /tmp/prof.txt
+# 3) 按热点偏移反汇编对照（nm 找符号基址，otool -tV 看指令）
+nm <bin> | grep <kernel_fn>        # 拿基址
+otool -tV <bin> > /tmp/dis.txt      # 偏移 = 采样地址 − 基址
+```
+
+**配套铁律：凡是"条件编译切换快慢路径"的代码，改完必须反汇编验尸，
+确认快路径真的被选中。** sdot3 曾写 `#if defined(__ARM_FEATURE_FP16)`
+守卫——clang `-march=...+fp16` 从不定义这个宏（真名是
+`__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），守卫永远为假，热循环静默
+跑软件转换，白白多烧 ~4.6G 条指令/token，而编译、单测、bench 全部"正常"。
+验证手段两条：
+
+- 宏层面：`echo | clang -march=<你的 flags> -dM -E - | grep <宏名>`；
+- 指令层面：反汇编热点函数，数特征指令（如本例软件转换的 `clz` vs
+  硬件转换的 `fcvt`），快路径特征指令必须出现、慢路径特征指令必须为 0。
+
+**诊断先于设计**：本轮若按原计划直接做 4-row 内循环，预期 ~10%；
+sample 把真正的瓶颈（软件转换）指出来后，一条守卫修正拿到单核 1.35×。
+
 ## 7. 进阶：多个优化叠加时怎么评测
 
 ### 7.1 最大的坑：加速比不能直接相乘
@@ -250,6 +281,11 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
   `ref`（默认）→ `double_2_float`（+float 累加）→ `acc4`（+4 链并行累加，
   标量）→ `neon_nofma`（+NEON 向量化，仅 aarch64）→ `neon`（+FMA，仅 aarch64）。
   各层贡献见 `optimization_log.md` 的 neon_nofma 条目（阶梯账本）。
+- **INT4 归因阶梯**（i4 注册表）：`ref` → `neon`（NEON 解包）→ `neon_mt`
+  （+行切分多线程）→ `sdot`/`sdot_mt`（W4A8 SDOT 整数点积）→ `sdot2`/
+  `sdot2_mt`（+预计算缓存 + 2-row ILP）→ `sdot3`/`sdot3_mt`（+work-stealing
+  调度 + 内联组头 + 128 位解包）→ `sdot4`/`sdot4_mt`（修正组头转换守卫，
+  硬件 `_Float16` FCVT 真正生效；4B 单核 1.35×）。当前最佳配方 `sdot4_mt`。
 - **非 matvec 算子分发**（ops dispatch）：rmsnorm/rope/attention/swiglu/argmax
   五个注册表共享 `--ops-impl` 开关。`neon` 变体已全部就位（见 ops_neon 条目）。
 - **GDN 算子分发**（Qwen3.5 专属）：l2norm_inplace/causal_conv1d_update/

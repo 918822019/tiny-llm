@@ -7,6 +7,9 @@
 //   - neon_mt  — ARM NEON + 多线程行切分
 //   - sdot     — ARM dotprod 扩展指令（W4A8 SDOT）
 //   - sdot_mt  — SDOT + 多线程
+//   - sdot2 / sdot2_mt — 预计算缓存 + 2-row 并行
+//   - sdot3 / sdot3_mt — work-stealing + 内联组头 + 128 位解包
+//   - sdot4 / sdot4_mt — sdot3 + 修正组头转换守卫（硬件 _Float16 FCVT）
 //
 // 背景：i4 kernel 此前只有 ref 注释约束、没有自动化验证。量化导出（RTN/HQQ）
 // 与 kernel 之间的契约（interleaved 布局、低 nibble 在前、(q-zero)×scale 反量化、
@@ -377,6 +380,41 @@ TEST(matvec_i4_sdot3_bitexact_vs_sdot2) {
         }
     }
     tinyqwen::set_matvec_i4_impl_by_name("ref");  // 复位，避免影响后续测试
+}
+
+// ---------------------------------------------------------------------------
+// SDOT v4（修正组头转换特性守卫：_Float16 硬件 FCVT）
+// ---------------------------------------------------------------------------
+TEST(matvec_i4_sdot4_matches_w4a8_naive_g64) { check_matvec_i4_sdot_impl("sdot4", 96, 384, 64); }
+TEST(matvec_i4_sdot4_matches_w4a8_naive_g128) { check_matvec_i4_sdot_impl("sdot4", 96, 384, 128); }
+TEST(matvec_i4_sdot4_partial) { check_matvec_i4_sdot_impl("sdot4", 32, 200, 64); }  // 尾部组
+TEST(matvec_i4_sdot4_mt_matches_w4a8_naive_g64) { check_matvec_i4_sdot_impl("sdot4_mt", 512, 896, 64); }
+TEST(matvec_i4_sdot4_mt_matches_w4a8_naive_g128) { check_matvec_i4_sdot_impl("sdot4_mt", 512, 1024, 128); }
+TEST(matvec_i4_sdot4_mt_matches_w4a8_naive_g48) { check_matvec_i4_sdot_impl("sdot4_mt", 512, 544, 48); }
+
+// ---------------------------------------------------------------------------
+// sdot4 vs sdot3 逐位一致：唯一改动是组头转换的实现（硬件 FCVT 替软件
+// 转换），两者都是无损的 fp16→fp32，输出必须逐位相同。
+// ---------------------------------------------------------------------------
+TEST(matvec_i4_sdot4_bitexact_vs_sdot3) {
+    if (!tinyqwen::set_matvec_i4_impl_by_name("sdot3")) return;  // 平台无 dotprod
+    const int out_dim = 128, in_dim = 896, group_size = 64;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 5252);
+    const std::vector<float> x = random_vec(in_dim, 5253);
+    const std::vector<uint8_t> packed = pack_i4_rtn(w, out_dim, in_dim, group_size);
+    std::vector<float> y3(out_dim), y4(out_dim);
+    tinyqwen::set_matvec_i4_impl_by_name("sdot3");
+    tinyqwen::matvec_i4(packed.data(), x.data(), y3.data(), out_dim, in_dim, group_size);
+    tinyqwen::set_matvec_i4_impl_by_name("sdot4");
+    tinyqwen::matvec_i4(packed.data(), x.data(), y4.data(), out_dim, in_dim, group_size);
+    for (int i = 0; i < out_dim; ++i) {
+        if (y3[i] != y4[i]) {  // 逐位比较（不是近似）
+            TQ_FAIL("sdot4 vs sdot3 非逐位一致 @ row " + std::to_string(i) +
+                    ": sdot3=" + std::to_string(y3[i]) + " sdot4=" + std::to_string(y4[i]));
+            return;
+        }
+    }
+    tinyqwen::set_matvec_i4_impl_by_name("ref");  // 复位
 }
 
 // ---------------------------------------------------------------------------

@@ -49,16 +49,16 @@ quantization:
 
 # 推荐的计算配方
 recipe:
-  matvec_impl: sdot3_mt
+  matvec_impl: sdot4_mt
   ops_impl: neon
-  note: W4A8 SDOT v3 多线程；0.8B 上较 sdot2_mt 收益温和（1.02×，模型小缓存占比低）
+  note: W4A8 SDOT v4 多线程；0.8B 上 vs sdot3_mt 1.26×（8.08 vs 10.19）
 
 # 基准测试结果
 benchmark:
   macos_m4:
-    topt_ms: 10.53           # decode 中位（同场 2 轮；sdot2_mt 10.74）
+    topt_ms: 8.08            # decode 中位（同场 2 轮；sdot3_mt 10.19）
     ttft_ms: null
     peak_rss_mb: null
     device: Mac16,10（Apple M4，4P+6E，16GB）
     commit: ea3aba3+
-    note: vs f16 满栈 neon_mt_kv_nt 17.87 = 1.70× 更快；有效带宽 ~40GB/s（单核效率受限，见优化日志）
+    note: vs f16 满栈 neon_mt_kv_nt 17.87 = 2.21× 更快；有效带宽 ~52GB/s

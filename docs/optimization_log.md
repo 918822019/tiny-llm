@@ -50,7 +50,8 @@
 | qwen35-f16-neon-android（Android，Qwen3.5-0.8B） | 54d05f4+ | 35.29 | 37.69 | —（跨模型，vs Qwen2.5-0.5B f16 ~17-21 = 慢 ~1.7-2×） | 30.19×（同场 vs qwen35 ref 1063） | Qwen3.5-0.8B 混合架构（GDN+full attn）f16 满栈首测。**lm_head 主导**：552.94ms/32=17.3ms/tok 占 49%（Qwen3.5 词表 248320→lm_head 508MB f16）。GDN 层高效 ~0.6ms/tok/层（O(1) seq）。peak RSS 1463MB（权重 1435 + GDN state 19.3 + KV 1.5） |
 | i4-sdot2_mt（macOS，预计算+2-row） | 本次 | **3.67** | 4.79 | —（i4 阶梯内部对比） | **1.72×**（同场 vs sdot_mt 6.31，3轮中位） | **i4 首次反超 f16**：预计算 scale/zero 为 f32（消 per-group memcpy+half_to_float，省 ~39M inst/token ~10%）+ 2-row 并行内循环（2 条独立 SDOT 链 + 共享激活加载，ILP 翻倍）。同场 i4 sdot2 3.58 vs f16 满栈 5.68 = **1.59× i4 更快** |
 | qwen35-4b-i4-sdot2_mt（macOS M4，4B 首测） | ea3aba3 | 50.30 | 52.38 | —（4B 首测，无历史基线） | — | Qwen3.5-4B i4（HQQ@64 + lm_head i4）M4 首测。有效带宽仅 ~57GB/s（含预计算缓存 +525MB/token 额外流量）远未及墙；**静态切分 E 核拖尾**：10 线程反慢于 4P（50.3 vs 45.9），6 线程最差（60.4） |
-| qwen35-4b-i4-sdot3_mt（macOS M4） | 本次 | **46.73** | 48.57 | —（4B 阶梯内部对比） | **1.08×**（同场交替 3 轮 vs sdot2_mt 50.30） | sdot3：work-stealing 动态行调度（消异构核拖尾）+ 砍预计算缓存改内联组头硬件 FCVT（流量 −18%、RSS −525MB）+ 128 位解包（−37% 指令）。**副产物：TTFT 456→180ms（2.53×）**——Qwen3.5 prefill 逐 token 回退走 matvec，sdot2 的懒预计算原来记在首 token 上。0.8B 同场 10.74→10.53（1.02×，模型小收益温和）。数值与 sdot2 逐位一致 |
+| qwen35-4b-i4-sdot3_mt（macOS M4） | 04788a5 | **46.73** | 48.57 | —（4B 阶梯内部对比） | **1.08×**（同场交替 3 轮 vs sdot2_mt 50.30） | sdot3：work-stealing 动态行调度（消异构核拖尾）+ 砍预计算缓存改内联组头硬件 FCVT（流量 −18%、RSS −525MB）+ 128 位解包（−37% 指令）。**副产物：TTFT 456→180ms（2.53×）**——Qwen3.5 prefill 逐 token 回退走 matvec，sdot2 的懒预计算原来记在首 token 上。0.8B 同场 10.74→10.53（1.02×，模型小收益温和）。数值与 sdot2 逐位一致 |
+| qwen35-4b-i4-sdot4_mt（macOS M4） | 本次 | **36.50** | 38.51 | 1.38×（4B 内，vs sdot2_mt 50.30） | **1.29×**（同场交替 3 轮 vs sdot3_mt 46.91） | 修组头转换特性守卫：clang +fp16 根本不定义 `__ARM_FEATURE_FP16`（实际是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），**sdot3 的硬件 FCVT 从未生效**，热循环静默跑软件转换（~4.6G 条指令/token，sample 第一大头）。改 `_Float16` cast（fmov+fcvt 2 条）。单核 160→119（1.35×）；有效带宽 50.5→64.8 GB/s；**E 核由负转正**：10 线程 36.0 < 4 线程 39.6。0.8B 同场 10.19→8.08（1.26×）。数值与 sdot3 逐位一致 |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
@@ -1765,6 +1766,68 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
      sdot3 低（4.73 vs 4.91GB，均低于模型文件 4.91GB）——macOS 页回收/
      压缩干扰。内存节省只以代码事实（不再分配 525MB）记录，不以实测断言。
 - **复现**：`MODEL=model_qwen35_4b_i4.tqwen ./scripts/bench.sh qwen35-4b-i4-sdot3_mt --extra-args "--matvec-impl sdot3_mt --ops-impl neon"`
+
+> **后续更正（2026-08-23，见下一条）**：本节声称"硬件 FCVT 替代软件
+> half_to_float"，实际**未生效**——守卫宏 `__ARM_FEATURE_FP16` 在 clang
+> 下不存在（+fp16 定义的是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），
+> 热循环一直跑软件转换。sdot3 的实测数字本身有效（收益来自调度 +
+> 流量削减 + 128 位解包），但"硬件转换"一项由 sdot4 才真正兑现。
+
+---
+
+### qwen35-4b-i4-sdot4_mt（2026-08-23，macOS M4，修正组头转换守卫——硬件 _Float16 FCVT）
+
+- **优化栈**：qwen35-4b-i4-sdot3_mt（work-stealing + 内联组头 + 128 位解包）
+  内核替换为 `kernels/matvec/matvec_i4_sdot4.cpp`（sdot3 原样保留供 A/B）。
+- **是什么**：**唯一改动 = 修正 `half_bits_to_float` 的特性守卫**。
+  sdot3 写 `#if defined(__ARM_FEATURE_FP16)`——clang `-march=...+fp16`
+  从不定义这个宏（定义的是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC` /
+  `_VECTOR_ARITHMETIC`），守卫永远为假，**静默回退软件版转换**
+  （分支 + `clz` 循环，每次 ~15-20 条指令）。sdot4 改用
+  `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC` 守卫 + `_Float16` 标量 cast
+  （编译为 `fmov s0,w0` + `fcvt s0,h0` 两条指令）。
+- **假设来源（先诊断后动刀）**：单线程 4B decode 用 `sample` 指令级采样，
+  97% 时间在 `dot_2rows` 内，热点却散布在**软件转换的分支指令**上
+  （+400~+760 偏移处成片 `clz/ubfx/cmp #0x1f/b.eq`），而非预想的解包/
+  归约。反汇编对照确认。每组 4 次转换（2 行 × scale+zero）× 65.7M
+  组/token ≈ **4.6G 条多余指令**——单核仅 ~15 GB/s（流式能力 68.8）的
+  第一解释。
+- **结果**（M4，冷态，同场交替 3 轮，每轮 27 稳态样本）：
+  - 4B decode：sdot3_mt [46.86, 46.91, 48.63] 中位 **46.91**；
+    sdot4_mt [36.50, 36.44, 36.65] 中位 **36.50** → **1.285×**
+    （样本极稳：全距 0.21ms）。p95：~48-98 → ~38。
+  - **单核**：160.2 → 118.6 ms/tok = **1.35×**——验证"单核效率"诊断。
+  - **有效带宽**：50.5 → **64.8 GB/s**（4B 权重 2365MB/36.5ms）。
+  - **E 核翻案**：sdot3 时代 4P 最优（45.9 < 10 线程 50.3）；sdot4 后
+    10 线程 **36.0** < 4 线程 39.6 ≈ 8 线程 39.0——单核效率上来后
+    work-stealing 让 E 簇真正贡献带宽（整机墙 114 开始有感）。
+  - 0.8B 同场（2 轮）：10.19 → **8.08** = **1.26×**（0.8B i4 vs f16 满栈
+    17.87 → **2.21×**）。
+  - TTFT 无变化（~170-180）：prefill 走 matmul_i4_ref，不经过本路径。
+  - 4B vs sdot2_mt 基线（50.30）累计 **1.38×**。
+- **验证**：
+  - 124 单测全过（新增 7 个：sdot4/sdot4_mt × g64/g128/尾部组/g48 边界
+    + **sdot4 vs sdot3 逐位一致测试**）。
+  - 反汇编确认：`dot_2rows_i4_sdot4` 热路径 63 条 `fcvt`、**0 条**软件
+    转换特征指令（`clz`）；sdot3 同位置是成片软件转换。
+  - 4B 端到端贪心 32 token：sdot4_mt vs sdot3_mt 逐位一致
+    （两种转换都是无损的 fp16→fp32）。
+- **瓶颈转移**：有效带宽 64.8 GB/s——已越过 P 簇墙（74）的 87%，
+  开始进入"全机带宽题"区间；剩余单核空间（118.6ms ≈ 20 GB/s/核 vs
+  能力 68.8）指向下一刀仍是内核效率：**4-row 内循环 / 激活量化 SIMD /
+  i4 gate_up·qkv 融合**；或转攻 prefill（matmul_i4 目前还是 ref 实现！
+  4B TTFT 175ms 里它占大头）。
+- **意外 / 教训**：
+  1. **守卫宏要验尸，不要想当然**：`__ARM_FEATURE_FP16` 听起来天经地义，
+     实际不存在；一条 `clang -dM -E | grep` 就能避免一轮无效优化。
+     凡是"条件编译切换快慢路径"，都要反汇编确认快路径真的被选中。
+  2. **sample 指令级采样是端侧 kernel 的一级工具**：本轮若按原计划直接
+     做 4-row，最多赚 ~10%；profile 把 1.35× 的单核空间直接指了出来。
+     方法论已补进 `docs/optimization.md` 的候选（见该文件更新）。
+  3. 单核效率与调度交互：同一套 work-stealing，sdot3 时 E 核为负、
+     sdot4 时为正——**线程策略的最优解依赖内核效率**，调优顺序应该是
+     先单核、后并行。
+- **复现**：`MODEL=model_qwen35_4b_i4.tqwen ./scripts/bench.sh qwen35-4b-i4-sdot4_mt --extra-args "--matvec-impl sdot4_mt --ops-impl neon"`
 
 ---
 

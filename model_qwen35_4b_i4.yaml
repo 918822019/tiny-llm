@@ -50,19 +50,19 @@ quantization:
   lm_head_quantized: true    # lm_head i4 副本（流量 2543→358MB/token）
   note: tied 模型 embed 保持 fp32 lookup；lm_head 独立量化副本
 
-# 推荐的计算配方：W4A8 SDOT v3 多线程（当前最佳 INT4 配方）
+# 推荐的计算配方：W4A8 SDOT v4 多线程（当前最佳 INT4 配方）
 recipe:
-  matvec_impl: sdot3_mt      # work-stealing + 内联组头硬件 FCVT + 128 位解包
+  matvec_impl: sdot4_mt      # sdot3 + 修正组头转换守卫（硬件 _Float16 FCVT）
   ops_impl: neon
-  note: sdot3_mt（vs sdot2_mt 1.08× + TTFT 2.5×）；TINYQWEN_MT_THREADS 可覆盖线程数
+  note: sdot4_mt（vs sdot3_mt 1.29×）；TINYQWEN_MT_THREADS 可覆盖线程数（10 线程最优）
 
 # 基准测试结果
 benchmark:
   macos_m4:
-    topt_ms: 46.73           # decode 中位（同场交替 3 轮，27 稳态样本/轮）
-    ttft_ms: 180.21          # prefill 3 tok（无预计算开销；sdot2 为 456）
-    p95_ms: 48.57
+    topt_ms: 36.50           # decode 中位（同场交替 3 轮，27 稳态样本/轮）
+    ttft_ms: 176.07          # prefill 3 tok（走 matmul_i4_ref，未优化）
+    p95_ms: 38.51
     peak_rss_mb: null        # macOS ru_maxrss 受页回收干扰，未采信（见优化日志）
     device: Mac16,10（Apple M4，4P+6E，16GB）
     commit: ea3aba3+
-    note: vs sdot2_mt 50.30 = 1.08×（三会话 1.076–1.098×）；与 sdot2_mt 输出逐位一致
+    note: vs sdot3_mt 46.91 = 1.29×；vs sdot2_mt 50.30 累计 1.38×；有效带宽 64.8GB/s；与 sdot3_mt 输出逐位一致
