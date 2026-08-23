@@ -342,6 +342,44 @@ TEST(matvec_i4_sdot_mt_matches_w4a8_naive_g64) { check_matvec_i4_sdot_impl("sdot
 TEST(matvec_i4_sdot_mt_matches_w4a8_naive_g128) { check_matvec_i4_sdot_impl("sdot_mt", 512, 1024, 128); }
 
 // ---------------------------------------------------------------------------
+// SDOT v3（动态调度 + 内联组头 + 128 位解包）
+// ---------------------------------------------------------------------------
+TEST(matvec_i4_sdot3_matches_w4a8_naive_g64) { check_matvec_i4_sdot_impl("sdot3", 96, 384, 64); }
+TEST(matvec_i4_sdot3_matches_w4a8_naive_g128) { check_matvec_i4_sdot_impl("sdot3", 96, 384, 128); }
+TEST(matvec_i4_sdot3_partial) { check_matvec_i4_sdot_impl("sdot3", 32, 200, 64); }  // 尾部组
+TEST(matvec_i4_sdot3_mt_matches_w4a8_naive_g64) { check_matvec_i4_sdot_impl("sdot3_mt", 512, 896, 64); }
+TEST(matvec_i4_sdot3_mt_matches_w4a8_naive_g128) { check_matvec_i4_sdot_impl("sdot3_mt", 512, 1024, 128); }
+// 组内非 32 倍数边界（48 = 32 主块 + 16 兜底块）+ 尾部组恰好 16 元素
+// （544 = 48×11 + 16）；512×544 > 并行阈值 262144，真正走线程池路径
+TEST(matvec_i4_sdot3_mt_matches_w4a8_naive_g48) { check_matvec_i4_sdot_impl("sdot3_mt", 512, 544, 48); }
+
+// ---------------------------------------------------------------------------
+// sdot3 vs sdot2 逐位一致：两项改动（内联组头/128 位解包）都不改变数值——
+// fp16→fp32 无损、整数点积与累加顺序无关、浮点还原同序。任何偏差都说明
+// 实现有 bug，因此容差为 0（逐位比较）。
+// ---------------------------------------------------------------------------
+TEST(matvec_i4_sdot3_bitexact_vs_sdot2) {
+    if (!tinyqwen::set_matvec_i4_impl_by_name("sdot2")) return;  // 平台无 dotprod
+    const int out_dim = 128, in_dim = 896, group_size = 64;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 4242);
+    const std::vector<float> x = random_vec(in_dim, 4243);
+    const std::vector<uint8_t> packed = pack_i4_rtn(w, out_dim, in_dim, group_size);
+    std::vector<float> y2(out_dim), y3(out_dim);
+    tinyqwen::set_matvec_i4_impl_by_name("sdot2");
+    tinyqwen::matvec_i4(packed.data(), x.data(), y2.data(), out_dim, in_dim, group_size);
+    tinyqwen::set_matvec_i4_impl_by_name("sdot3");
+    tinyqwen::matvec_i4(packed.data(), x.data(), y3.data(), out_dim, in_dim, group_size);
+    for (int i = 0; i < out_dim; ++i) {
+        if (y2[i] != y3[i]) {  // 逐位比较（不是近似）
+            TQ_FAIL("sdot3 vs sdot2 非逐位一致 @ row " + std::to_string(i) +
+                    ": sdot2=" + std::to_string(y2[i]) + " sdot3=" + std::to_string(y3[i]));
+            return;
+        }
+    }
+    tinyqwen::set_matvec_i4_impl_by_name("ref");  // 复位，避免影响后续测试
+}
+
+// ---------------------------------------------------------------------------
 // 小矩阵走单线程分支也要对
 // ---------------------------------------------------------------------------
 TEST(matvec_i4_neon_mt_small_singlethread) { check_matvec_i4_impl("neon_mt", 32, 64, 64); }

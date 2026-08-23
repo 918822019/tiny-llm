@@ -101,7 +101,9 @@ if __name__ == "__main__":
     # 作为独立脚本运行：打印所有已注册模型的摘要表格
     for m in load_registry():
         r = m.get("recipe", {})                    # 获取推荐配方
-        b = m.get("benchmark", {}).get("android", {})  # 获取 Android 基准测试数据
+        # 基准数字：优先 android，其次任意已记录平台（如 macos_m4）
+        bench = m.get("benchmark", {})
+        b = bench.get("android") or (next(iter(bench.values()), {}) if bench else {})
         ex = "✓" if m["_exists"] else "✗"          # 文件存在标记
         topt = b.get("topt_ms", "?")               # 每 token 推理耗时（ms）
         # 打印一行模型摘要：存在标记、名字、架构、dtype、大小、配方、性能

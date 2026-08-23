@@ -1,0 +1,68 @@
+# =============================================================================
+# model_qwen35_4b_i4.yaml —— Qwen3.5-4B INT4 HQQ 混合架构模型注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件记录 Qwen3.5-4B（GDN + Full Attention 3:1 混合架构）INT4 量化
+#   模型的元数据。4B 是当前端侧路线的主力规模：i4 权重 2365MB，
+#   tied 模型的 lm_head 导出为独立 i4 副本（2543→358MB/token 流量）。
+#
+#   文件内 f32 部分（2546MB）= embed_tokens fp32 lookup 表，
+#   每 token 只查一行，不构成带宽压力，但占磁盘与常驻内存大头。
+#
+#   M4（4P+6E，16GB）实测：sdot3_mt 46.73 ms/tok（vs sdot2_mt 50.30 = 1.08×），
+#   TTFT 180ms。详见 docs/optimization_log.md「qwen35-4b-i4-sdot3_mt」小节。
+# =============================================================================
+
+# Model registry: model_qwen35_4b_i4.tqwen（Qwen3.5-4B i4 HQQ@64 + lm_head i4）
+name: model_qwen35_4b_i4
+architecture: qwen3.5        # 架构族：Qwen3.5 混合架构（GDN + Full Attention）
+source: Qwen/Qwen3.5-4B
+dtype: i4                    # 权重数据类型：INT4
+file: model_qwen35_4b_i4.tqwen
+size_mb: 4684.3              # i4 2365MB + embed fp32 2543MB（lookup 表）
+
+# 模型结构参数（config.json text_config）
+params:
+  n_layers: 32               # Transformer 总层数（24 GDN + 8 Full Attention）
+  hidden_size: 2560          # 隐藏层维度
+  intermediate_size: 9216    # FFN 中间层维度（>8192：曾触发 sdot kMaxInDim 截断 bug）
+  n_heads: 16                # Full Attention 的 Query 头数
+  n_kv_heads: 4              # Full Attention 的 KV 头数（GQA）
+  head_dim: 256              # Full Attention 每个头的维度
+  vocab_size: 248320         # 词表大小（与 0.8B 相同）
+  tied_embeddings: true      # embed 与 lm_head 共享（导出独立 lm_head i4 副本）
+  model_type: qwen3_5
+  full_attention_interval: 4 # 每 4 层 1 层 Full Attention
+  attn_output_gate: true     # 注意力输出经过门控
+
+# GDN（Gated Delta Network）层参数
+gdn:
+  linear_num_qk_heads: 16    # GDN 的 QK 头数
+  linear_num_v_heads: 32     # GDN 的 V 头数（0.8B 是 16，4B 翻倍）
+  linear_qk_head_dim: 128
+  linear_v_head_dim: 128
+  linear_conv_kernel_dim: 4
+
+# 量化配置：HQQ@64，lm_head 也量化
+quantization:
+  method: hqq                # HQQ（MSE 最优），导出 --method hqq
+  group_size: 64
+  lm_head_quantized: true    # lm_head i4 副本（流量 2543→358MB/token）
+  note: tied 模型 embed 保持 fp32 lookup；lm_head 独立量化副本
+
+# 推荐的计算配方：W4A8 SDOT v3 多线程（当前最佳 INT4 配方）
+recipe:
+  matvec_impl: sdot3_mt      # work-stealing + 内联组头硬件 FCVT + 128 位解包
+  ops_impl: neon
+  note: sdot3_mt（vs sdot2_mt 1.08× + TTFT 2.5×）；TINYQWEN_MT_THREADS 可覆盖线程数
+
+# 基准测试结果
+benchmark:
+  macos_m4:
+    topt_ms: 46.73           # decode 中位（同场交替 3 轮，27 稳态样本/轮）
+    ttft_ms: 180.21          # prefill 3 tok（无预计算开销；sdot2 为 456）
+    p95_ms: 48.57
+    peak_rss_mb: null        # macOS ru_maxrss 受页回收干扰，未采信（见优化日志）
+    device: Mac16,10（Apple M4，4P+6E，16GB）
+    commit: ea3aba3+
+    note: vs sdot2_mt 50.30 = 1.08×（三会话 1.076–1.098×）；与 sdot2_mt 输出逐位一致

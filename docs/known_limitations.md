@@ -47,7 +47,9 @@
 
 ## 未实现（路线图，不在 v1）
 
-- INT4 继续：per-group 标量开销压缩、lm_head 进一步提速、sdot2 Android 真机验证；
+- INT4 继续：sdot3 已消预计算缓存与异构核拖尾（见优化日志），下一刀候选
+  = 4-row 内循环（单核效率）/ i4 gate_up·qkv 融合（dispatch 入口已有、
+  无实现）/ 激活量化 SIMD；Android 真机验证 sdot3 未做；
 - INT8 weight-only reference quantization；
 - KronQ packing；
 - GPTQ / AWQ 等量化算法（接入流程见 `quantization_guide.md`）；

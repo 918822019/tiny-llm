@@ -61,6 +61,9 @@ add_library(tinyqwen_kernels OBJECT
         # SDOT v2：预计算 scale/zero 为 f32 数组（消 per-group memcpy+half_to_float）
         # + 2-row 并行内循环（2 条独立 SDOT 链 + 共享激活加载，提高 ILP）。
         matvec/matvec_i4_sdot2.cpp
+        # SDOT v3：动态行调度（work-stealing，异构核无拖尾）+ 内联组头
+        # 硬件 FCVT（砍掉预计算缓存的 +25% 流量）+ 128 位解包（-37% 指令）。
+        matvec/matvec_i4_sdot3.cpp
         matvec/matmul_ref.cpp
         matvec/matmul_i4_ref.cpp
         # Qwen3.5 Gated DeltaNet（GDN）算子：l2norm / causal conv1d 单步 /
@@ -83,6 +86,11 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
             COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
     set_source_files_properties(matvec/matvec_i4_sdot2.cpp PROPERTIES
             COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+    # sdot3 另开 +fp16：组头的 fp16→fp32 走硬件 FCVT（__ARM_FEATURE_FP16）。
+    # Apple Silicon 与 Android arm64（armv8.2+dotprod 的芯片）均支持；
+    # 源码里另有 __ARM_FEATURE_FP16 守卫，缺特性时退回软件转换（仍逐位一致）。
+    set_source_files_properties(matvec/matvec_i4_sdot3.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16")
 endif ()
 
 # neon_mt 用 std::thread 建常驻线程池。OBJECT 库的 PUBLIC 链接需求会传播给
