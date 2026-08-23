@@ -98,22 +98,29 @@ namespace tinyqwen {
         // forward_token: 在当前位置上前向一个 token（decode 模式）
         //
         // 参数:
-        //   token_id: 当前输入 token 的 id
-        //   topk:     可选输出参数，填入 top-k logits 结果
-        //   topk_k:   top-k 的数量（默认 5）
+        //   token_id:   当前输入 token 的 id
+        //   topk:       可选输出参数，填入 top-k logits 结果
+        //   topk_k:     top-k 的数量（默认 5）
+        //   need_logits: 是否计算 final_norm + lm_head + argmax（默认 true）。
+        //                prefill 非末位 token 的 logits 会被丢弃，传 false 跳过
+        //                这段（4B 上约省 16% 单 token 开销）；状态（KV/GDN）
+        //                照常更新。跳过时返回 -1。
+        //                ⚠️ --verbose / --dump-logits 的逐位置对照路径必须保持
+        //                true（由 main 的直接调用保证，不走 forward_prefill）。
         //
         // 返回值:
-        //   greedy 的下一个 token id（即 argmax(logits)）
+        //   greedy 的下一个 token id（即 argmax(logits)）；need_logits=false 时 -1
         //
         // 说明:
         //   当前位置 = kv_cache().seq_len()。
         //   处理流程:
         //     1. embed(token_id) -> hidden
         //     2. 逐层 forward（attention + FFN）
-        //     3. final_norm -> lm_head -> logits
-        //     4. argmax(logits) 返回下一个 token id
+        //     3. final_norm -> lm_head -> logits（need_logits 时）
+        //     4. argmax(logits) 返回下一个 token id（need_logits 时）
         // ---------------------------------------------------------------------
-        int forward_token(int token_id, TopKResult *topk = nullptr, int topk_k = 5);
+        int forward_token(int token_id, TopKResult *topk = nullptr, int topk_k = 5,
+                          bool need_logits = true);
 
         // ---------------------------------------------------------------------
         // forward_prefill: 批量 prefill —— 一次处理 n 个 prompt token

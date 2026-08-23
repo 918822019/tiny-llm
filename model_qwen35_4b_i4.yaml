@@ -60,7 +60,7 @@ recipe:
 benchmark:
   macos_m4:
     topt_ms: 36.50           # decode 中位（同场交替 3 轮，27 稳态样本/轮）
-    ttft_ms: 176.07          # prefill 3 tok（走 matmul_i4_ref，未优化）
+    ttft_ms: 101.76          # canonical 3-token prefill 冷态；33-token prompt 1158ms（非末位跳过 logits 后）
     p95_ms: 38.51
     peak_rss_mb: null        # macOS ru_maxrss 受页回收干扰，未采信（见优化日志）
     device: Mac16,10（Apple M4，4P+6E，16GB）

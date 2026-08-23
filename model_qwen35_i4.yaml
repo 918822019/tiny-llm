@@ -57,7 +57,7 @@ recipe:
 benchmark:
   macos_m4:
     topt_ms: 8.08            # decode 中位（同场 2 轮；sdot3_mt 10.19）
-    ttft_ms: null
+    ttft_ms: 21.39           # canonical 3-token prefill（非末位跳过 logits 后）
     peak_rss_mb: null
     device: Mac16,10（Apple M4，4P+6E，16GB）
     commit: ea3aba3+

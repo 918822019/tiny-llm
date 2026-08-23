@@ -51,7 +51,8 @@
 | i4-sdot2_mt（macOS，预计算+2-row） | 本次 | **3.67** | 4.79 | —（i4 阶梯内部对比） | **1.72×**（同场 vs sdot_mt 6.31，3轮中位） | **i4 首次反超 f16**：预计算 scale/zero 为 f32（消 per-group memcpy+half_to_float，省 ~39M inst/token ~10%）+ 2-row 并行内循环（2 条独立 SDOT 链 + 共享激活加载，ILP 翻倍）。同场 i4 sdot2 3.58 vs f16 满栈 5.68 = **1.59× i4 更快** |
 | qwen35-4b-i4-sdot2_mt（macOS M4，4B 首测） | ea3aba3 | 50.30 | 52.38 | —（4B 首测，无历史基线） | — | Qwen3.5-4B i4（HQQ@64 + lm_head i4）M4 首测。有效带宽仅 ~57GB/s（含预计算缓存 +525MB/token 额外流量）远未及墙；**静态切分 E 核拖尾**：10 线程反慢于 4P（50.3 vs 45.9），6 线程最差（60.4） |
 | qwen35-4b-i4-sdot3_mt（macOS M4） | 04788a5 | **46.73** | 48.57 | —（4B 阶梯内部对比） | **1.08×**（同场交替 3 轮 vs sdot2_mt 50.30） | sdot3：work-stealing 动态行调度（消异构核拖尾）+ 砍预计算缓存改内联组头硬件 FCVT（流量 −18%、RSS −525MB）+ 128 位解包（−37% 指令）。**副产物：TTFT 456→180ms（2.53×）**——Qwen3.5 prefill 逐 token 回退走 matvec，sdot2 的懒预计算原来记在首 token 上。0.8B 同场 10.74→10.53（1.02×，模型小收益温和）。数值与 sdot2 逐位一致 |
-| qwen35-4b-i4-sdot4_mt（macOS M4） | 本次 | **36.50** | 38.51 | 1.38×（4B 内，vs sdot2_mt 50.30） | **1.29×**（同场交替 3 轮 vs sdot3_mt 46.91） | 修组头转换特性守卫：clang +fp16 根本不定义 `__ARM_FEATURE_FP16`（实际是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），**sdot3 的硬件 FCVT 从未生效**，热循环静默跑软件转换（~4.6G 条指令/token，sample 第一大头）。改 `_Float16` cast（fmov+fcvt 2 条）。单核 160→119（1.35×）；有效带宽 50.5→64.8 GB/s；**E 核由负转正**：10 线程 36.0 < 4 线程 39.6。0.8B 同场 10.19→8.08（1.26×）。数值与 sdot3 逐位一致 |
+| qwen35-4b-i4-sdot4_mt（macOS M4） | 8d5447f | **36.50** | 38.51 | 1.38×（4B 内，vs sdot2_mt 50.30） | **1.29×**（同场交替 3 轮 vs sdot3_mt 46.91） | 修组头转换特性守卫：clang +fp16 根本不定义 `__ARM_FEATURE_FP16`（实际是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），**sdot3 的硬件 FCVT 从未生效**，热循环静默跑软件转换（~4.6G 条指令/token，sample 第一大头）。改 `_Float16` cast（fmov+fcvt 2 条）。单核 160→119（1.35×）；有效带宽 50.5→64.8 GB/s；**E 核由负转正**：10 线程 36.0 < 4 线程 39.6。0.8B 同场 10.19→8.08（1.26×）。数值与 sdot3 逐位一致 |
+| prefill_skip_logits（macOS M4，TTFT 专项） | 本次 | 36.49（TOPT 不变） | 38.42 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT 1.14×**（33-tok prompt 1320→1158ms） | Qwen3.5 prefill 逐 token 回退中，非末位 token 的 logits 被丢弃却全量计算 lm_head（4B 占单 token 16%）。forward_token 加 need_logits 门控跳过 final_norm+lm_head+argmax。微观证据：同 profile 内跳过位 29.96 vs 末位 35.77（Δ5.81≈lm_head 5.87ms）；0.8B TTFT ~21.4。对齐契约（--verbose 逐位置 dump）不受影响。TOPT 逐位不变 |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
@@ -1803,7 +1804,10 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
     work-stealing 让 E 簇真正贡献带宽（整机墙 114 开始有感）。
   - 0.8B 同场（2 轮）：10.19 → **8.08** = **1.26×**（0.8B i4 vs f16 满栈
     17.87 → **2.21×**）。
-  - TTFT 无变化（~170-180）：prefill 走 matmul_i4_ref，不经过本路径。
+  - TTFT 无变化（~170-180）：~~prefill 走 matmul_i4_ref~~ **更正**：Qwen3.5
+    prefill 实际逐 token 回退走 forward_token（含 lm_head），当时两次测量
+    都含完整 lm_head 且热态相近故无差；此误判由下一条（prefill_skip_logits）
+    的 profile 拆解纠正。
   - 4B vs sdot2_mt 基线（50.30）累计 **1.38×**。
 - **验证**：
   - 124 单测全过（新增 7 个：sdot4/sdot4_mt × g64/g128/尾部组/g48 边界
@@ -1828,6 +1832,47 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
      sdot4 时为正——**线程策略的最优解依赖内核效率**，调优顺序应该是
      先单核、后并行。
 - **复现**：`MODEL=model_qwen35_4b_i4.tqwen ./scripts/bench.sh qwen35-4b-i4-sdot4_mt --extra-args "--matvec-impl sdot4_mt --ops-impl neon"`
+
+---
+
+### prefill_skip_logits（2026-08-24，macOS M4，TTFT 专项——非末位 prefill 跳过 logits）
+
+- **优化栈**：qwen35-4b-i4-sdot4_mt + `forward_token(need_logits)` 门控。
+- **是什么**：Qwen3.5 prefill 走逐 token 回退，**每个** token 都算 final_norm
+  + lm_head + argmax，但非末位 token 的 logits 会被丢弃（下一个 token 只由
+  末位 logits 决定）。给 `forward_token` 加 `need_logits` 参数（默认 `true`），
+  回退循环对非末位传 `false`，整段跳过；末位与 decode 不受影响。
+  KV cache / GDN state 照常更新，返回 -1 仅被中间迭代覆盖。
+- **假设**：省掉一次 lm_head（4B 357.6MB i4 ≈ 单 token 流量 16%、0.8B 34%）
+  + final_norm + argmax。prefill 是逐 token 带宽题，省一份权重搬运就快一份。
+- **结果**（M4，冷态）：
+  - **33-token 真实中文 prompt**（梯度下降主题，tokenize 自 Qwen3.5-4B 分词器）：
+    OLD 1317.2/1322.9（中位 **1320**）→ NEW 1144.9/1170.4（中位 **1158**）
+    = **1.14×**。与理论吻合：33 个里 32 个跳过、每个省 ~16% → 33/(33−32×0.16)≈1.135。
+  - **微观证据**（单次 profile 内拆每个 prefill token）：
+    跳过位 tok1=29.96ms vs 末位 tok2=35.77ms，Δ=**5.81ms ≈ lm_head 实测 5.87ms**——
+    省的就是 lm_head。OLD（commit 8d5447f）同拆：tok1=33.45≈tok2=35.93（未跳过）。
+  - **0.8B**：TTFT 21.4/22.0ms（未跳过理论 ~24-25），TOPT 7.91-8.44 无回归。
+  - **decode TOPT 不变**（本刀只动 prefill）：4B 35.7-36.5 vs 基线 36.5；逐位一致。
+  - canonical 3-token TTFT 绝对值受热噪声污染（冷 107.6，热态漂到 ~200），
+    故以"长 prompt + 同 profile 内逐 token 拆分"为权威证据。
+- **验证**：
+  - 124 单测全过；4B 端到端贪心 32 token 与优化前**逐位一致**。
+  - **对齐契约**：`tools/align_fake_qwen35_model.py` 通过（worst 1.16e-6 < 1e-5）——
+    它走 `--verbose` 逐位置 `--dump-logits`，由 main 直接调 `forward_token`
+    （need_logits 恒 true），不受回退循环门控影响。
+- **瓶颈转移**：Qwen3.5 prefill 仍是逐 token 串行（GDN 状态需顺序更新）。
+  真正的下一刀是 **GDN 架构的批量 prefill**：投影/FFN 部分 GEMM 化（权重
+  流量从"每 token 一遍"摊薄为"整批一遍"），仅 GDN 递归态保留顺序扫描——
+  长 prompt 预期量级级改善。
+- **意外 / 教训**：
+  1. **bench 的 TTFT 是热污染重灾区**：3-token canonical 冷态 107.6，热态能漂
+     到 ~200（175/3≈58ms/tok≈热态 decode 速度）。TTFT 比 TOPT 更吃测量时的
+     热状态；小幅 TTFT 优化要用长 prompt + 同 profile 逐 token 拆分来证明。
+  2. **先 profile 再下结论**：上一轮日志曾断言"prefill 走 matmul_i4_ref"，
+     实际 Qwen3.5 逐 token 回退、根本不走 matmul。本条已一并更正该误判。
+- **复现**：长 prompt 用 `tools/tokenize_prompt.py --model models/Qwen3.5-4B`
+  生成，`--tokens-json` 喂给 runtime；对比 `--profile-out` 的 `first_token_ms`。
 
 ---
 

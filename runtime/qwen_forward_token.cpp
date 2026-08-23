@@ -80,7 +80,8 @@ namespace tinyqwen {
     // 说明：pos 是当前 KV 长度（= 这是序列里第几个位置）；调用结束后 cache
     //       有 pos+1 条，返回值是 greedy 的下一个 token。
     //       数学定义见 docs/qwen_forward.md。
-    int QwenModel::forward_token(int token_id, TopKResult *topk, int topk_k) {
+    int QwenModel::forward_token(int token_id, TopKResult *topk, int topk_k,
+                                 bool need_logits) {
         // 提取配置参数（转为 int 便于循环中使用）
         const int hidden = static_cast<int>(cfg_.hidden_size);
         const int inter = static_cast<int>(cfg_.intermediate_size);
@@ -456,38 +457,43 @@ namespace tinyqwen {
         }
 
         // =====================================================================
-        // Step 3: 最后的 norm + 投影到词表
+        // Step 3 + 4: 最后的 norm + lm_head + argmax
         // =====================================================================
-        {
-            ScopedTimer t(prof, "final_norm");
-            backend_->rmsnorm(hidden_.data(), final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
-        }
-        {
-            // lm_head：把 hidden 向量投成 vocab 维的 logits（每个词一个分数）
-            // tied 时 lm_head_ 就是 embed_（见 create）。I4 tied 时 embed 是 fp32
-            ScopedTimer t(prof, "lm_head");
-            if (lm_head_is_f32_) {
-                // I4 tied embeddings：lm_head 走 f32 matvec 路径
-                matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
-                           logits_.data(), vocab, hidden);
-            } else {
-                // 正常路径：通过 backend 的 matvec
-                mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+        // need_logits=false（prefill 非末位 token）时整段跳过：其 logits 会被
+        // 丢弃，跳过省掉一次 lm_head 流量（4B ≈ 16%、0.8B ≈ 29% 单 token
+        // 开销）。各层状态（KV cache / GDN state）在 Step 2 已照常更新，
+        // 返回值 -1 仅被 forward_prefill 的回退循环用于中间迭代（随即被覆盖）。
+        // 注意：--verbose / --dump-logits 的逐位置对照走 main 的直接调用，
+        // 恒为 need_logits=true，对齐契约不受影响。
+        int next = -1;
+        if (need_logits) {
+            {
+                ScopedTimer t(prof, "final_norm");
+                backend_->rmsnorm(hidden_.data(), final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
             }
-        }
+            {
+                // lm_head：把 hidden 向量投成 vocab 维的 logits（每个词一个分数）
+                // tied 时 lm_head_ 就是 embed_（见 create）。I4 tied 时 embed 是 fp32
+                ScopedTimer t(prof, "lm_head");
+                if (lm_head_is_f32_) {
+                    // I4 tied embeddings：lm_head 走 f32 matvec 路径
+                    matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                               logits_.data(), vocab, hidden);
+                } else {
+                    // 正常路径：通过 backend 的 matvec
+                    mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+                }
+            }
 
-        // =====================================================================
-        // Step 4: greedy 取 argmax
-        // =====================================================================
-        int next = 0;
-        {
-            // 要 top-k 就顺便取，argmax 就是 top-1，不重复扫
-            ScopedTimer t(prof, "topk_argmax");
-            if (topk) {
-                top_k_logits(logits_.data(), vocab, topk_k, topk);
-                next = topk->indices.empty() ? 0 : topk->indices[0]; // 第一个就是 argmax
-            } else {
-                next = argmax(logits_.data(), vocab); // 直接取最大值索引
+            // greedy 取 argmax：要 top-k 就顺便取，argmax 就是 top-1，不重复扫
+            {
+                ScopedTimer t(prof, "topk_argmax");
+                if (topk) {
+                    top_k_logits(logits_.data(), vocab, topk_k, topk);
+                    next = topk->indices.empty() ? 0 : topk->indices[0]; // 第一个就是 argmax
+                } else {
+                    next = argmax(logits_.data(), vocab); // 直接取最大值索引
+                }
             }
         }
 

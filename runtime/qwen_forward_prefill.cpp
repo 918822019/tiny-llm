@@ -86,11 +86,15 @@ namespace tinyqwen {
         const bool is_qwen35 = cfg_.model_type == ModelType::kQwen35;
 
         // GDN (linear attention) layers need sequential state updates — fall back
-        // 如果模型是 Qwen3.5，GDN 的状态更新必须顺序进行，退回到逐 token 处理
+        // 如果模型是 Qwen3.5，GDN 的状态更新必须顺序进行，退回到逐 token 处理。
+        // 非末位 token 的 logits 会被丢弃 → need_logits=false 跳过
+        // final_norm + lm_head + argmax（4B 上省 ~16% 单 token 开销，
+        // 长 prompt 线性累计）；末位保留，产出第一个生成 token。
         if (is_qwen35) {
             int last = -1;
             for (int i = 0; i < n; ++i)
-                last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k);
+                last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k,
+                                     /*need_logits=*/i == n - 1);
             return last;
         }
 

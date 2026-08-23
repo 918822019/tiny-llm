@@ -47,9 +47,10 @@
 
 ## 未实现（路线图，不在 v1）
 
-- INT4 继续：sdot4 已兑现硬件组头转换（4B 46.9→36.5 ms/tok），下一刀候选
-  = 4-row 内循环 / i4 gate_up·qkv 融合（dispatch 入口已有、无实现）/
-  激活量化 SIMD / prefill matmul_i4 优化（目前仍是 ref 实现，4B TTFT 大头）；
+- INT4 继续：sdot4 已兑现硬件组头转换（4B 46.9→36.5 ms/tok），TTFT 侧
+  已跳过非末位 prefill 的 logits（长 prompt 1.14×）；下一刀候选
+  = **Qwen3.5 批量 prefill**（投影/FFN GEMM 化 + GDN 态顺序扫描，长 prompt
+  量级级改善）/ 4-row 内循环 / i4 gate_up·qkv 融合 / 激活量化 SIMD；
   Android 真机验证 sdot3/sdot4 未做；
 - INT8 weight-only reference quantization；
 - KronQ packing；
