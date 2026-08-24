@@ -394,6 +394,88 @@ TEST(matvec_i4_sdot4_mt_matches_w4a8_naive_g128) { check_matvec_i4_sdot_impl("sd
 TEST(matvec_i4_sdot4_mt_matches_w4a8_naive_g48) { check_matvec_i4_sdot_impl("sdot4_mt", 512, 544, 48); }
 
 // ---------------------------------------------------------------------------
+// SDOT v5（对称量化，zero=8）——需要对称量化数据才能对
+// ---------------------------------------------------------------------------
+// 先用对称 pack 生成 zero=8 的权重，再与 naive W4A8 参考比对。
+// 普通 pack_i4_rtn 的 zero≠8，sdot5 跳过修正项会产生大误差——这是预期行为。
+namespace {
+// 对称量化打包：zero 强制为 8，scale = max(|vmin|,|vmax|)/7
+std::vector<uint8_t> pack_i4_rtn_symmetric(const std::vector<float> &w, int out_dim, int in_dim,
+                                           int group_size) {
+    const int groups_per_row = (in_dim + group_size - 1) / group_size;
+    const int group_total = kHdr + group_size / 2;
+    const int row_bytes = groups_per_row * group_total;
+    std::vector<uint8_t> packed(static_cast<size_t>(out_dim) * row_bytes, 0);
+    for (int o = 0; o < out_dim; ++o) {
+        for (int g = 0; g < groups_per_row; ++g) {
+            const int start = g * group_size;
+            const int end = std::min(start + group_size, in_dim);
+            float vmin = w[o * in_dim + start], vmax = vmin;
+            for (int i = start; i < end; ++i) {
+                vmin = std::min(vmin, w[o * in_dim + i]);
+                vmax = std::max(vmax, w[o * in_dim + i]);
+            }
+            const float amax = std::max(std::fabs(vmin), std::fabs(vmax));
+            const float scale = (amax > 0) ? amax / 7.0f : 0.0f;
+            const float zero = 8.0f;
+            const uint16_t scale_h = float_to_half(scale);
+            const uint16_t zero_h = float_to_half(zero);
+            const float s = half_to_float(scale_h);
+            const float z = half_to_float(zero_h);
+            uint8_t *gp = packed.data() + static_cast<size_t>(o) * row_bytes + g * group_total;
+            std::memcpy(gp, &scale_h, 2);
+            std::memcpy(gp + 2, &zero_h, 2);
+            for (int i = start; i < end; ++i) {
+                const int li = i - start;
+                const float v = (s > 0) ? w[o * in_dim + i] / s + z : 0.0f;
+                const int q = std::max(0, std::min(15, static_cast<int>(v >= 0 ? v + 0.5f : v - 0.5f)));
+                if (li % 2 == 0) gp[kHdr + li / 2] = static_cast<uint8_t>(q);
+                else gp[kHdr + li / 2] |= static_cast<uint8_t>(q << 4);
+            }
+        }
+    }
+    return packed;
+}
+} // namespace
+
+TEST(matvec_i4_sdot5_matches_sym_naive_g64) {
+    if (!tinyqwen::set_matvec_i4_impl_by_name("sdot5")) return;
+    const int out_dim = 96, in_dim = 384, group_size = 64;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 9901);
+    const std::vector<uint8_t> packed = pack_i4_rtn_symmetric(w, out_dim, in_dim, group_size);
+    const std::vector<float> x = random_vec(in_dim, 9902);
+    std::vector<float> y(out_dim);
+    tinyqwen::matvec_i4(packed.data(), x.data(), y.data(), out_dim, in_dim, group_size);
+    const std::vector<float> ref = matvec_i4_w4a8_naive(packed, x, out_dim, in_dim, group_size);
+    double max_err = 0.0;
+    for (int i = 0; i < out_dim; ++i)
+        max_err = std::max(max_err, std::fabs(static_cast<double>(y[i]) - ref[i]));
+    // sdot5 与 naive 使用同一 W4A8 方案，零修正项为 0，应几乎逐位一致
+    if (max_err >= 1e-4) {
+        TQ_FAIL("sdot5 symmetric max_err=" + std::to_string(max_err));
+    }
+    tinyqwen::set_matvec_i4_impl_by_name("ref");
+}
+
+TEST(matvec_i4_sdot5_mt_matches_sym_naive) {
+    if (!tinyqwen::set_matvec_i4_impl_by_name("sdot5_mt")) return;
+    const int out_dim = 512, in_dim = 896, group_size = 64;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 9903);
+    const std::vector<uint8_t> packed = pack_i4_rtn_symmetric(w, out_dim, in_dim, group_size);
+    const std::vector<float> x = random_vec(in_dim, 9904);
+    std::vector<float> y(out_dim);
+    tinyqwen::matvec_i4(packed.data(), x.data(), y.data(), out_dim, in_dim, group_size);
+    const std::vector<float> ref = matvec_i4_w4a8_naive(packed, x, out_dim, in_dim, group_size);
+    double max_err = 0.0;
+    for (int i = 0; i < out_dim; ++i)
+        max_err = std::max(max_err, std::fabs(static_cast<double>(y[i]) - ref[i]));
+    if (max_err >= 1e-4) {
+        TQ_FAIL("sdot5_mt symmetric max_err=" + std::to_string(max_err));
+    }
+    tinyqwen::set_matvec_i4_impl_by_name("ref");
+}
+
+// ---------------------------------------------------------------------------
 // sdot4 vs sdot3 逐位一致：唯一改动是组头转换的实现（硬件 FCVT 替软件
 // 转换），两者都是无损的 fp16→fp32，输出必须逐位相同。
 // ---------------------------------------------------------------------------

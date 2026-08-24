@@ -195,10 +195,13 @@ def should_quantize(name: str) -> bool:
     return True  # 其余 tensor（主要是 linear projection）做 INT4 量化
 
 
-def quantize_i4_group(data: np.ndarray) -> tuple[np.float16, np.float16, np.ndarray]:
+def quantize_i4_group(data: np.ndarray, symmetric: bool = False) -> tuple[np.float16, np.float16, np.ndarray]:
     """对一组 float32 数据做非对称 RTN（Round-To-Nearest）INT4 量化。
 
-    RTN 量化原理：
+    symmetric=True 时强制 zero=8（对称量化），scale = max(|vmin|,|vmax|) / 7，
+    与 llama.cpp Q4_0 同方案。反量化 = (q-8) * scale，无 zero 修正项。
+
+    RTN 量化原理（非对称）：
     1. 计算该组数据的 min/max 范围。
     2. scale = (max - min) / 15，将浮点范围映射到 [0, 15] 整数区间。
     3. zero_point = -min / scale，使得 uint4=0 对应 vmin。
@@ -210,6 +213,7 @@ def quantize_i4_group(data: np.ndarray) -> tuple[np.float16, np.float16, np.ndar
 
     Args:
         data: 一维 float32 数组，长度 <= group_size。
+        symmetric: 是否对称量化（zero=8）。
 
     Returns:
         (scale_fp16, zero_fp16, quantized_uint8_array) 三元组。
@@ -217,6 +221,24 @@ def quantize_i4_group(data: np.ndarray) -> tuple[np.float16, np.float16, np.ndar
     """
     vmin = data.min()  # 组内最小值
     vmax = data.max()  # 组内最大值
+
+    if symmetric:
+        # 对称量化（llama.cpp Q4_0 同方案）：zero=8，scale = max(|vmin|,|vmax|)/7
+        amax = max(abs(vmin), abs(vmax))
+        if amax == 0.0:
+            scale = np.float16(0.0)
+            zero = np.float16(8.0)
+            quantized = np.zeros(len(data), dtype=np.uint8)
+        else:
+            scale = np.float16(np.float32(amax) / np.float32(7.0))
+            zero = np.float16(8.0)
+            s = float(scale)
+            if s == 0:
+                quantized = np.zeros(len(data), dtype=np.uint8)
+            else:
+                q = np.round(data / s + 8.0).astype(np.int32)
+                quantized = np.clip(q, 0, 15).astype(np.uint8)
+        return scale, zero, quantized
 
     if vmax == vmin:
         # 特殊情况：所有元素相同，scale=0 避免除零
@@ -247,7 +269,7 @@ def quantize_i4_group(data: np.ndarray) -> tuple[np.float16, np.float16, np.ndar
     return scale, zero, quantized
 
 
-def quantize_tensor_i4(tensor: np.ndarray, group_size: int) -> bytes:
+def quantize_tensor_i4(tensor: np.ndarray, group_size: int, symmetric: bool = False) -> bytes:
     """将 [out_dim, in_dim] 的 fp32 tensor 量化为 interleaved INT4 格式（RTN 方法）。
 
     输出格式（每行每个组）：
@@ -260,6 +282,7 @@ def quantize_tensor_i4(tensor: np.ndarray, group_size: int) -> bytes:
     Args:
         tensor: 形状为 [out_dim, in_dim] 的 fp32 numpy 数组。
         group_size: 量化组大小。
+        symmetric: 是否对称量化（zero=8）。
 
     Returns:
         量化后的字节串，长度为 out_dim × i4_row_bytes(in_dim, group_size)。
@@ -267,11 +290,11 @@ def quantize_tensor_i4(tensor: np.ndarray, group_size: int) -> bytes:
     assert tensor.ndim == 2  # 必须是 2D 矩阵
     out_dim, in_dim = tensor.shape  # 获取矩阵维度
     if in_dim % group_size == 0:
-        return _quantize_tensor_i4_vec(tensor, group_size)  # 快路径：全向量化
-    return _quantize_tensor_i4_loop(tensor, group_size)     # 慢路径：尾部不满组
+        return _quantize_tensor_i4_vec(tensor, group_size, symmetric)  # 快路径：全向量化
+    return _quantize_tensor_i4_loop(tensor, group_size, symmetric)     # 慢路径：尾部不满组
 
 
-def _quantize_tensor_i4_vec(tensor: np.ndarray, group_size: int) -> bytes:
+def _quantize_tensor_i4_vec(tensor: np.ndarray, group_size: int, symmetric: bool = False) -> bytes:
     """RTN 向量量化快路径（in_dim % group_size == 0）。
 
     与逐组循环版（_quantize_tensor_i4_loop）逐位一致：
@@ -293,6 +316,19 @@ def _quantize_tensor_i4_vec(tensor: np.ndarray, group_size: int) -> bytes:
     vmin = g.min(axis=1)  # 每组最小值（fp32）
     vmax = g.max(axis=1)  # 每组最大值（fp32）
     same = vmax == vmin   # 退化组标记（全相同元素）
+
+    if symmetric:
+        # 对称量化（llama.cpp Q4_0 同方案）：zero=8，scale = max(|vmin|,|vmax|)/7
+        amax = np.maximum(np.abs(vmin), np.abs(vmax))
+        scale_f32 = np.where(amax == 0.0, np.float32(0.0), amax / np.float32(7.0))
+        scale = scale_f32.astype(np.float16)
+        zero = np.full(scale.shape, np.float16(8.0), dtype=np.float16)
+        s = scale.astype(np.float32)
+        z = np.float32(8.0)
+        valid = s != 0
+        q = np.zeros(g.shape, dtype=np.uint8)
+        q[valid] = np.clip(np.round(g[valid] / s[valid, np.newaxis] + z), 0, 15).astype(np.uint8)
+        return pack_i4_groups(q, scale, zero, out_dim, groups_per_row, group_size)
 
     # scale/zero 的 fp32 中间值（退化组 scale=zero=0，避免除零）
     scale_f32 = np.where(same, np.float32(0.0), (vmax - vmin) / np.float32(15.0))
@@ -317,7 +353,7 @@ def _quantize_tensor_i4_vec(tensor: np.ndarray, group_size: int) -> bytes:
     return pack_i4_groups(q, scale, zero, out_dim, groups_per_row, group_size)
 
 
-def _quantize_tensor_i4_loop(tensor: np.ndarray, group_size: int) -> bytes:
+def _quantize_tensor_i4_loop(tensor: np.ndarray, group_size: int, symmetric: bool = False) -> bytes:
     """RTN 逐组循环版（支持尾部不满组；in_dim % group_size != 0 时用）。
 
     保留原始实现作为边界情况兜底，与向量化快路径结果逐位一致。
@@ -336,7 +372,7 @@ def _quantize_tensor_i4_loop(tensor: np.ndarray, group_size: int) -> bytes:
             end = min(start + group_size, in_dim)
             group_data = tensor[o, start:end].astype(np.float32)
 
-            scale, zero, quantized = quantize_i4_group(group_data)
+            scale, zero, quantized = quantize_i4_group(group_data, symmetric)
 
             group_offset = row_offset + g * group_total
             result[group_offset:group_offset + 2] = scale.tobytes()
@@ -431,11 +467,11 @@ def _worker_init(torch_threads: int, need_torch: bool) -> None:
 
 
 def _quantize_one(payload: tuple) -> bytes:
-    """worker 端量化入口：(fp32_array, group_size, method) -> packed bytes。"""
-    arr, group_size, method = payload
+    """worker 端量化入口：(fp32_array, group_size, method, symmetric) -> packed bytes。"""
+    arr, group_size, method, symmetric = payload
     if method == "hqq":
         return quantize_tensor_i4_hqq(arr, group_size)
-    return quantize_tensor_i4(arr, group_size)
+    return quantize_tensor_i4(arr, group_size, symmetric)
 
 
 def _shard_rows(arr: np.ndarray, shard_target: int) -> list:
@@ -462,7 +498,7 @@ def _shard_rows(arr: np.ndarray, shard_target: int) -> list:
 
 def write_tqwen_i4(out_path: str | Path, cfg: dict, names: list, load,
                    group_size: int, version: int = 2, ext: dict | None = None,
-                   method: str = "hqq", workers: int = 1) -> int:
+                   method: str = "hqq", workers: int = 1, symmetric: bool = False) -> int:
     """写一个 INT4 混合 dtype 的 .tqwen 文件（流式两遍 + 可选并行量化）。
 
     与 f16 版本的 write_tqwen 的主要区别：
@@ -580,7 +616,7 @@ def write_tqwen_i4(out_path: str | Path, cfg: dict, names: list, load,
         out.write(b"\x00" * (data_offset - out.tell()))
 
         # 第二遍：加载 → 量化 → 写盘（并行与否由 workers 决定）
-        _write_data_pass(out, entries, load, group_size, method, workers)
+        _write_data_pass(out, entries, load, group_size, method, workers, symmetric)
         assert out.tell() == total_bytes  # 最终大小校验
 
     # 验证文件大小
@@ -591,7 +627,7 @@ def write_tqwen_i4(out_path: str | Path, cfg: dict, names: list, load,
 
 
 def _write_data_pass(out, entries: list, load, group_size: int,
-                     method: str, workers: int) -> None:
+                     method: str, workers: int, symmetric: bool = False) -> None:
     """第二遍数据写盘：按 entries 顺序写出每个 tensor 的数据。
 
     workers <= 1 时串行（加载 → 量化 → 写，便于调试与逐位对照）；
@@ -621,7 +657,7 @@ def _write_data_pass(out, entries: list, load, group_size: int,
         for name, shape, off, nbytes, dtype_code in entries:
             arr = load(name)  # 按需加载
             if dtype_code == DTYPE_I4:
-                data = _quantize_one((arr, group_size, method))  # 量化
+                data = _quantize_one((arr, group_size, method, symmetric))  # 量化
             else:
                 data = np.ascontiguousarray(arr).tobytes()  # fp32 直接序列化
             assert len(data) == nbytes, f"{name}: size {len(data)} != {nbytes}"
@@ -671,7 +707,7 @@ def _write_data_pass(out, entries: list, load, group_size: int,
                 else:
                     shards = [arr]
                 # submit 时参数即被序列化进队列，主进程可尽快释放原数组
-                pending[idx] = [pool.submit(_quantize_one, (s, group_size, method))
+                pending[idx] = [pool.submit(_quantize_one, (s, group_size, method, symmetric))
                                 for s in shards]
             del arr
             n_inflight += 1
@@ -775,6 +811,9 @@ def main():
                         "注意：并行 worker 的 torch 线程数与串行不同，HQQ 归约"
                         "顺序变化会带来 fp16 ULP 级差异（质量等价，非逐位一致）；"
                         "需要字节级复现既有文件时用 --workers 1")
+    p.add_argument("--symmetric", action="store_true",
+                   help="对称量化：强制 zero=8，消除 per-group 修正项（解码 ~1.5-2× 提速）。"
+                        "仅 --method rtn 有效；scale = max(|vmin|,|vmax|)/7")
     p.add_argument("--no-lm-head-i4", action="store_true",
                    help="tied 模型默认把 lm_head 也量化导出（embed 的独立副本，"
                         "流量 544→~70MB/token）；此开关关闭，退回 fp32 lm_head（A/B 对照用）")
@@ -866,7 +905,7 @@ def main():
     t0 = time.time()
     total = write_tqwen_i4(args.out, tqwen_cfg, names, load, args.group_size,
                            version=FORMAT_VERSION, ext=ext, method=args.method,
-                           workers=workers)
+                           workers=workers, symmetric=args.symmetric)
 
     # 打印结果摘要
     mb = total / (1024 * 1024)  # 转换为 MB

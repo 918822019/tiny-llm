@@ -55,7 +55,8 @@
 | prefill_skip_logits（macOS M4，TTFT 专项） | 7fa8c9a | 36.49（TOPT 不变） | 38.42 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT 1.14×**（33-tok prompt 1320→1158ms） | Qwen3.5 prefill 逐 token 回退中，非末位 token 的 logits 被丢弃却全量计算 lm_head（4B 占单 token 16%）。forward_token 加 need_logits 门控跳过 final_norm+lm_head+argmax。微观证据：同 profile 内跳过位 29.96 vs 末位 35.77（Δ5.81≈lm_head 5.87ms）；0.8B TTFT ~21.4。对齐契约（--verbose 逐位置 dump）不受影响。TOPT 逐位不变 |
 | qwen35_batch_prefill（macOS M4，TTFT 专项） | e25e9ae | 35.72（TOPT 不变） | 37.23 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT：4B-61tok 2072→1206ms（1.72×）、0.8B-33tok 214→156ms（1.38×）** | Qwen3.5 prefill GEMM 路径（`forward_prefill_qwen35_batch`）：权重每层反量化到 fp32 一次 + Accelerate/AMX sgemm，把全部线性投影摊薄到 N 个 token；GDN 递归与因果 attention 保留逐 token 顺序扫描。反量化是固定开销（~0.9s@4B），crossover≈30 token，阈值 32（低于阈值仍走逐 token，canonical 3-tok 不受影响）。⚠️ i4 数值：批量路径激活走 fp32（weight-only int4），decode 逐 token 走 W4A8（int8 激活），二者非逐位一致，临界 argmax 偶发不同（批量更贴近 HF） |
 | dequant_mt（macOS M4，TTFT 专项） | 44d2439 | 35.72（TOPT 不变） | — | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**批量 prefill TTFT 1.08×**（4B-33tok 1116→1037ms，同二进制交替 4 轮中位） | 批量 prefill 的 i4 反量化（每权重矩阵一遍、行独立）从串行改为常驻线程池工作窃取（结构同 RowPool；<262144 元素的小矩阵仍串行）。**关键实测：反量化并非批量路径大头**——串行化它只慢 79ms；真正瓶颈是 sgemm 小 N 的访存（权重反量化写 fp32 + 读 fp32 = 8B/权重）。跨构建 A/B 受热污染只有 1.01-1.04×，同二进制交替（唯一可信判据）才显出 1.08× |
-| fused_i4_batch_mm（macOS M4，**证伪归档**） | 本次 | 35.72（TOPT 不变，默认路径未用它） | — | —（TTFT 专项） | 批量 prefill TTFT **0.70×**（4B-61tok 1174→1675ms，更慢） | 融合 W4A8 批量 matmul（权重 i4 读一遍 + 激活 int8 + SDOT，省 fp32 往返）：数值正确（与 sdot4 逐位一致 + 单测），但**手写 NEON SDOT 干不过 AMX sgemm**——省下的访存填不平算力差距，N 越大越亏（61tok 0.70×、33tok 0.97×、0.8B 0.77×）。默认关闭，`TINYQWEN_FUSED_MM` 可启用对照。教训：AMX 面前别用裸 NEON 拼 GEMM |
+| fused_i4_batch_mm（macOS M4，**证伪归档**） | ccc0457 | 35.72（TOPT 不变，默认路径未用它） | — | —（TTFT 专项） | 批量 prefill TTFT **0.70×**（4B-61tok 1174→1675ms，更慢） | 融合 W4A8 批量 matmul（权重 i4 读一遍 + 激活 int8 + SDOT，省 fp32 往返）：数值正确（与 sdot4 逐位一致 + 单测），但**手写 NEON SDOT 干不过 AMX sgemm**——省下的访存填不平算力差距，N 越大越亏（61tok 0.70×、33tok 0.97×、0.8B 0.77×）。默认关闭，`TINYQWEN_FUSED_MM` 可启用对照。教训：AMX 面前别用裸 NEON 拼 GEMM |
+| sdot5_sym（macOS M4，对称量化） | 本次 | — | — | —（仅 0.8B 验证） | 0.8B decode **1.045×**（8.07→7.72 ms/tok） | sdot5：对称量化（zero=8）+ 无 zero 修正项 + 无前缀和，导出器加 `--symmetric`（--method rtn）。每 64 权重组省 ~7 条标量（zero 读/转/FSUB/C/xqsum×2/修正）。**部分证伪**：0.8B 只提 4.5%，远低于预期 1.5-2×——省下的标量指令大部分被 OoO 隐藏在内存加载延迟后，瓶颈是带宽/加载流水线不是标量。4B 对称导出未做（留作后续）。数值正确（对称单测 + 单测全过） |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
@@ -2011,6 +2012,38 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
     AMX-sgemm（~77%）与单线程 GDN 递归扫描（~20%，跨 token 顺序依赖难并行）。
 - **复现**：`TINYQWEN_FUSED_MM=1 ./build/runtime/tinyqwen ... --profile-out`，
   对照不设该变量，各 3 轮取中位。
+
+---
+
+### sdot5_sym（2026-08-24，macOS M4，对称量化 + 无 zero 修正——部分证伪）
+
+- **优化栈**：0.8B i4（HQQ→RTN 对称重导）+ `matvec_i4_sdot5_mt`。
+- **是什么**：两组改动配套使用：
+  1. **导出器 `--symmetric`**（仅 `--method rtn`）：强制 zero=8，
+     scale = max(|vmin|,|vmax|)/7，与 llama.cpp Q4_0 同方案。
+  2. **kernel sdot5**（`matvec_i4_sdot5.cpp`）：相对 sdot4 删掉
+     zero 点读取 + 修正项（C = A·(zero−8)）+ 激活前缀和填表，
+     每 64 权重组省 ~7 条标量指令，每 token 省一次 O(K) 前缀和。
+- **假设**：per-group 标量开销是解码瓶颈（65.7M 组 × ~7 条 = 量级大），
+  砍掉应能提 1.5-2×。
+- **结果**（0.8B，冷态 2 轮取中位）：
+  - sdot4_mt（非对称 HQQ）8.07 ms/tok → **sdot5_mt（对称）7.72 ms/tok = 1.045×**
+  - 对称模型输出正常（非乱码），但与非对称模型不同（量化方案不同，预期）。
+- **验证**：130 单测全过（新增 `sdot5_matches_sym_naive_g64` /
+  `sdot5_mt_matches_sym_naive`，用 zero=8 的对称打包数据对照朴素参考，
+  max_err < 1e-4）。非对称随机数据下 sdot5 误差大是预期（跳过修正项），
+  已用对称打包测试覆盖。
+- **部分证伪（本条最重要的结论）**：只提 4.5%，远低于预期。省下的标量指令
+  **大部分被 OoO 隐藏在内存加载延迟后面**——kernel 的瓶颈是**带宽/加载流水线**
+  而非标量尾部。这与"64 GB/s 撞不到 114 墙"的根因一致：不是标量太多，
+  是解包+SDOT+加载的流水线没喂满带宽。
+- **对"别人为什么快"的修正认识**：llama.cpp Q4_0 接近墙，不仅因为对称量化，
+  更因为 block_size=32（组更小）+ 极致 SIMD 布局。换对称量化只是其中一小步。
+- **后续**：4B 对称导出未做（~18min），预期收益与 0.8B 相近（~5-10%，
+  同样被 OoO 掩盖）；下一刀方向应转向**提加载效率**（4-row 内循环、
+  block_size=32、prefetch/LDNP 系统调参），而非继续删标量。
+- **复现**：`.venv/bin/python tools/export_qwen_to_tiny_i4.py --model models/Qwen3.5-0.8B --out model_qwen35_i4_sym.tqwen --method rtn --symmetric --workers 1`；
+  `--matvec-impl sdot5_mt` 跑对称模型对照 `sdot4_mt` 非对称模型。
 
 ---
 

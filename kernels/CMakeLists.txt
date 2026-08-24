@@ -68,6 +68,8 @@ add_library(tinyqwen_kernels OBJECT
         # __ARM_FEATURE_FP16（sdot3 守卫失效，热循环静默跑软件转换），
         # 改用 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC + _Float16（2 条指令）。
         matvec/matvec_i4_sdot4.cpp
+        # SDOT v5：对称量化版（zero=8），无 zero 修正项与前缀和，省 per-group 标量。
+        matvec/matvec_i4_sdot5.cpp
         matvec/matmul_ref.cpp
         matvec/matmul_i4_ref.cpp
         # Qwen3.5 Gated DeltaNet（GDN）算子：l2norm / causal conv1d 单步 /
@@ -98,6 +100,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     # sdot4 同开 +fp16（守卫修正为 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC，
     # 这才是 clang 实际定义的宏；见文件头注释的翻车记录）。
     set_source_files_properties(matvec/matvec_i4_sdot4.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16")
+    # sdot5 同开 +dotprod+fp16（对称量化版，与 sdot4 同 SDK 需求）。
+    set_source_files_properties(matvec/matvec_i4_sdot5.cpp PROPERTIES
             COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16")
 endif ()
 
