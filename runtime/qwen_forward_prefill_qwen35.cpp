@@ -643,7 +643,7 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
         for (int c = 0; c < n; ++c) {
             const int tid = token_ids[c];
             float *dst = bp.hid.data() + static_cast<size_t>(c) * hidden;
-            if (dtype_ == Dtype::kF32 || dtype_ == Dtype::kI4) {
+            if (embed_dtype_ == Dtype::kF32) {
                 std::memcpy(dst, static_cast<const float *>(embed_) +
                                          static_cast<size_t>(tid) * hidden,
                             hidden * sizeof(float));
@@ -852,6 +852,9 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
         ScopedTimer t(prof, "lm_head");
         if (lm_head_is_f32_) {
             matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                       logits_.data(), vocab, hidden);
+        } else if (lm_head_is_f16_) {
+            matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                        logits_.data(), vocab, hidden);
         } else {
             mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);

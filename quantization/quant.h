@@ -35,7 +35,8 @@ namespace quantization {
         kF32 = 0,   // FP32：无量化，权重以 float32 存储
         kF16 = 1,   // FP16：半精度浮点，权重以 float16 存储
         kI4 = 2,    // INT4：非对称 uint4 量化，per-group scale(fp16)+zero(fp16)
-        // 未来扩展：kI8, kGPTQ, kAWQ, ...
+        kVQ2 = 3,   // VQ2：2-bit 向量量化，每权重 uint8 码本索引 + per-tensor fp16 码本
+        // 未来扩展：kI8, kGPTQ, AWQ, ...
     };
 
     // =========================================================================

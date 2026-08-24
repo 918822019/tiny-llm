@@ -50,8 +50,19 @@ namespace tinyqwen {
             switch (d) {
                 case Dtype::kF16: return QuantType::kF16;
                 case Dtype::kI4:  return QuantType::kI4;
+                case Dtype::kVQ2: return QuantType::kVQ2;
                 default:          return QuantType::kF32;
             }
+        }
+
+        // find_hadamard_block_size — 与 kronq/hadamard.py 一致的块大小选择：
+        // 取能整除 dim 的最大候选（256/128/64/32，其次 16/8/4/2，兜底 1）。
+        int find_hadamard_block_size(int dim) {
+            const int cand[] = {256, 128, 64, 32, 16, 8, 4, 2};
+            for (int bs : cand) {
+                if (dim % bs == 0) return bs;
+            }
+            return 1;
         }
 
         // =====================================================================
@@ -116,11 +127,15 @@ namespace tinyqwen {
             if (err) *err = "missing tensor: " + name;
             return nullptr;
         }
-        // dtype 校验：I4 文件允许混合 dtype（大矩阵 kI4、小向量 kF32）
-        if (dtype_ == Dtype::kI4) {
-            if (t->dtype != Dtype::kI4 && t->dtype != Dtype::kF32) {
+        // dtype 校验：I4/VQ2 文件允许混合 dtype（大矩阵量化、小向量/embed kF32）
+        if (dtype_ == Dtype::kI4 || dtype_ == Dtype::kVQ2) {
+            const bool ok = (dtype_ == Dtype::kI4)
+                    ? (t->dtype == Dtype::kI4 || t->dtype == Dtype::kF32)
+                    : (t->dtype == Dtype::kVQ2 || t->dtype == Dtype::kF32 ||
+                       t->dtype == Dtype::kF16);
+            if (!ok) {
                 if (err)
-                    *err = "tensor " + name + " dtype mismatch: i4 file allows i4/f32, got " +
+                    *err = "tensor " + name + " dtype mismatch: quant file allows quant/f32, got " +
                            dtype_name(t->dtype);
                 return nullptr;
             }
@@ -191,6 +206,43 @@ namespace tinyqwen {
     void QwenModel::mv(const void *w, const float *x, float *y, int out_dim, int in_dim) const {
         WeightTensor wt{w, quant_type_of(dtype_), out_dim, in_dim, group_size_};
         backend_->matvec(wt, x, y, out_dim, in_dim);
+    }
+
+    // =========================================================================
+    // QwenModel::mv_rot() — 旋转感知 matvec
+    // =========================================================================
+    // 若 rot 有效（sign 非空），先把输入 x 经 BiIP 配对旋转写入 rot_buf_，
+    // 再以旋转后的激活做 matvec；否则直接 mv（非旋转模型无额外开销）。
+    // 自抵消保证：旋转激活 × 旋转量化权重 == 原始激活 × 原始权重。
+    void QwenModel::mv_rot(const void *w, const float *x, float *y, int out_dim, int in_dim,
+                           const RotParams &rot) const {
+        const float *xr = x;
+        if (rot.sign) {
+            biip_rotate_activation(x, rot_buf_.data(), in_dim, rot.scale, rot.sign,
+                                   rot.block_size);
+            xr = rot_buf_.data();
+        }
+        mv(w, xr, y, out_dim, in_dim);
+    }
+
+    // =========================================================================
+    // QwenModel::mm_rot() — 旋转感知 GEMM（prefill）
+    // =========================================================================
+    // X 为列主序 [K, N]（每列一个 token）。若 rot 有效，逐列旋转进 rot_buf_ 再 GEMM。
+    void QwenModel::mm_rot(const void *w, const float *x, float *y, int M, int K, int N,
+                           const RotParams &rot) const {
+        const float *xr = x;
+        if (rot.sign) {
+            const size_t total = static_cast<size_t>(K) * N;
+            if (rot_buf_.size() < total) rot_buf_.resize(total);
+            for (int c = 0; c < N; ++c) {
+                biip_rotate_activation(x + static_cast<size_t>(c) * K,
+                                       rot_buf_.data() + static_cast<size_t>(c) * K,
+                                       K, rot.scale, rot.sign, rot.block_size);
+            }
+            xr = rot_buf_.data();
+        }
+        mm(w, xr, y, M, K, N);
     }
 
     // =========================================================================
@@ -321,8 +373,21 @@ namespace tinyqwen {
             return true;
         };
 
+        // 绑定单个子层的 BiIP 旋转参数（可选）：存在 {prefix}.rot_sign 才视为被旋转。
+        // sign/scale 存 f16，转 fp32 副本；block_size 由 in_f 推导。命中即置 rotated_。
+        const auto bind_rot = [&](const std::string &prefix, int in_f, RotParams *rot) {
+            const TensorView *sign_t = file.get(prefix + ".rot_sign");
+            if (!sign_t) return;                       // 该子层未旋转
+            rot->sign = m->bind_f32_vector(sign_t);
+            const TensorView *scale_t = file.get(prefix + ".rot_scale");
+            rot->scale = scale_t ? m->bind_f32_vector(scale_t) : nullptr;
+            rot->block_size = find_hadamard_block_size(in_f);
+            m->rotated_ = true;
+        };
+
         // 全局权重：词嵌入、最后 norm、lm_head
         if (!bind_mat("model.embed_tokens.weight", {vocab, hidden}, &m->embed_)) return false;
+        m->embed_dtype_ = file.get("model.embed_tokens.weight")->dtype; // embed 真实 dtype
         if (!bind_vec("model.norm.weight", {hidden}, &m->final_norm_)) return false;
         if (cfg.tied_embeddings) {
             // tied：lm_head 与词嵌入同源。默认共享 embed（省内存）；但若文件里
@@ -332,8 +397,9 @@ namespace tinyqwen {
                 // 走 dtype 对应的正常 matvec 路径（i4 文件里即 i4 kernel）
             } else {
                 m->lm_head_ = m->embed_; // 未绑定：直接共享 embed 层
-                // I4 文件中 embed 存为 fp32（lookup table 不量化），lm_head 投影需走 f32 路径
-                if (m->dtype_ == Dtype::kI4) m->lm_head_is_f32_ = true;
+                // lm_head 投影按 embed 的真实 dtype 路由（i4 embed=f32；vq2 embed 可为 f16）
+                if (m->embed_dtype_ == Dtype::kF32) m->lm_head_is_f32_ = true;
+                else if (m->embed_dtype_ == Dtype::kF16) m->lm_head_is_f16_ = true;
             }
         } else {
             // 非 tied embeddings：lm_head 必须独立存在
@@ -419,6 +485,14 @@ namespace tinyqwen {
                     return false;
                 if (!bind_mat((p + "self_attn.o_proj.weight").c_str(), {hidden, qd}, &w.o_proj))
                     return false;
+                // BiIP 旋转参数（旋转量化模型才有；否则全部 no-op）
+                bind_rot(p + "self_attn.q_proj", static_cast<int>(hidden), &w.rot_q);
+                bind_rot(p + "self_attn.k_proj", static_cast<int>(hidden), &w.rot_k);
+                bind_rot(p + "self_attn.v_proj", static_cast<int>(hidden), &w.rot_v);
+                bind_rot(p + "self_attn.o_proj", static_cast<int>(qd), &w.rot_o);
+                bind_rot(p + "mlp.gate_proj", static_cast<int>(hidden), &w.rot_gate);
+                bind_rot(p + "mlp.up_proj", static_cast<int>(hidden), &w.rot_up);
+                bind_rot(p + "mlp.down_proj", static_cast<int>(inter), &w.rot_down);
             }
         }
 
@@ -446,6 +520,8 @@ namespace tinyqwen {
         m->up_.resize(inter);        // FFN up 支路
         m->ffn_.resize(hidden);      // FFN 输出
         m->logits_.resize(vocab);    // 最终 logits
+        // 旋转激活暂存：最大 in_dim（hidden / inter / q_dim 取大）
+        m->rot_buf_.resize(std::max({hidden, inter, qd}));
         // Qwen3.5 额外 workspace
         if (is_qwen35) {
             m->q_full_.resize(2 * static_cast<size_t>(m->q_dim_)); // q_proj 全输出 [q|gate]

@@ -247,6 +247,19 @@ namespace tinyqwen {
         //   - Qwen3.5 full attention 层: 额外使用 q_norm, k_norm
         //   - Qwen3.5 linear attention 层: 使用 gdn_* 系列权重
         // ---------------------------------------------------------------------
+        // ---------------------------------------------------------------------
+        // RotParams: 单个子层的 BiIP 旋转参数（旋转量化模型专用）
+        //   sign  — ±1 符号向量 [in_f]（fp32）；nullptr = 该子层未旋转
+        //   scale — scaleH 向量 [in_f]（fp32）；nullptr = 被中和/无 scaleH
+        //   block_size — Hadamard 分块大小（由 in_f 推导）
+        // 推理时对激活施加配对逆变换：x → blockHadamard((x/scale)⊙sign)
+        // ---------------------------------------------------------------------
+        struct RotParams {
+            const float *sign = nullptr;
+            const float *scale = nullptr;
+            int block_size = 0;
+        };
+
         struct LayerWeights {
             // ---- attention 前的 RMSNorm 权重 ----
             const float *input_ln = nullptr;
@@ -289,6 +302,10 @@ namespace tinyqwen {
             const float *gdn_a_log = nullptr;   // 每个 v head 的 a 对数 [num_v_heads]
             const float *gdn_dt_bias = nullptr; // 每个 v head 的 dt bias [num_v_heads]
             const float *gdn_norm = nullptr;    // GDN 输出门控 RMSNorm 权重 [v_head_dim]
+
+            // ---- BiIP 旋转参数（旋转量化模型；未旋转模型全为 nullptr）----
+            RotParams rot_q, rot_k, rot_v, rot_o;      // attention 四个投影
+            RotParams rot_gate, rot_up, rot_down;      // FFN 三个投影
         };
 
         // ---------------------------------------------------------------------
@@ -343,6 +360,16 @@ namespace tinyqwen {
         // W 是 const void*（可能 f32/f16/i4），按 dtype_ 分派
         void mv(const void *w, const float *x, float *y, int out_dim, int in_dim) const;
 
+        // 旋转感知 matvec: 若 rot 有效，先对 x 施加 BiIP 配对旋转（进 rot_buf_），
+        // 再做 matvec；rot.sign==nullptr 时等价于普通 mv（非旋转模型零开销分支）。
+        void mv_rot(const void *w, const float *x, float *y, int out_dim, int in_dim,
+                    const RotParams &rot) const;
+
+        // 旋转感知 GEMM：若 rot 有效，先把输入批量 X 的每一列(每个 token)做 BiIP
+        // 配对旋转，再做 GEMM；rot.sign==nullptr 时等价普通 mm。
+        void mm_rot(const void *w, const float *x, float *y, int M, int K, int N,
+                    const RotParams &rot) const;
+
         // GEMM: Y[M,N] = W[M,K] @ X[K,N]
         void mm(const void *w, const float *x, float *y, int M, int K, int N) const;
 
@@ -382,7 +409,17 @@ namespace tinyqwen {
 
         Dtype dtype_ = Dtype::kF32;   // 权重 dtype（= 文件 header dtype），全模型统一
         int group_size_ = 0;          // INT4 量化 group size（kI4 时 > 0，否则 0）
-        bool lm_head_is_f32_ = false; // I4 tied 时 lm_head=embed（fp32），需特殊处理
+        bool lm_head_is_f32_ = false; // tied 时 lm_head=embed（fp32），需走 f32 matvec
+        bool lm_head_is_f16_ = false; // tied 时 lm_head=embed（fp16），需走 f16 matvec
+        // embed 张量的真实 dtype（可与文件级 dtype_ 不同，如 vq2 文件里 embed 存 f16）。
+        // embed 查表与 tied-lm_head 投影都按它路由，而不是按文件级 dtype_。
+        Dtype embed_dtype_ = Dtype::kF32;
+
+        // 旋转量化标志：模型权重在旋转空间量化，推理需对激活做 BiIP 配对旋转。
+        // 由是否存在 *.rot_sign 张量决定（见 create）。
+        bool rotated_ = false;
+        // 旋转激活的暂存缓冲（mv_rot 用，大小 = 最大 in_dim）。mutable：const 方法内可写。
+        mutable std::vector<float> rot_buf_;
 
         // ==================== 全局权重 ====================
 

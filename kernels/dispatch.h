@@ -175,6 +175,42 @@ namespace tinyqwen {
                        int q_dim, int kv_dim, int in_dim, int group_size);  // 通用入口
 
     // ================================================================
+    // VQ2（2-bit 向量量化）路径：与 i4 对称的第四套注册表/选择器/入口
+    // ================================================================
+    //
+    // 每个权重张量 = [码本 256×fp16 = 512B][uint8 索引，行主序，每权重 1B]，
+    // 码本 in-band 存在权重数据区头部（与 i4 把 scale/zero 内联进权重同思路）。
+    // 反量化 = 纯查表 codebook[index]，零算术；签名因此不需要 group_size。
+    // 权重指针类型 = const uint8_t*（指向码本起点）。
+
+    // VQ2 matvec 签名（w 指向 [码本][索引]）
+    using MatvecVQ2Fn = void (*)(const uint8_t *w, const float *x, float *y,
+                                 int out_dim, int in_dim);
+
+    void register_matvec_vq2_impl(const char *name, MatvecVQ2Fn fn);  // 注册
+    bool set_matvec_vq2_impl_by_name(const char *name);               // 按名字选择
+    const char *matvec_vq2_impl_name();                                // 当前实现名
+    const char *available_matvec_vq2_impls();                          // 所有已注册名
+    void matvec_vq2(const uint8_t *w, const float *x, float *y,
+                    int out_dim, int in_dim);                          // 通用入口
+
+    // VQ2 pair / qkv / matmul：v1 无融合内核，通用入口直接拆成多次 matvec_vq2。
+    void matvec_pair_vq2(const uint8_t *w1, const uint8_t *w2, const float *x,
+                         float *y1, float *y2, int out_dim, int in_dim);
+    void matvec_qkv_vq2(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
+                        const float *x, float *yq, float *yk, float *yv,
+                        int q_dim, int kv_dim, int in_dim);
+    void matmul_vq2(const uint8_t *w, const float *x, float *y, int M, int K, int N);
+
+    // ================================================================
+    // BiIP 激活旋转：推理时对激活施加旋转的配对逆变换
+    // ================================================================
+    // y = blockHadamard( (x / scale) ⊙ sign )；scale==nullptr 表示被中和(跳过除法)。
+    // 与量化权重旋转自抵消：x_rot @ W_rot^T == x @ W^T。
+    void biip_rotate_activation(const float *x, float *y, int dim,
+                                const float *scale, const float *sign, int block_size);
+
+    // ================================================================
     // Matmul (GEMM) 路径：prefill 批量投影
     // ================================================================
     //
@@ -390,6 +426,11 @@ namespace tinyqwen {
 #define TINYQWEN_MATVEC_QKV_I4_VARIANT(fn, name)                                     \
     [[maybe_unused]] static const bool tqwen_reg_qkv_i4_## fn =                       \
             (tinyqwen::register_matvec_qkv_i4_impl(name, fn), true)
+
+// VQ2 路径的自注册宏（登记进 vq2 注册表）。
+#define TINYQWEN_MATVEC_VQ2_VARIANT(fn, name)                                        \
+    [[maybe_unused]] static const bool tqwen_reg_vq2_## fn =                          \
+            (tinyqwen::register_matvec_vq2_impl(name, fn), true)
 
 // ---- 非 matvec 算子的自注册宏 ----
 // 各登记进对应算子注册表；key 用同一个实现名。

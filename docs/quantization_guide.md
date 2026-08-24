@@ -8,6 +8,33 @@
 | FP16 | `kF16` | 极小 | 2× | `tools/export_qwen_to_tiny.py --dtype f16` |
 | INT4 (RTN) | `kI4` | 中等 | 4× | `tools/export_qwen_to_tiny_i4.py` |
 | INT4 (HQQ) | `kI4` | 较小 | 4× | `tools/export_qwen_to_tiny_i4.py --hqq` |
+| VQ2 朴素 (k-means) | `kVQ2` | **大（无旋转，退化）** | 8×（线性层） | `tools/export_qwen_to_tiny_vq2.py` |
+| VQ2 完整配方 (旋转+TwoPass) | `kVQ2` | 小 | 8×（线性层） | kronq 仓 `scripts/export_tiny_vq2.py`（GPU） |
+
+## VQ2（2-bit 块向量量化）与 BiIP 旋转
+
+**格式**：块大小 d=4、码本 K=256，每 4 个连续权重共用 1 字节索引，码率 2 bit/权重。
+张量布局 = `[码本 [256,4] fp16 = 2048B][索引 uint8]`，详见 `weight_format.md`。
+反量化纯查表、字节对齐、免 bit-pack（2.0bit"部署洁净点"）。
+
+**为什么有两条路径**：2-bit 单码本罩不住非平稳权重分布，必须靠 **BiIP 旋转**
+（消融：无旋转 −46.6% / 有旋转 −9.4%）。旋转在量化前对权重做变换、推理时对激活做
+配对逆变换，自抵消。因此：
+- **朴素导出器**（`tools/export_qwen_to_tiny_vq2.py`）：仅 k-means、无旋转。
+  免校准、快，但 2-bit 精度差（生成退化）。用于链路/格式验证与基线。
+- **完整配方桥接**（kronq 仓 `scripts/export_tiny_vq2.py`，GPU 上跑）：
+  BiIP 旋转 + GPTQ 误差补偿 + TwoPass 码本精化 + K-FAC。产出精度可用的 2-bit，
+  同时把旋转参数（`*.rot_sign`/`*.rot_scale`）一并写进 `.tqwen`。
+
+**运行时**：`QwenModel` 检测 `*.rot_sign` 判定 `rotated_`；`mv_rot`/`mm_rot` 在
+量化 matvec 前对激活施加 `x → blockHadamard((x/scale)⊙sign)`（内核
+`kernels/biip/biip_rotate.cpp`）。旋转使 q/k/v、gate/up 融合失效，旋转模型自动
+去融合逐子层投影；非旋转模型路径不受影响。
+
+**验证手段**（都在 `tools/`）：
+- `add_biip_rotation.py`：给已有模型注入旋转，做**自抵消测试**（旋转前后输出须一致）。
+- `make_rotated_vq2_fake.py`：合成"旋转+VQ2"假模型，端到端验证格式可加载运行。
+- 单元：`tests/test_biip_rotate.cpp`（Hadamard）、`tests/test_matvec_vq2.cpp`（VQ2）。
 
 ## 接入新的量化算法
 

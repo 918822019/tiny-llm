@@ -120,7 +120,7 @@ namespace tinyqwen {
         // embed 布局 [vocab, hidden]，第 token_id 行起点 = embed_ + token_id*hidden。
         {
             ScopedTimer t(prof, "embed");
-            if (dtype_ == Dtype::kF32 || dtype_ == Dtype::kI4) {
+            if (embed_dtype_ == Dtype::kF32) {
                 // f32 文件或 I4 文件（embed 存为 fp32 lookup table）：直接 memcpy
                 std::memcpy(hidden_.data(),
                             static_cast<const float *>(embed_) +
@@ -335,7 +335,17 @@ namespace tinyqwen {
             } else {
                 // ---- Qwen2.x attention 路径（与 v1 完全一致）----
                 // 2b. q/k/v 投影 + bias。Qwen2/2.5 的 q/k/v 有 bias，且必须加在 RoPE 之前
-                if (fuse_qkv_) {
+                if (rotated_) {
+                    // 旋转模型：q/k/v 旋转各不相同，不能融合，逐个旋转+投影
+                    ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
+                    mv_rot(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden, w.rot_q);
+                    mv_rot(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden, w.rot_k);
+                    mv_rot(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden, w.rot_v);
+                    // bias 在输出侧，不受输入旋转影响
+                    for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
+                    for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
+                    for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
+                } else if (fuse_qkv_) {
                     // 融合 QKV 投影：一次计算三个投影
                     ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
                     mv_qkv(w.q_proj, w.k_proj, w.v_proj, normed_.data(),
@@ -385,7 +395,7 @@ namespace tinyqwen {
                 // 2f. 输出投影 o_proj
                 {
                     ScopedTimer t(prof, scope("layer_%d.o_proj", i));
-                    mv(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
+                    mv_rot(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_, w.rot_o);
                 }
 
                 // 2g. 第一次残差连接：x = x + attention(x)。残差让梯度/信息能直通
@@ -405,7 +415,12 @@ namespace tinyqwen {
             }
 
             // 2i. gate 和 up 两个投影（SwiGLU 需要两条支路）
-            if (fuse_gate_up_) {
+            if (rotated_) {
+                // 旋转模型：gate/up 旋转不同，去融合逐个旋转+投影
+                ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
+                mv_rot(w.gate, normed_.data(), gate_.data(), inter, hidden, w.rot_gate);
+                mv_rot(w.up, normed_.data(), up_.data(), inter, hidden, w.rot_up);
+            } else if (fuse_gate_up_) {
                 // 融合版本：gate 和 up 一次投影完成
                 ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
                 mv_pair(w.gate, w.up, normed_.data(), gate_.data(), up_.data(), inter, hidden);
@@ -430,7 +445,7 @@ namespace tinyqwen {
             // 2k. down 投影，把维度从 inter 压回 hidden
             {
                 ScopedTimer t(prof, scope("layer_%d.down_proj", i));
-                mv(w.down, gate_.data(), ffn_.data(), hidden, inter);
+                mv_rot(w.down, gate_.data(), ffn_.data(), hidden, inter, w.rot_down);
             }
 
             // 2l. 第二次残差连接：x = x + ffn(x)
@@ -462,6 +477,10 @@ namespace tinyqwen {
                 if (lm_head_is_f32_) {
                     // I4 tied embeddings：lm_head 走 f32 matvec 路径
                     matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                               logits_.data(), vocab, hidden);
+                } else if (lm_head_is_f16_) {
+                    // VQ2 tied（embed 存 f16）：lm_head 走 f16 matvec
+                    matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                                logits_.data(), vocab, hidden);
                 } else {
                     // 正常路径：通过 backend 的 matvec

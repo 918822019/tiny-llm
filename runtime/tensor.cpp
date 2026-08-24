@@ -36,6 +36,7 @@ namespace tinyqwen {
             case Dtype::kF16: return 2;  // float16: 2 字节
             case Dtype::kI8:  return 1;  // int8:    1 字节
             case Dtype::kI4:  return 0;  // int4:    亚字节，无法简单描述
+            case Dtype::kVQ2: return 0;  // vq2:     每权重 1B 索引 + per-tensor 码本，整体大小见 vq2_tensor_bytes
         }
         return 0; // 未知类型，保守返回 0
     }
@@ -53,6 +54,7 @@ namespace tinyqwen {
             case Dtype::kF16: return "f16";
             case Dtype::kI8:  return "i8";
             case Dtype::kI4:  return "i4";
+            case Dtype::kVQ2: return "vq2";
         }
         return "?"; // 未知类型
     }

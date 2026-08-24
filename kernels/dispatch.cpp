@@ -441,6 +441,97 @@ namespace tinyqwen {
     }
 
     // ====================================================================
+    // VQ2 路径：与 i4 对称的第四套注册表/选择器/入口
+    // ====================================================================
+    // 2-bit 向量量化：权重 = [码本 256×fp16][uint8 索引]。反量化纯查表。
+    // pair/qkv/matmul 无融合内核，通用入口直接拆成多次 matvec_vq2。
+    namespace {
+        // VQ2 matvec 注册表
+        std::unordered_map<std::string, MatvecVQ2Fn> &vq2_registry() {
+            static std::unordered_map<std::string, MatvecVQ2Fn> r;
+            return r;
+        }
+        // VQ2 当前选择
+        MatvecVQ2Fn g_vq2_current = nullptr;     // nullptr = 未显式选择
+        std::string g_vq2_current_name;           // 空 = 未显式选择
+    } // namespace
+
+    // 注册 VQ2 matvec 实现
+    void register_matvec_vq2_impl(const char *name, MatvecVQ2Fn fn) {
+        vq2_registry()[name] = fn;
+    }
+
+    // 按名字选择 VQ2 matvec 实现
+    bool set_matvec_vq2_impl_by_name(const char *name) {
+        const auto &r = vq2_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_vq2_current = it->second;
+        g_vq2_current_name = name;
+        return true;
+    }
+
+    // 获取当前 VQ2 matvec 实现名
+    const char *matvec_vq2_impl_name() {
+        return g_vq2_current_name.empty() ? "ref" : g_vq2_current_name.c_str();
+    }
+
+    // 获取所有已注册的 VQ2 matvec 实现名
+    const char *available_matvec_vq2_impls() {
+        static std::string joined;
+        if (joined.empty()) {
+            std::vector<std::string> names;
+            for (const auto &kv : vq2_registry()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i) joined += ", ";
+                joined += names[i];
+            }
+        }
+        return joined.c_str();
+    }
+
+    // VQ2 matvec 通用入口：未显式选择时兜底到 "ref"
+    void matvec_vq2(const uint8_t *w, const float *x, float *y,
+                    int out_dim, int in_dim) {
+        MatvecVQ2Fn fn = g_vq2_current;
+        if (!fn) {
+            auto it = vq2_registry().find("ref");
+            if (it == vq2_registry().end()) {
+                std::fprintf(stderr,
+                             "tinyqwen: matvec_vq2 'ref' 未注册——检查 kernels 是否被整体链接\n");
+                std::abort();
+            }
+            fn = it->second;
+        }
+        fn(w, x, y, out_dim, in_dim);
+    }
+
+    // VQ2 pair 通用入口：无融合内核，拆成两次 matvec_vq2
+    void matvec_pair_vq2(const uint8_t *w1, const uint8_t *w2, const float *x,
+                         float *y1, float *y2, int out_dim, int in_dim) {
+        matvec_vq2(w1, x, y1, out_dim, in_dim);
+        matvec_vq2(w2, x, y2, out_dim, in_dim);
+    }
+
+    // VQ2 qkv 通用入口：无融合内核，拆成三次 matvec_vq2
+    void matvec_qkv_vq2(const uint8_t *wq, const uint8_t *wk, const uint8_t *wv,
+                        const float *x, float *yq, float *yk, float *yv,
+                        int q_dim, int kv_dim, int in_dim) {
+        matvec_vq2(wq, x, yq, q_dim, in_dim);
+        matvec_vq2(wk, x, yk, kv_dim, in_dim);
+        matvec_vq2(wv, x, yv, kv_dim, in_dim);
+    }
+
+    // VQ2 matmul 通用入口：X/Y 列主序（每列一个 token），逐列调 matvec_vq2
+    void matmul_vq2(const uint8_t *w, const float *x, float *y, int M, int K, int N) {
+        for (int n = 0; n < N; ++n) {
+            matvec_vq2(w, x + static_cast<size_t>(n) * K,
+                       y + static_cast<size_t>(n) * M, M, K);
+        }
+    }
+
+    // ====================================================================
     // Matmul (GEMM) 分发：prefill 批量投影
     // ====================================================================
     // Y[M,N] = W[M,K] × X[K,N]。N=1 时退化为 matvec。

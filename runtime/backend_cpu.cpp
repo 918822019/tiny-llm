@@ -18,7 +18,9 @@ namespace tinyqwen {
     // 矩阵-向量乘法（单输出）：根据权重 dtype 分发到 f32/f16/i4 实现
     void CPUBackend::matvec(const WeightTensor& w, const float* x, float* y,
                            int out_dim, int in_dim) {
-        if (w.quant_type == QuantType::kI4) {
+        if (w.quant_type == QuantType::kVQ2) {
+            matvec_vq2(static_cast<const uint8_t*>(w.data), x, y, out_dim, in_dim);
+        } else if (w.quant_type == QuantType::kI4) {
             matvec_i4(static_cast<const uint8_t*>(w.data), x, y, out_dim, in_dim, w.group_size);
         } else if (w.quant_type == QuantType::kF16) {
             matvec_f16(static_cast<const uint16_t*>(w.data), x, y, out_dim, in_dim);
@@ -31,7 +33,11 @@ namespace tinyqwen {
     void CPUBackend::matvec_pair(const WeightTensor& w1, const WeightTensor& w2,
                                  const float* x, float* y1, float* y2,
                                  int out_dim, int in_dim) {
-        if (w1.quant_type == QuantType::kI4) {
+        if (w1.quant_type == QuantType::kVQ2) {
+            matvec_pair_vq2(static_cast<const uint8_t*>(w1.data),
+                           static_cast<const uint8_t*>(w2.data),
+                           x, y1, y2, out_dim, in_dim);
+        } else if (w1.quant_type == QuantType::kI4) {
             matvec_pair_i4(static_cast<const uint8_t*>(w1.data),
                           static_cast<const uint8_t*>(w2.data),
                           x, y1, y2, out_dim, in_dim, w1.group_size);
@@ -51,7 +57,12 @@ namespace tinyqwen {
                                 const WeightTensor& wv, const float* x,
                                 float* yq, float* yk, float* yv,
                                 int q_dim, int kv_dim, int in_dim) {
-        if (wq.quant_type == QuantType::kI4) {
+        if (wq.quant_type == QuantType::kVQ2) {
+            matvec_qkv_vq2(static_cast<const uint8_t*>(wq.data),
+                          static_cast<const uint8_t*>(wk.data),
+                          static_cast<const uint8_t*>(wv.data),
+                          x, yq, yk, yv, q_dim, kv_dim, in_dim);
+        } else if (wq.quant_type == QuantType::kI4) {
             matvec_qkv_i4(static_cast<const uint8_t*>(wq.data),
                          static_cast<const uint8_t*>(wk.data),
                          static_cast<const uint8_t*>(wv.data),
@@ -72,7 +83,9 @@ namespace tinyqwen {
     // 批量矩阵乘法（GEMM）：用于 prefill 阶段一次性处理多个 token 的线性投影
     void CPUBackend::matmul(const WeightTensor& w, const float* x, float* y,
                            int M, int K, int N) {
-        if (w.quant_type == QuantType::kI4) {
+        if (w.quant_type == QuantType::kVQ2) {
+            matmul_vq2(static_cast<const uint8_t*>(w.data), x, y, M, K, N);
+        } else if (w.quant_type == QuantType::kI4) {
             matmul_i4(static_cast<const uint8_t*>(w.data), x, y, M, K, N, w.group_size);
         } else if (w.quant_type == QuantType::kF16) {
             // f16 matmul 暂未实现，回退到 N 次 matvec（效率较低）

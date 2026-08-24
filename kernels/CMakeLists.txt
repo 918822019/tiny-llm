@@ -55,6 +55,12 @@ add_library(tinyqwen_kernels OBJECT
         matvec/matvec_i4_ref.cpp
         matvec/matvec_i4_neon.cpp
         matvec/matvec_i4_neon_mt.cpp
+        # VQ2（2-bit 向量量化）：每权重 uint8 码本索引 + per-tensor 码本，
+        # 反量化纯查表（2.0bit 部署洁净点）。ref=double 累加锚；neon=fp32+4路ILP。
+        matvec/matvec_vq2_ref.cpp
+        matvec/matvec_vq2_neon.cpp
+        # BiIP 激活旋转（推理时对激活施加旋转配对逆变换，配合旋转量化权重）。
+        biip/biip_rotate.cpp
         # W4A8 SDOT：权重解包 int8 + 激活 int8 对称量化 + SDOT 整数点积（armv8.2
         # dotprod；把 unpack 指令/字节从 ~3.5 打到 ~0.9，目标逼近带宽墙）。
         matvec/matvec_i4_sdot.cpp

@@ -33,6 +33,7 @@ namespace tinyqwen {
         kF32 = 0,   // FP32 权重（32位浮点，无量化）
         kF16 = 1,   // FP16 权重（16位半精度浮点，weight-only）
         kI4 = 2,    // INT4 权重量化（非对称 uint4，per-group scale+zero）
+        kVQ2 = 3,   // 2-bit 向量量化（每权重 uint8 码本索引 + per-tensor fp16 码本）
         // 未来扩展: kI8, kGPTQ, kAWQ, ...
     };
 

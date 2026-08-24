@@ -314,7 +314,25 @@ int main(int argc, char **argv) {
     // ---- 按模型 dtype 选择 matvec 实现（f32/f16/i4 各有独立注册表）----
     const bool is_f16 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kF16);
     const bool is_i4 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kI4);
-    if (is_i4) {
+    const bool is_vq2 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kVQ2);
+    if (is_vq2) {
+        if (!tinyqwen::set_matvec_vq2_impl_by_name(impl_name.c_str())) {
+            std::fprintf(stderr,
+                         "error: unknown vq2 matvec_impl '%s' (available: %s)\n",
+                         impl_name.c_str(), tinyqwen::available_matvec_vq2_impls());
+            return 2;
+        }
+        if (!tinyqwen::set_matvec_impl_by_name(impl_name.c_str())) {
+            tinyqwen::set_matvec_impl_by_name("neon_mt_kv_nt");
+        }
+        // embed/lm_head 存 f16 时，f16 注册表也要选优化内核（否则 lm_head 落 ref）
+        if (!tinyqwen::set_matvec_f16_impl_by_name(impl_name.c_str())) {
+            tinyqwen::set_matvec_f16_impl_by_name("neon_mt_kv_nt");
+        }
+        std::fprintf(stderr, "[init] matvec impl: %s (vq2 weights; lm_head f32: %s / f16: %s)\n",
+                     tinyqwen::matvec_vq2_impl_name(), tinyqwen::matvec_impl_name(),
+                     tinyqwen::matvec_f16_impl_name());
+    } else if (is_i4) {
         if (!tinyqwen::set_matvec_i4_impl_by_name(impl_name.c_str())) {
             std::fprintf(stderr,
                          "error: unknown i4 matvec_impl '%s' (available: %s)\n",

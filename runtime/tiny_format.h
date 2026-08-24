@@ -74,6 +74,32 @@ namespace tinyqwen {
         return static_cast<size_t>(n_groups) * (kI4GroupHeaderBytes + data_bytes);
     }
 
+    // =========================================================================
+    // VQ2（2-bit 向量量化）布局常量
+    //
+    // 每个被量化的权重张量 = 一个 [out_dim, in_dim] 矩阵 + 一份码本。
+    // 码本 in-band 存放在张量数据区最前面（与 i4 把 scale/zero 内联进权重同思路）：
+    //   [ codebook: [K, d] 个 fp16 = kVQ2CodebookBytes 字节 ]
+    //   [ indices:  out_dim × (in_dim/d) 个 uint8，行主序，每 d 个连续权重 1 字节 ]
+    // 块向量量化：每 d(=4) 个连续权重 = 一个 d 维向量，用 1 个索引编码；
+    // 反量化：取 codebook[index] 这个 d 维向量（fp16 → fp32），纯查表、零算术。
+    // 码率 = log2(K)/d = log2(256)/4 = 2 bit/权重。
+    // 2.0bit 的"部署洁净点"：每块恰 1 字节、字节对齐、免 bit-pack。
+    // =========================================================================
+    inline constexpr int kVQ2BlockDim = 4;                 // 块大小 d：每个索引编码 d 个连续权重
+    inline constexpr int kVQ2CodebookEntries = 256;        // 码本条目数 K = 256
+    // 码本 [K, d] fp16 字节数 = 256 * 4 * 2 = 2048B
+    inline constexpr int kVQ2CodebookBytes = kVQ2CodebookEntries * kVQ2BlockDim * 2;
+
+    // 给定形状，计算整个 VQ2 张量的字节数（码本 + 索引）
+    // 块向量量化：每 d(=4) 个连续权重共用 1 个字节索引 → 码率 = log2(K)/d = 2 bit/权重
+    // 索引区 = rows * (cols / d) 字节；要求 cols 能被 d 整除
+    // nbytes = kVQ2CodebookBytes + rows * (cols / kVQ2BlockDim)
+    inline constexpr size_t vq2_tensor_bytes(int rows, int cols) {
+        return kVQ2CodebookBytes +
+               static_cast<size_t>(rows) * (static_cast<size_t>(cols) / kVQ2BlockDim);
+    }
+
     // 模型架构族枚举。决定 forward 走哪条路径、按什么名字绑定权重
     enum class ModelType : uint32_t {
         kQwen2 = 0,  // Qwen2 / Qwen2.5: 所有层同构（full attention + SwiGLU）
@@ -86,6 +112,7 @@ namespace tinyqwen {
         kF16 = 1, // 16 位浮点（IEEE 754 half precision），weight-only 半精度
         kI8 = 2,  // 预留: weight-only INT8 量化
         kI4 = 3,  // 打包 INT4 量化（亚字节，需要专门布局）
+        kVQ2 = 4, // 2-bit 向量量化：每权重 1 字节 uint8 码本索引 + per-tensor 码本
     };
 
     // 返回每种 dtype 每元素占多少字节；未知/亚字节类型返回 0

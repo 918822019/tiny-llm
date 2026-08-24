@@ -45,6 +45,10 @@ namespace quantization {
             *out = Type::kI4;
             return true;
         }
+        if (str == "vq2" || str == "vq" || str == "vec2") {
+            *out = Type::kVQ2;
+            return true;
+        }
         return false;
     }
 
@@ -55,6 +59,7 @@ namespace quantization {
             case Type::kF32: return "f32";
             case Type::kF16: return "f16";
             case Type::kI4:  return "i4";
+            case Type::kVQ2: return "vq2";
             default:         return "unknown";
         }
     }
@@ -66,6 +71,7 @@ namespace quantization {
             case Type::kF32:
             case Type::kF16:
             case Type::kI4:
+            case Type::kVQ2:
                 return true;
             default:
                 return false;
@@ -100,6 +106,10 @@ namespace quantization {
                 const size_t param_bytes = static_cast<size_t>(rows) * num_groups * 2 * 2;  // 量化参数
                 return data_bytes + param_bytes;
             }
+            case Type::kVQ2:
+                // VQ2: 块向量量化（d=4）。码本 [256,4] fp16 = 2048B +
+                // 索引每 4 权重 1 字节 = rows * (cols/4)
+                return 2048 + static_cast<size_t>(rows) * (static_cast<size_t>(cols) / 4);
             default:
                 return 0;
         }

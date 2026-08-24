@@ -99,6 +99,38 @@ matvec reference 直接按行点积。INT4 走专用 packed layout（见下节�
 bias 约定：Qwen2/2.5 的 attention **q/k/v 有 bias**（HF `attention_bias=True`），
 o_proj 与 MLP 无 bias。bias 必须在 RoPE 之前加到 q/k/v 上。
 
+### VQ2 packing（dtype=4，块向量量化）
+
+- **量化算法**：2-bit 块向量量化（块大小 d=4，码本 K=256）。每 d=4 个连续权重
+  共用一个码本索引，码率 = log2(K)/d = 2 bit/权重。两条产出路径：
+  - **朴素导出器** `tools/export_qwen_to_tiny_vq2.py`：per-sublayer 向量 k-means，
+    免校准、免训练，但**无旋转**——2-bit 下重构误差大、生成退化，仅作基线/链路验证。
+  - **完整配方桥接**（kronq 仓 `scripts/export_tiny_vq2.py`，在 GPU 机器上运行）：
+    BiIP 旋转 + GPTQ 误差补偿 + TwoPass 码本精化 + K-FAC，产出精度可用的 2-bit。
+- **每个量化张量内存布局**：
+  `[ 码本 [K=256, d=4] fp16 = 2048 B ][ 索引 [rows, cols/4] uint8，行主序 ]`
+  - 码本 in-band 存张量头部（同 INT4 把 scale/zero 内联的思路）；
+  - 每 d=4 个权重 1 字节索引，字节对齐、免 bit-pack（2.0bit"部署洁净点"）。
+- **反量化**：`w[4b+j] = codebook[index_b][j]`（纯查表，零算术）。
+- **约束**：`cols` 必须被 d=4 整除；`nbytes == 2048 + rows*(cols/4)`。
+- **混合 dtype**：线性层走 VQ2；embed（INT4 量化后以 f16 存）/ norm / bias 保留原精度。
+
+### BiIP 旋转参数（旋转量化模型）
+
+2-bit 必须靠旋转（消融：无旋转 −46.6%、有旋转 −9.4%）。旋转在量化**前**对权重做
+BiIP 变换（kronq `rotation_manager.py`：scaleH 对角缩放 + 分块 Hadamard），
+tiny-llm 推理**时**对激活做配对逆变换，两者自抵消（输出不变）。
+
+- **每个被旋转子层额外两个张量**（存在即视为该子层被旋转）：
+  - `{sublayer}.rot_sign`：`[in_features]` f16，±1 符号向量；
+  - `{sublayer}.rot_scale`：`[in_features]` f16，scaleH；被中和时缺省。
+  `{sublayer}` = 去掉 `.weight` 的权重名，如 `model.layers.0.self_attn.q_proj`。
+- **运行时变换**：量化 matvec 前对激活 `x → blockHadamard((x/scale)⊙sign)`；
+  分块大小由 in_features 推导（`find_hadamard_block_size`：256/128/64/32/… 取能整除的最大者）。
+- **自抵消**：权重与激活施加同一变换，`x_rot @ W_rotᵀ == x @ Wᵀ`。
+- **对融合的影响**：q/k/v、gate/up 的旋转各不相同，旋转模型下**去融合**、逐子层
+  独立旋转+投影（`mv_rot`/`mm_rot`）；非旋转模型保持原融合路径不变。
+
 ## 5. 校验规则（loader 必须 fail fast）
 
 1. 文件 ≥ 192 B，magic/version 匹配；

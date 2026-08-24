@@ -131,7 +131,7 @@ namespace tinyqwen {
                 int tid = token_ids[c]; // 当前 token 的 ID
                 // 目标位置：hid_batch 的第 c 列（偏移 c * hidden）
                 float *dst = hid_batch.data() + static_cast<size_t>(c) * hidden;
-                if (dtype_ == Dtype::kF32 || dtype_ == Dtype::kI4) {
+                if (embed_dtype_ == Dtype::kF32) {
                     // fp32 或 I4 文件（embed 存为 fp32 lookup table）：直接 memcpy
                     std::memcpy(dst, static_cast<const float *>(embed_) +
                                     static_cast<size_t>(tid) * hidden,
@@ -168,9 +168,9 @@ namespace tinyqwen {
                 std::snprintf(name, sizeof(name), "layer_%d.qkv_proj", li);
                 ScopedTimer t(prof, name);
                 // mm() 计算 y = W * x，其中 W 是 [M, K]，x 是 [K, N] 列主序
-                mm(w.q_proj, norm_batch.data(), q_batch.data(), q_dim_, hidden, n);
-                mm(w.k_proj, norm_batch.data(), k_batch.data(), kv_dim_, hidden, n);
-                mm(w.v_proj, norm_batch.data(), v_batch.data(), kv_dim_, hidden, n);
+                mm_rot(w.q_proj, norm_batch.data(), q_batch.data(), q_dim_, hidden, n, w.rot_q);
+                mm_rot(w.k_proj, norm_batch.data(), k_batch.data(), kv_dim_, hidden, n, w.rot_k);
+                mm_rot(w.v_proj, norm_batch.data(), v_batch.data(), kv_dim_, hidden, n, w.rot_v);
             }
 
             // 2c. Per-token 循环：bias + RoPE + KV append + attention
@@ -210,7 +210,7 @@ namespace tinyqwen {
             {
                 std::snprintf(name, sizeof(name), "layer_%d.o_proj", li);
                 ScopedTimer t(prof, name);
-                mm(w.o_proj, attn_batch.data(), o_batch.data(), hidden, q_dim_, n);
+                mm_rot(w.o_proj, attn_batch.data(), o_batch.data(), hidden, q_dim_, n, w.rot_o);
             }
             // 残差连接：x = x + attention(x)
             {
@@ -235,8 +235,8 @@ namespace tinyqwen {
             {
                 std::snprintf(name, sizeof(name), "layer_%d.gate_up_proj", li);
                 ScopedTimer t(prof, name);
-                mm(w.gate, norm_batch.data(), gate_batch.data(), inter, hidden, n);
-                mm(w.up, norm_batch.data(), up_batch.data(), inter, hidden, n);
+                mm_rot(w.gate, norm_batch.data(), gate_batch.data(), inter, hidden, n, w.rot_gate);
+                mm_rot(w.up, norm_batch.data(), up_batch.data(), inter, hidden, n, w.rot_up);
             }
 
             // 2g. SwiGLU 激活：逐 token 计算（gate 就地复用为融合结果）
@@ -253,7 +253,7 @@ namespace tinyqwen {
             {
                 std::snprintf(name, sizeof(name), "layer_%d.down_proj", li);
                 ScopedTimer t(prof, name);
-                mm(w.down, gate_batch.data(), ffn_batch.data(), hidden, inter, n);
+                mm_rot(w.down, gate_batch.data(), ffn_batch.data(), hidden, inter, n, w.rot_down);
             }
             // 残差连接：x = x + ffn(x)
             {
@@ -279,6 +279,10 @@ namespace tinyqwen {
             if (lm_head_is_f32_) {
                 // I4 tied embeddings：embed 是 fp32，lm_head 走 f32 matvec
                 matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                           logits_.data(), vocab, hidden);
+            } else if (lm_head_is_f16_) {
+                // VQ2 tied（embed 存 f16）：lm_head 走 f16 matvec
+                matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                            logits_.data(), vocab, hidden);
             } else {
                 // 正常路径：通过 backend 的 matvec

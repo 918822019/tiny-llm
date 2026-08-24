@@ -154,11 +154,12 @@ namespace tinyqwen {
                       std::to_string(kFormatVersion) + ")");
             return false;
         }
-        // dtype 校验：只支持 f32、f16、i4 三种
+        // dtype 校验：只支持 f32、f16、i4、vq2 四种
         if (header_.dtype != static_cast<uint32_t>(Dtype::kF32) &&
             header_.dtype != static_cast<uint32_t>(Dtype::kF16) &&
-            header_.dtype != static_cast<uint32_t>(Dtype::kI4)) {
-            fail(err, "loader supports dtype f32/f16/i4, got " + std::to_string(header_.dtype));
+            header_.dtype != static_cast<uint32_t>(Dtype::kI4) &&
+            header_.dtype != static_cast<uint32_t>(Dtype::kVQ2)) {
+            fail(err, "loader supports dtype f32/f16/i4/vq2, got " + std::to_string(header_.dtype));
             return false;
         }
         // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了
@@ -229,6 +230,14 @@ namespace tinyqwen {
                               "i4/f32 tensors, got dtype " + std::to_string(e.dtype));
                     return false;
                 }
+            } else if (static_cast<Dtype>(header_.dtype) == Dtype::kVQ2) {
+                if (e.dtype != static_cast<uint32_t>(Dtype::kVQ2) &&
+                    e.dtype != static_cast<uint32_t>(Dtype::kF32) &&
+                    e.dtype != static_cast<uint32_t>(Dtype::kF16)) {
+                    fail(err, "tensor #" + std::to_string(i) + ": vq2 file allows only "
+                              "vq2/f32/f16 tensors, got dtype " + std::to_string(e.dtype));
+                    return false;
+                }
             } else {
                 if (e.dtype != header_.dtype) {
                     fail(err, "tensor #" + std::to_string(i) + ": dtype " +
@@ -253,13 +262,14 @@ namespace tinyqwen {
                     return false;
                 }
             }
-            // 声明的字节数校验：INT4 用 group-based 公式；f32/f16 用元素数 * 元素字节
-            if (static_cast<Dtype>(e.dtype) == Dtype::kI4) {
+            // 声明的字节数校验：INT4/VQ2 用专门公式；f32/f16 用元素数 * 元素字节
+            if (static_cast<Dtype>(e.dtype) == Dtype::kI4 ||
+                static_cast<Dtype>(e.dtype) == Dtype::kVQ2) {
                 if (e.ndim != 2) {
-                    fail(err, "tensor #" + std::to_string(i) + ": i4 tensor must be 2D");
+                    fail(err, "tensor #" + std::to_string(i) + ": i4/vq2 tensor must be 2D");
                     return false;
                 }
-                // nbytes 延迟到阶段 4 解析 quant_group_size 后再验（此处先记录）
+                // nbytes 延迟到阶段 5 用对应公式再验（此处先记录）
             } else {
                 if (e.nbytes != numel * dtype_size(static_cast<Dtype>(e.dtype))) {
                     fail(err, "tensor #" + std::to_string(i) + ": nbytes mismatch");
@@ -402,6 +412,30 @@ namespace tinyqwen {
                     static_cast<int>(t.shape[1]), gs);
                 if (t.nbytes != expected) {
                     fail(err, "tensor '" + kv.first + "': i4 nbytes mismatch, expected " +
+                              std::to_string(expected) + " got " + std::to_string(t.nbytes));
+                    return false;
+                }
+            }
+        }
+
+        // ---- 阶段 5b：VQ2 量化校验（每个 VQ2 tensor 的 nbytes = 码本 + 索引）----
+        if (static_cast<Dtype>(header_.dtype) == Dtype::kVQ2) {
+            for (const auto &kv : tensors_) {
+                const TensorView &t = kv.second;
+                if (t.dtype != Dtype::kVQ2) continue; // 只检查 VQ2 类型的 tensor
+                if (t.ndim != 2) {
+                    fail(err, "tensor '" + kv.first + "': vq2 tensor must be 2D");
+                    return false;
+                }
+                if (t.shape[1] % kVQ2BlockDim != 0) {
+                    fail(err, "tensor '" + kv.first + "': vq2 in_dim must be divisible by " +
+                              std::to_string(kVQ2BlockDim));
+                    return false;
+                }
+                const uint64_t expected = vq2_tensor_bytes(
+                    static_cast<int>(t.shape[0]), static_cast<int>(t.shape[1]));
+                if (t.nbytes != expected) {
+                    fail(err, "tensor '" + kv.first + "': vq2 nbytes mismatch, expected " +
                               std::to_string(expected) + " got " + std::to_string(t.nbytes));
                     return false;
                 }
