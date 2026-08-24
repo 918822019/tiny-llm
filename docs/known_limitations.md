@@ -17,7 +17,10 @@
   GPU engine 路径无批量 prefill 入口（逐 token 喂）；
 - C++ 侧无 tokenizer：token ids 由 Python 工具提供；
 - loader 一次性 fread 整个文件进内存（未用 mmap）；
-- KV cache 一次性分配 fp32，`--max-seq-len` 过大会有内存压力；
+- KV cache 一次性分配，`--max-seq-len` 过大会有内存压力；默认 fp32，
+  `--kv-f16` 可切 fp16（内存减半，长上下文用；解码慢 ~8%，因寄存器内
+  fp16→fp32 转换抵消读带宽减半——是内存特性不是提速，见优化日志
+  `fp16_kv_fused`）；fp16-KV 仅 CPU（CUDA 后端调用即 abort）；
 - 超出 max_seq_len / KV 溢出直接 abort（fail loud）；
 - speculative rollback / KV truncate 未实现。
 

@@ -298,6 +298,17 @@ namespace tinyqwen {
         cudaFree(d_pos);
     }
 
+    // fp16-KV 融合 attention：CUDA 后端暂不支持，调用即 abort。
+    void CUDABackend::attention_decode_f16kv(const float* q, const uint16_t* k_cache,
+                                            const uint16_t* v_cache, int seq_len, int max_seq_len,
+                                            int n_heads, int n_kv_heads, int head_dim,
+                                            float scale, float* out) {
+        (void)q; (void)k_cache; (void)v_cache; (void)seq_len; (void)max_seq_len;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale; (void)out;
+        std::fprintf(stderr, "tinyqwen: CUDABackend::attention_decode_f16kv 未实现（fp16-KV 仅 CPU）\n");
+        std::abort();
+    }
+
     // SwiGLU 激活函数
     void CUDABackend::swiglu(float* gate, const float* up, int n) {
         float* d_gate;

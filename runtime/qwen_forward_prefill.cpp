@@ -195,25 +195,14 @@ namespace tinyqwen {
                     backend_->rope(qc, kc, n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
 
                     // KV append：将当前 token 的 K 和 V 写入 KV cache
-                    // 平面布局：每个 head 的平面是 [max_seq_len, head_dim]
-                    const size_t pos_off = static_cast<size_t>(pos) * head_dim;
-                    const size_t head_plane = static_cast<size_t>(max_seq_len_) * head_dim;
-                    float *k_layer = kv_.k(static_cast<int>(li));
-                    float *v_layer = kv_.v(static_cast<int>(li));
-                    for (int h = 0; h < n_kv_heads; ++h) {
-                        // 写入第 h 个头、第 pos 个位置的 K
-                        std::memcpy(k_layer + h * head_plane + pos_off,
-                                    kc + h * head_dim, head_dim * sizeof(float));
-                        // 写入第 h 个头、第 pos 个位置的 V
-                        std::memcpy(v_layer + h * head_plane + pos_off,
-                                    vc + h * head_dim, head_dim * sizeof(float));
-                    }
+                    // 统一写入入口：内部按存储精度转换（fp32 memcpy / fp16 转换）
+                    kv_.write_token(static_cast<int>(li), pos, kc, vc);
 
                     // Attention：Q 对 KV cache 中 [0..pos] 所有位置加权求和
                     // seq_len = pos + 1（包含当前 token 自身）
-                    backend_->attention_decode(qc, kv_.k(static_cast<int>(li)),
-                                     kv_.v(static_cast<int>(li)), pos + 1, max_seq_len_,
-                                     n_heads, n_kv_heads, head_dim, attn_scale, ac);
+                    // attention_kv 按 KV 精度分发（fp32 / fp16-KV 融合）
+                    attention_kv(qc, static_cast<int>(li), pos + 1, n_heads, n_kv_heads,
+                                 head_dim, attn_scale, ac);
                 }
             }
 

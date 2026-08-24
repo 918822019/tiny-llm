@@ -56,6 +56,10 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
   prompt ≥32 token 时，线性投影反量化到 fp32 走 Accelerate/AMX sgemm
   （权重每层只读一遍），GDN 递归与因果 attention 保留逐 token 顺序扫描。
   4B 61-token TTFT 2072→1206ms（1.72×）。
+- **fp16-KV 融合 attention**：`attention/attention_decode_neon.cpp` 内的
+  `attention_decode_f16kv_neon`——`--kv-f16` 时 KV 存 fp16，attention 读 fp16、
+  寄存器内转 fp32 计算（消灭独立反量化遍）。省一半 KV 内存（长上下文用），
+  解码慢 ~8%（内存特性非提速）。`QwenModel::attention_kv` 按 KV 精度分发。
 - CUDA 两条腿：matvec 单算子变体（`matvec/*.cu`，走 dispatch）+ GPU-resident
   decode engine（`cuda/gpu_engine.cu`，`--engine cuda` 整段 forward，与逐算子
   分发正交）。runtime 侧另有逐算子 CUDABackend（`--backend cuda`，A/B 用）。

@@ -96,6 +96,12 @@ namespace tinyqwen {
                              int n_heads, int n_kv_heads, int head_dim,
                              float scale, float* out) override;
 
+        // fp16-KV 融合 attention：直接调 kernels 的 attention_decode_f16kv_neon。
+        void attention_decode_f16kv(const float* q, const uint16_t* k_cache,
+                                   const uint16_t* v_cache, int seq_len, int max_seq_len,
+                                   int n_heads, int n_kv_heads, int head_dim,
+                                   float scale, float* out) override;
+
         // SwiGLU 激活: gate[i] = silu(gate[i]) * up[i]（就地）
         // 转发到 dispatch::swiglu
         void swiglu(float* gate, const float* up, int n) override;

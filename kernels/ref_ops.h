@@ -136,4 +136,13 @@ namespace tinyqwen {
     void attention_decode_ref(const float *q, const float *k_cache, const float *v_cache,
                               int seq_len, int max_seq_len, int n_heads, int n_kv_heads,
                               int head_dim, float scale, float *out);
+
+    // fp16-KV 融合 attention：k_cache/v_cache 为 fp16（uint16_t*），
+    // 在寄存器内转 fp32 后按与 attention_decode_ref 完全相同的 online softmax
+    // 计算。消灭"独立反量化遍历"，是 fp16 KV 的正确加速方式。
+    // 仅 aarch64 提供 NEON 实现；其余平台无实现（调用方需保证不走到）。
+    void attention_decode_f16kv_neon(const float *q, const uint16_t *k_cache,
+                                     const uint16_t *v_cache, int seq_len, int max_seq_len,
+                                     int n_heads, int n_kv_heads, int head_dim, float scale,
+                                     float *out);
 } // namespace tinyqwen

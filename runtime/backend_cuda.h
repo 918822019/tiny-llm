@@ -103,6 +103,12 @@ namespace tinyqwen {
                              int n_heads, int n_kv_heads, int head_dim,
                              float scale, float* out) override;
 
+        // fp16-KV 融合 attention：CUDA 后端暂不支持 fp16-KV，调用即 abort。
+        void attention_decode_f16kv(const float* q, const uint16_t* k_cache,
+                                   const uint16_t* v_cache, int seq_len, int max_seq_len,
+                                   int n_heads, int n_kv_heads, int head_dim,
+                                   float scale, float* out) override;
+
         // SwiGLU 激活: 使用 CUDA element-wise kernel
         void swiglu(float* gate, const float* up, int n) override;
 

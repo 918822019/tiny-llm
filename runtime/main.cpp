@@ -64,6 +64,7 @@ namespace {
         bool no_fuse_gate_up = false;   // 禁用 gate/up 投影融合
         bool no_fuse_qkv = false;       // 禁用 Q/K/V 投影融合
         bool no_batch_prefill = false;  // 禁用 Qwen3.5 批量 prefill（A/B 对照用）
+        bool kv_fp16 = false;           // KV cache 用 fp16 存储（内存/带宽减半，opt-in）
         std::string config;             // 配置文件路径（可选）
         std::string matvec_impl;        // matvec 实现选择；空 = 未指定
         std::string ops_impl;           // 非 matvec 算子实现；空 = 未指定
@@ -94,6 +95,8 @@ namespace {
                      "  --matvec-impl NAME      matvec kernel: ref (default; neon later)\n"
                      "  --ops-impl NAME         non-matvec ops (rmsnorm/rope/attention/swiglu/\n"
                      "                          argmax): ref (default) / neon\n"
+                     "  --kv-f16                store KV cache in fp16 (halves KV memory + attn\n"
+                     "                          read bandwidth; store fp16, compute fp32)\n"
                      "  --engine NAME           decode engine: '' = CPU forward (default) / cuda\n"
                      "                          (GPU-resident whole-forward; requires CUDA build)\n"
                      "  --backend NAME          compute backend: '' = CPU (default) / cuda\n"
@@ -135,6 +138,7 @@ namespace {
             else if (a == "--no-fuse-gate-up") out->no_fuse_gate_up = true;
             else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
             else if (a == "--no-batch-prefill") out->no_batch_prefill = true;
+            else if (a == "--kv-f16") out->kv_fp16 = true;
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
                 usage(argv[0]);
@@ -378,7 +382,8 @@ int main(int argc, char **argv) {
 
     // ---- 建模：校验权重、分配 KV cache 和 workspace ----
     std::unique_ptr<tinyqwen::QwenModel> model;
-    if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model, std::move(backend))) {
+    if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model,
+                                     std::move(backend), args.kv_fp16)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }

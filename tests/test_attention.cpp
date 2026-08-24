@@ -181,3 +181,46 @@ TEST (attention_matches_softmax_kernel) {
         }
     }
 }
+// ===========================================================================
+// fp16-KV 融合 attention 测试（仅 aarch64）
+// ===========================================================================
+// 验证 attention_decode_f16kv_neon（读 fp16 K/V、寄存器内转 fp32）与
+// "先把 fp16 反量化成 fp32 再走 attention_decode_ref"数值一致。
+// 两者用同一份 fp16 K/V，唯一差异是 NEON float 累加 vs ref double 累加，
+// 故按 1e-4 容差对齐。这证明融合 kernel 计算正确（fp16 压缩损失是共享的）。
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(attention_f16kv_fused_matches_dequant_ref) {
+    const int seq_len = 5, max_seq = 8, n_heads = 2, n_kv = 1, head_dim = 16;
+    // 构造 fp32 的 q / k / v
+    std::vector<float> q(n_heads * head_dim);
+    std::vector<float> k(static_cast<size_t>(n_kv) * max_seq * head_dim);
+    std::vector<float> v(static_cast<size_t>(n_kv) * max_seq * head_dim);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = 0.1f * ((i * 7) % 13) - 0.5f;
+    for (size_t i = 0; i < k.size(); ++i) k[i] = 0.1f * ((i * 5) % 11) - 0.4f;
+    for (size_t i = 0; i < v.size(); ++i) v[i] = 0.1f * ((i * 3) % 9) - 0.3f;
+    // 把 k/v 转成 fp16（模拟 fp16 KV cache），再反量化回 fp32 作为参考输入
+    std::vector<uint16_t> k_f16(k.size()), v_f16(v.size());
+    std::vector<float> k_deq(k.size()), v_deq(v.size());
+    for (size_t i = 0; i < k.size(); ++i) {
+        k_f16[i] = tinyqwen::float_to_half(k[i]);
+        k_deq[i] = tinyqwen::half_to_float(k_f16[i]);
+    }
+    for (size_t i = 0; i < v.size(); ++i) {
+        v_f16[i] = tinyqwen::float_to_half(v[i]);
+        v_deq[i] = tinyqwen::half_to_float(v_f16[i]);
+    }
+    const float scale = 0.25f;
+    // 融合 kernel：直接读 fp16
+    std::vector<float> out_fused(n_heads * head_dim);
+    tinyqwen::attention_decode_f16kv_neon(q.data(), k_f16.data(), v_f16.data(), seq_len,
+                                          max_seq, n_heads, n_kv, head_dim, scale,
+                                          out_fused.data());
+    // 参考：反量化成 fp32 后走 ref
+    std::vector<float> out_ref(n_heads * head_dim);
+    tinyqwen::attention_decode_ref(q.data(), k_deq.data(), v_deq.data(), seq_len, max_seq,
+                                   n_heads, n_kv, head_dim, scale, out_ref.data());
+    for (int i = 0; i < n_heads * head_dim; ++i) {
+        EXPECT_NEAR(out_fused[i], out_ref[i], 1e-4);
+    }
+}
+#endif

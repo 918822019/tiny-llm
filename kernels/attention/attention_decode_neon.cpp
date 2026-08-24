@@ -176,6 +176,101 @@ namespace tinyqwen {
     }
   } // namespace
 
+  // =========================================================================
+  // dot_f16_neon — query(fp32) 与 key(fp16) 的点积，寄存器内转 fp32
+  // =========================================================================
+  // 功能：sum_i(q[i] * k[i])，其中 q 是 fp32，k 是 fp16（uint16_t*）。
+  // 关键：k 从内存按 fp16 加载（vld1_f16，4 个/次），用 vcvt_f32_f16 在寄存器
+  // 内转 fp32，再做 FMA。没有独立的反量化遍历。
+  inline float dot_f16_neon(const float *q, const uint16_t *k, int n) {
+    float32x4_t a0 = vdupq_n_f32(0.0f);
+    float32x4_t a1 = vdupq_n_f32(0.0f);
+    float32x4_t a2 = vdupq_n_f32(0.0f);
+    float32x4_t a3 = vdupq_n_f32(0.0f);
+    int i = 0;
+    // 主循环：每轮 16 元素（4 组 × 4 lane）
+    for (; i + 16 <= n; i += 16) {
+      a0 = vfmaq_f32(a0, vld1q_f32(q + i),
+                     vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t *>(k + i))));
+      a1 = vfmaq_f32(a1, vld1q_f32(q + i + 4),
+                     vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t *>(k + i + 4))));
+      a2 = vfmaq_f32(a2, vld1q_f32(q + i + 8),
+                     vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t *>(k + i + 8))));
+      a3 = vfmaq_f32(a3, vld1q_f32(q + i + 12),
+                     vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t *>(k + i + 12))));
+    }
+    for (; i + 4 <= n; i += 4) {
+      a0 = vfmaq_f32(a0, vld1q_f32(q + i),
+                     vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t *>(k + i))));
+    }
+    float dot = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < n; ++i) {
+      dot += q[i] * half_to_float(k[i]);
+    }
+    return dot;
+  }
+
+  // =========================================================================
+  // attention_decode_f16kv_neon — fp16-KV 融合 attention（GQA，online softmax）
+  // =========================================================================
+  // 与 attention_decode_neon 完全相同的数学，仅 K/V 从 fp16 加载、寄存器内转
+  // fp32。消灭独立反量化遍历。
+  void attention_decode_f16kv_neon(const float *q, const uint16_t *k_cache,
+                                   const uint16_t *v_cache, int seq_len, int max_seq_len,
+                                   int n_heads, int n_kv_heads, int head_dim, float scale,
+                                   float *out) {
+    const int heads_per_kv = n_heads / n_kv_heads;
+    const size_t kv_layer_stride = static_cast<size_t>(max_seq_len) * head_dim;
+
+    for (int h = 0; h < n_heads; ++h) {
+      const int kv = h / heads_per_kv;
+      const float *qh = q + static_cast<size_t>(h) * head_dim;
+      const uint16_t *kh = k_cache + static_cast<size_t>(kv) * kv_layer_stride;
+      const uint16_t *vh = v_cache + static_cast<size_t>(kv) * kv_layer_stride;
+      float *oh = out + static_cast<size_t>(h) * head_dim;
+
+      float m = -std::numeric_limits<float>::infinity();
+      float l = 0.0f;
+      for (int i = 0; i < head_dim; ++i) oh[i] = 0.0f;
+
+      for (int t = 0; t < seq_len; ++t) {
+        const uint16_t *kt = kh + static_cast<size_t>(t) * head_dim;
+        const uint16_t *vt = vh + static_cast<size_t>(t) * head_dim;
+
+        const float s = dot_f16_neon(qh, kt, head_dim) * scale;
+        const float m_new = s > m ? s : m;
+        const float rescale = std::exp(m - m_new);
+        const float p = std::exp(s - m_new);
+
+        const float32x4_t vr = vdupq_n_f32(rescale);
+        const float32x4_t vp = vdupq_n_f32(p);
+        int i = 0;
+        for (; i + 4 <= head_dim; i += 4) {
+          float32x4_t o = vld1q_f32(oh + i);
+          o = vmulq_f32(o, vr);
+          // v 从 fp16 加载、寄存器内转 fp32，再累加
+          float32x4_t vv = vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t *>(vt + i)));
+          o = vfmaq_f32(o, vp, vv);
+          vst1q_f32(oh + i, o);
+        }
+        for (; i < head_dim; ++i) {
+          oh[i] = oh[i] * rescale + p * half_to_float(vt[i]);
+        }
+
+        l = l * rescale + p;
+        m = m_new;
+      }
+
+      const float inv_l = 1.0f / l;
+      const float32x4_t vi = vdupq_n_f32(inv_l);
+      int i = 0;
+      for (; i + 4 <= head_dim; i += 4) {
+        vst1q_f32(oh + i, vmulq_f32(vld1q_f32(oh + i), vi));
+      }
+      for (; i < head_dim; ++i) oh[i] *= inv_l;
+    }
+  }
+
   // 自注册进 attention 注册表，名称为 "neon"。仅在 aarch64 构建中存在。
   // TINYQWEN_ATTENTION_DECODE_VARIANT 宏会在 dispatch 表中注册此函数指针，
   // 运行时可通过 backend 选择机制自动选用。

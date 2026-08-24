@@ -113,6 +113,23 @@ namespace tinyqwen {
                                     n_heads, n_kv_heads, head_dim, scale, out);
     }
 
+    // fp16-KV 融合 attention：直接调 kernels 的 attention_decode_f16kv_neon
+    // （读 fp16、寄存器内转 fp32）。仅 aarch64 有实现。
+    void CPUBackend::attention_decode_f16kv(const float* q, const uint16_t* k_cache,
+                                           const uint16_t* v_cache, int seq_len, int max_seq_len,
+                                           int n_heads, int n_kv_heads, int head_dim,
+                                           float scale, float* out) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        ::tinyqwen::attention_decode_f16kv_neon(q, k_cache, v_cache, seq_len, max_seq_len,
+                                               n_heads, n_kv_heads, head_dim, scale, out);
+#else
+        (void)q; (void)k_cache; (void)v_cache; (void)seq_len; (void)max_seq_len;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale; (void)out;
+        std::fprintf(stderr, "tinyqwen: attention_decode_f16kv 仅 aarch64 支持\n");
+        std::abort();
+#endif
+    }
+
     // SwiGLU 激活：gate[i] = gate[i] * sigmoid(gate[i]) * up[i]，gate 就地复用
     void CPUBackend::swiglu(float* gate, const float* up, int n) {
         ::tinyqwen::swiglu(gate, up, n);

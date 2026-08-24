@@ -56,6 +56,7 @@
 | qwen35_batch_prefill（macOS M4，TTFT 专项） | e25e9ae | 35.72（TOPT 不变） | 37.23 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT：4B-61tok 2072→1206ms（1.72×）、0.8B-33tok 214→156ms（1.38×）** | Qwen3.5 prefill GEMM 路径（`forward_prefill_qwen35_batch`）：权重每层反量化到 fp32 一次 + Accelerate/AMX sgemm，把全部线性投影摊薄到 N 个 token；GDN 递归与因果 attention 保留逐 token 顺序扫描。反量化是固定开销（~0.9s@4B），crossover≈30 token，阈值 32（低于阈值仍走逐 token，canonical 3-tok 不受影响）。⚠️ i4 数值：批量路径激活走 fp32（weight-only int4），decode 逐 token 走 W4A8（int8 激活），二者非逐位一致，临界 argmax 偶发不同（批量更贴近 HF） |
 | dequant_mt（macOS M4，TTFT 专项） | 44d2439 | 35.72（TOPT 不变） | — | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**批量 prefill TTFT 1.08×**（4B-33tok 1116→1037ms，同二进制交替 4 轮中位） | 批量 prefill 的 i4 反量化（每权重矩阵一遍、行独立）从串行改为常驻线程池工作窃取（结构同 RowPool；<262144 元素的小矩阵仍串行）。**关键实测：反量化并非批量路径大头**——串行化它只慢 79ms；真正瓶颈是 sgemm 小 N 的访存（权重反量化写 fp32 + 读 fp32 = 8B/权重）。跨构建 A/B 受热污染只有 1.01-1.04×，同二进制交替（唯一可信判据）才显出 1.08× |
 | fused_i4_batch_mm（macOS M4，**证伪归档**） | ccc0457 | 35.72（TOPT 不变，默认路径未用它） | — | —（TTFT 专项） | 批量 prefill TTFT **0.70×**（4B-61tok 1174→1675ms，更慢） | 融合 W4A8 批量 matmul（权重 i4 读一遍 + 激活 int8 + SDOT，省 fp32 往返）：数值正确（与 sdot4 逐位一致 + 单测），但**手写 NEON SDOT 干不过 AMX sgemm**——省下的访存填不平算力差距，N 越大越亏（61tok 0.70×、33tok 0.97×、0.8B 0.77×）。默认关闭，`TINYQWEN_FUSED_MM` 可启用对照。教训：AMX 面前别用裸 NEON 拼 GEMM |
+| fp16_kv_fused（macOS M4，opt-in 长上下文） | 本次 | 52.23（4B-1360tok，vs fp32 48.56） | — | —（长上下文专项） | 融合 attention 把独立反量化开销消掉：4B-1360tok decode 75.1→52.2ms（1.44×）、TTFT 37.1→16.4s（2.26×） | `--kv-f16` opt-in：KV cache 存 fp16（内存减半 96→48MB），新增融合 attention `attention_decode_f16kv_neon`（读 fp16、寄存器内转 fp32、就地算），消灭"逐调用整段反量化"。**定位修正**：独立反量化版慢 1.56×（每调用反量化整段 [0,seq]）；融合后收窄到慢 1.08×。**本质是内存特性不是提速**——省一半 KV 内存、能塞 2× 长序列，但解码比 fp32 慢 ~8%（寄存器内 fp16→fp32 转换抵消了读带宽减半）。短上下文用 fp32，长上下文内存不够才用 `--kv-f16` |
 | sdot5_sym（macOS M4，对称量化） | 本次 | — | — | —（仅 0.8B 验证） | 0.8B decode **1.045×**（8.07→7.72 ms/tok） | sdot5：对称量化（zero=8）+ 无 zero 修正项 + 无前缀和，导出器加 `--symmetric`（--method rtn）。每 64 权重组省 ~7 条标量（zero 读/转/FSUB/C/xqsum×2/修正）。**部分证伪**：0.8B 只提 4.5%，远低于预期 1.5-2×——省下的标量指令大部分被 OoO 隐藏在内存加载延迟后，瓶颈是带宽/加载流水线不是标量。4B 对称导出未做（留作后续）。数值正确（对称单测 + 单测全过） |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
@@ -2044,6 +2045,36 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
   block_size=32、prefetch/LDNP 系统调参），而非继续删标量。
 - **复现**：`.venv/bin/python tools/export_qwen_to_tiny_i4.py --model models/Qwen3.5-0.8B --out model_qwen35_i4_sym.tqwen --method rtn --symmetric --workers 1`；
   `--matvec-impl sdot5_mt` 跑对称模型对照 `sdot4_mt` 非对称模型。
+
+---
+
+### fp16_kv_fused（2026-08-24，macOS M4，opt-in 长上下文——融合 fp16-KV attention）
+
+- **优化栈**：`--kv-f16`（KV cache 存 fp16）+ 融合 attention
+  `attention_decode_f16kv_neon`。
+- **背景**：先做了"独立反量化"版 fp16 KV（读出整段 [0,seq] fp16→fp32 到
+  workspace 再走 fp32 attention），实测长上下文**慢 1.56×**（4B-1360tok decode
+  48.6→75.1ms、TTFT 15.4→37.1s）——每次 attention 调用都反量化整段，序列越长
+  越亏。根因：反量化走了独立遍历。
+- **是什么**：业界标准做法——把反量化**融进 attention kernel**。
+  `attention_decode_f16kv_neon` 直接读 fp16 K/V，用 `vcvt_f32_f16` 在寄存器内
+  转 fp32，dot/加权求和仍在 fp32 算（online softmax 结构与 ref 一致）。
+  没有独立反量化遍历。`KvCache` 去掉 dequant-to-workspace，直接暴露
+  `k_f16()/v_f16()`；forward 经新增的 `QwenModel::attention_kv` 按 KV 精度
+  分发（4 处 attention 调用统一走它）。
+- **结果**（4B-1360tok，M4）：
+  - decode：75.1（独立反量化）→ **52.2 ms/tok（1.44×）**；vs fp32 48.6 仍慢 ~8%。
+  - TTFT：37.1 → **16.4 s（2.26×）**；vs fp32 15.4 仍慢 ~7%。
+  - KV 内存：96 → 48 MB（减半）。
+- **关键认识（本质是内存特性，不是提速）**：融合后 fp16 KV 仍比 fp32 略慢，
+  因为"寄存器内 fp16→fp32 转换"的计算抵消了"读带宽减半"。所以 `--kv-f16`
+  的价值是**省一半 KV 内存、塞 2× 长序列**，不是提速。短上下文用 fp32，
+  长上下文内存不够才开 `--kv-f16`。
+- **验证**：131 单测全过（新增 `attention_f16kv_fused_matches_dequant_ref`，
+  融合 kernel vs 反量化-fp32 参考 < 1e-4）；4B 真模型融合 fp16 vs fp32 logits
+  差 ~1.5（= fp16 压缩正常损失，贪心仅临界 token 翻转，非 bug）。
+- **复现**：`--kv-f16` 开，`--matvec-impl sdot4_mt --ops-impl neon`；
+  对照不加 `--kv-f16`。
 
 ---
 

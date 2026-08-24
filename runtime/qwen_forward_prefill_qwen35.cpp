@@ -765,9 +765,6 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
             // 顺序扫描：解交错 + QK-norm + partial RoPE + KV 追加 + attention + 门
             {
                 ScopedTimer t(prof, scope("layer_%d.bp_attn_scan", i));
-                const size_t head_plane = static_cast<size_t>(max_seq_len_) * head_dim;
-                float *k_layer = kv_.k(ci);
-                float *v_layer = kv_.v(ci);
                 for (int c = 0; c < n; ++c) {
                     const int pos = base_pos + c;
                     const float *qf = bp.q_full.data() + static_cast<size_t>(c) * 2 * q_dim_;
@@ -795,19 +792,13 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
                     backend_->partial_rope(q_.data(), k_.data(), n_heads, n_kv_heads,
                                            head_dim, rotary_dim_, pos, cfg_.rope_theta);
 
-                    // KV 追加到 pos
-                    const size_t pos_off = static_cast<size_t>(pos) * head_dim;
-                    for (int h = 0; h < n_kv_heads; ++h) {
-                        std::memcpy(k_layer + h * head_plane + pos_off,
-                                    k_.data() + h * head_dim, head_dim * sizeof(float));
-                        std::memcpy(v_layer + h * head_plane + pos_off,
-                                    vc + h * head_dim, head_dim * sizeof(float));
-                    }
+                    // KV 追加到 pos（统一写入入口，内部按精度转换）
+                    kv_.write_token(ci, pos, k_.data(), vc);
 
                     // attention（因果：看到 [0, pos]）+ sigmoid 输出门
-                    backend_->attention_decode(q_.data(), k_layer, v_layer, pos + 1,
-                                               max_seq_len_, n_heads, n_kv_heads, head_dim,
-                                               attn_scale, attn_.data());
+                    //   attention_kv 按 KV 精度分发（fp32 / fp16-KV 融合）
+                    attention_kv(q_.data(), ci, pos + 1, n_heads, n_kv_heads, head_dim,
+                                 attn_scale, attn_.data());
                     float *atc = bp.attn.data() + static_cast<size_t>(c) * q_dim_;
                     for (int j = 0; j < q_dim_; ++j)
                         atc[j] = attn_[j] * sigmoidf32(q_gate_[j]);

@@ -235,6 +235,17 @@ namespace tinyqwen {
                                      float scale, float* out) = 0;
 
         // ---------------------------------------------------------------------
+        // attention_decode_f16kv: fp16-KV 融合 attention
+        //
+        // 与 attention_decode 相同的数学，但 k_cache/v_cache 为 fp16（uint16_t*），
+        // 在寄存器内转 fp32 计算。消灭独立反量化遍历。仅 fp16-KV cache 时调用。
+        // ---------------------------------------------------------------------
+        virtual void attention_decode_f16kv(const float* q, const uint16_t* k_cache,
+                                           const uint16_t* v_cache, int seq_len, int max_seq_len,
+                                           int n_heads, int n_kv_heads, int head_dim,
+                                           float scale, float* out) = 0;
+
+        // ---------------------------------------------------------------------
         // swiglu: SwiGLU 激活函数
         //
         // 计算: gate[i] = silu(gate[i]) * up[i]（就地修改 gate）

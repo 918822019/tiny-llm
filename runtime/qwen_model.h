@@ -114,7 +114,8 @@ namespace tinyqwen {
         // ---------------------------------------------------------------------
         static bool create(const ModelFile &file, int max_seq_len, Profiler &profiler,
                            std::string *err, std::unique_ptr<QwenModel> *out,
-                           std::unique_ptr<IBackend> backend = nullptr);
+                           std::unique_ptr<IBackend> backend = nullptr,
+                           bool kv_fp16 = false);
 
         // ---------------------------------------------------------------------
         // forward_token: 在当前位置上前向一个 token（decode 模式）
@@ -352,6 +353,11 @@ namespace tinyqwen {
         // QKV 三路融合: yq = Wq @ x, yk = Wk @ x, yv = Wv @ x
         void mv_qkv(const void *wq, const void *wk, const void *wv, const float *x,
                     float *yq, float *yk, float *yv, int q_dim, int kv_dim, int in_dim) const;
+
+        // attention 统一分发：按 KV cache 精度选 fp32 / fp16-KV 融合 attention。
+        // layer 为 KV cache 紧凑下标（full attention 层），seq 为有效位置数。
+        void attention_kv(const float *q, int layer, int seq, int n_heads, int n_kv_heads,
+                          int head_dim, float scale, float *out) const;
 
         // ==================== 模型配置和状态 ====================
 

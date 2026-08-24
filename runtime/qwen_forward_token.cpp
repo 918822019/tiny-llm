@@ -306,25 +306,18 @@ namespace tinyqwen {
                 }
 
                 // 2e. k/v 追加进 cache（紧凑下标 ci：只存 full 层）
+                //     统一写入入口：内部按存储精度转换（fp32 memcpy / fp16 转换）
                 {
                     ScopedTimer t(prof, scope("layer_%d.kv_append", i));
-                    const size_t pos_off = static_cast<size_t>(pos) * head_dim;
-                    const size_t head_plane = static_cast<size_t>(max_seq_len_) * head_dim;
-                    float *k_layer = kv_.k(ci);
-                    float *v_layer = kv_.v(ci);
-                    for (int h = 0; h < n_kv_heads; ++h) {
-                        std::memcpy(k_layer + h * head_plane + pos_off,
-                                    k_.data() + h * head_dim, head_dim * sizeof(float));
-                        std::memcpy(v_layer + h * head_plane + pos_off,
-                                    v_.data() + h * head_dim, head_dim * sizeof(float));
-                    }
+                    kv_.write_token(ci, pos, k_.data(), v_.data());
                 }
 
                 // 2f. attention（GQA）+ sigmoid 输出门
                 {
                     ScopedTimer t(prof, scope("layer_%d.attention", i));
-                    backend_->attention_decode(q_.data(), kv_.k(ci), kv_.v(ci), pos + 1, max_seq_len_,
-                                     n_heads, n_kv_heads, head_dim, attn_scale, attn_.data());
+                    // attention 统一分发（按 KV 精度）+ sigmoid 输出门
+                    attention_kv(q_.data(), ci, pos + 1, n_heads, n_kv_heads, head_dim,
+                                 attn_scale, attn_.data());
                     // 应用 sigmoid 输出门：attn[i] *= sigmoid(gate[i])
                     for (int j = 0; j < q_dim_; ++j) attn_[j] *= sigmoidf32(q_gate_[j]);
                 }
@@ -376,26 +369,17 @@ namespace tinyqwen {
 
                 // 2d. 把当前 token 的 k/v 追加进 cache。注意必须先 append 再 attend：
                 //     当前 token 要能"看到"自己，所以下面 attention 读的 seq_len = pos+1
+                //     统一写入入口：内部按存储精度转换（fp32 memcpy / fp16 转换）
                 {
                     ScopedTimer t(prof, scope("layer_%d.kv_append", i));
-                    const size_t pos_off = static_cast<size_t>(pos) * head_dim;
-                    const size_t head_plane = static_cast<size_t>(max_seq_len_) * head_dim;
-                    float *k_layer = kv_.k(static_cast<int>(i));
-                    float *v_layer = kv_.v(static_cast<int>(i));
-                    for (int h = 0; h < n_kv_heads; ++h) {
-                        std::memcpy(k_layer + h * head_plane + pos_off, k_.data() + h * head_dim,
-                                    head_dim * sizeof(float));
-                        std::memcpy(v_layer + h * head_plane + pos_off, v_.data() + h * head_dim,
-                                    head_dim * sizeof(float));
-                    }
+                    kv_.write_token(static_cast<int>(i), pos, k_.data(), v_.data());
                 }
 
                 // 2e. attention：当前 q 对 cache 里 [0..pos] 所有位置加权求和
                 {
                     ScopedTimer t(prof, scope("layer_%d.attention", i));
-                    backend_->attention_decode(q_.data(), kv_.k(static_cast<int>(i)),
-                                     kv_.v(static_cast<int>(i)), pos + 1, max_seq_len_, n_heads,
-                                     n_kv_heads, head_dim, attn_scale, attn_.data());
+                    attention_kv(q_.data(), static_cast<int>(i), pos + 1, n_heads, n_kv_heads,
+                                 head_dim, attn_scale, attn_.data());
                 }
 
                 // 2f. 输出投影 o_proj

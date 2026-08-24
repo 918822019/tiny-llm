@@ -248,7 +248,7 @@ namespace tinyqwen {
     //   所有失败经 *err 报告；成功后 *out 持有一个可直接运行的模型。
     bool QwenModel::create(const ModelFile &file, int max_seq_len, Profiler &profiler,
                            std::string *err, std::unique_ptr<QwenModel> *out,
-                           std::unique_ptr<IBackend> backend) {
+                           std::unique_ptr<IBackend> backend, bool kv_fp16) {
         out->reset(); // 清空输出指针
         if (!file.loaded()) {
             if (err) *err = "model file not loaded";
@@ -424,7 +424,7 @@ namespace tinyqwen {
 
         // KV cache 只给 full attention 层（qwen35：n_layers / interval 层）
         m->kv_.init(cfg.n_full_layers(), static_cast<int>(cfg.n_kv_heads), max_seq_len,
-                    static_cast<int>(cfg.head_dim));
+                    static_cast<int>(cfg.head_dim), kv_fp16);
         // GDN 状态：Qwen3.5 的 linear attention 层需要
         if (is_qwen35) {
             const int n_linear = static_cast<int>(cfg.n_layers) - cfg.n_full_layers();
@@ -486,6 +486,24 @@ namespace tinyqwen {
     void QwenModel::mm(const void *w, const float *x, float *y, int M, int K, int N) const {
         WeightTensor wt{w, quant_type_of(dtype_), M, K, group_size_};
         backend_->matmul(wt, x, y, M, K, N);
+    }
+
+    // =========================================================================
+    // QwenModel::attention_kv() — attention 统一分发（按 KV cache 精度）
+    // =========================================================================
+    // fp32 KV：走标准 attention_decode（读 fp32）。
+    // fp16 KV：走融合 attention_decode_f16kv（读 fp16、寄存器内转 fp32），
+    //   消灭独立反量化遍历。
+    void QwenModel::attention_kv(const float *q, int layer, int seq, int n_heads,
+                                 int n_kv_heads, int head_dim, float scale, float *out) const {
+        if (kv_.use_fp16()) {
+            backend_->attention_decode_f16kv(q, kv_.k_f16(layer), kv_.v_f16(layer), seq,
+                                             max_seq_len_, n_heads, n_kv_heads, head_dim, scale,
+                                             out);
+        } else {
+            backend_->attention_decode(q, kv_.k(layer), kv_.v(layer), seq, max_seq_len_, n_heads,
+                                       n_kv_heads, head_dim, scale, out);
+        }
     }
 
 } // namespace tinyqwen

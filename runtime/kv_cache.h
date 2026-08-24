@@ -14,11 +14,18 @@
 // 设计约束:
 //   - batch = 1（单条序列推理）
 //   - decode 式追加写入（每次前进 1 个位置）
-//   - 全精度 fp32 存储（作为参考实现）
 //   - 内存一次性分配，避免反复 new/delete 的碎片和延迟
+//
+// 存储精度（v2 新增）:
+//   - fp32（默认，参考实现）：全精度存储，作为正确性基准。
+//   - fp16（use_fp16=true，opt-in）：K/V 以 fp16 存储，内存与 attention
+//     读取带宽减半（长上下文收益）。写入时 fp32→fp16，读取（attention）时
+//     反量化回 fp32 到一个 workspace，attention 计算仍在 fp32 进行——
+//     即"存 fp16、算 fp32"，质量损失可忽略，attention kernel 无需改动。
 // ============================================================================
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace tinyqwen {
@@ -26,7 +33,7 @@ namespace tinyqwen {
     // KvCache: batch=1、decode 式追加的 K/V 缓存
     //
     // 内存布局（一整块 arena，先 K 后 V）:
-    //   整体: [2 * n_layers * layer_stride] 个 float
+    //   整体: [2 * n_layers * layer_stride] 个元素（元素类型随精度而变）
     //   K 区: [n_layers][n_kv_heads][max_seq_len][head_dim]
     //   V 区: [n_layers][n_kv_heads][max_seq_len][head_dim]
     //
@@ -37,11 +44,6 @@ namespace tinyqwen {
     //   访问某层 l、某头 h、某位置 t 的起点偏移（元素个数）:
     //     K: l * layer_stride_ + h * (max_seq_len * head_dim) + t * head_dim
     //     V: n_layers * layer_stride_ + l * layer_stride_ + ...（同上）
-    //
-    // 版本说明:
-    //   v1 实现已完成的功能: 追加写入、重置清空、容量检查
-    //   v1 未实现的功能: speculative rollback（推测性回滚）；
-    //     将来的扩展点: 加一个 truncate_to(new_len) 方法，当前布局不需要改
     // -------------------------------------------------------------------------
     class KvCache {
     public:
@@ -56,124 +58,104 @@ namespace tinyqwen {
         //   n_kv_heads:  每层 key/value 的注意力头数（GQA）
         //   max_seq_len: 最大序列长度（KV 容量上限）
         //   head_dim:    每个注意力头的维度
+        //   use_fp16:    是否用 fp16 存储（默认 false = fp32 参考）
         // ---------------------------------------------------------------------
-        KvCache(int n_layers, int n_kv_heads, int max_seq_len, int head_dim);
+        KvCache(int n_layers, int n_kv_heads, int max_seq_len, int head_dim,
+                bool use_fp16 = false);
 
         // ---------------------------------------------------------------------
         // init: 一次性分配全部内存
         //
-        // 参数:
-        //   同构造函数参数
-        //
         // 说明:
-        //   采用 arena 分配策略: 一整块 std::vector<float> 容纳所有层、所有头
-        //   的 K 和 V。这样做的好处是:
-        //     - 仅一次分配，减少 malloc 调用
-        //     - 内存连续，cache 友好
-        //     - 释放时也是一次，不会产生碎片
-        //   详见 .cpp 中的 arena 实现说明。
+        //   采用 arena 分配策略: 一整块连续内存容纳所有层、所有头的 K 和 V。
+        //   use_fp16=true 时分配 uint16_t（fp16）arena + 一个 fp32 反量化
+        //   workspace（读时把 fp16 反量化回 fp32 供 attention 用）。
         // ---------------------------------------------------------------------
-        void init(int n_layers, int n_kv_heads, int max_seq_len, int head_dim);
+        void init(int n_layers, int n_kv_heads, int max_seq_len, int head_dim,
+                  bool use_fp16 = false);
 
         // ---------------------------------------------------------------------
-        // reset: 逻辑上清空缓存
-        //
-        // 说明:
-        //   seq_len 归零，表示缓存中无有效数据。
-        //   但保留已分配的内存，下次使用不需要重新分配。
-        //   用于开始新的一段对话时重置状态。
+        // reset: 逻辑上清空缓存（seq_len 归零，保留内存）
         // ---------------------------------------------------------------------
         void reset();
 
         // ---- 属性访问器 ----
-
-        // 当前已缓存了多少个 token 的 K/V
         int seq_len() const { return seq_len_; }
-
-        // KV 缓存的最大容量（序列长度上限）
         int max_seq_len() const { return max_seq_len_; }
-
-        // full attention 层的数量
         int n_layers() const { return n_layers_; }
-
-        // 每层 key/value 注意力头的数量
         int n_kv_heads() const { return n_kv_heads_; }
-
-        // 每个注意力头内部的维度大小
         int head_dim() const { return head_dim_; }
+        bool use_fp16() const { return use_fp16_; }
 
-        // ---- 数据访问 ----
-
+        // ---- 数据访问（读）----
         // ---------------------------------------------------------------------
-        // k: 获取第 layer 层的 K 缓存指针（可写版本）
+        // k / v: 获取第 layer 层的 K/V 缓存（仅 fp32 模式；供 fp32 attention 读）
         //
-        // 参数:
-        //   layer: 层索引（0-based）
+        // 返回值: 指向该层 K/V 的 float* 指针，布局 [n_kv_heads][max_seq_len][head_dim]
         //
-        // 返回值:
-        //   指向该层 K 缓存的 float* 指针，布局为 [n_kv_heads][max_seq_len][head_dim]
-        //
-        // 说明:
-        //   调用方拿到指针后，按上面的偏移公式计算具体位置的地址。
+        // fp16 模式下不应调用本方法（存储是 fp16），请用 k_f16()/v_f16()。
         // ---------------------------------------------------------------------
         float *k(int layer);
-
-        // ---------------------------------------------------------------------
-        // v: 获取第 layer 层的 V 缓存指针（可写版本）
-        //
-        // 参数:
-        //   layer: 层索引（0-based）
-        //
-        // 返回值:
-        //   指向该层 V 缓存的 float* 指针，布局为 [n_kv_heads][max_seq_len][head_dim]
-        // ---------------------------------------------------------------------
         float *v(int layer);
-
-        // ---------------------------------------------------------------------
-        // k / v: 只读版本，用于 const 上下文
-        // ---------------------------------------------------------------------
         const float *k(int layer) const;
         const float *v(int layer) const;
 
         // ---------------------------------------------------------------------
-        // advance: 将 seq_len 向前推进 n 个位置
+        // k_f16 / v_f16: fp16 模式下获取第 layer 层的 K/V 缓存（fp16 指针）
+        //
+        // 返回值: 指向该层 K/V 的 uint16_t*（fp16）指针，
+        //   布局 [n_kv_heads][max_seq_len][head_dim]。
+        // 供 fp16-KV 融合 attention 直接读取（寄存器内转 fp32），
+        // 避免独立的反量化遍历。仅 fp16 模式有效。
+        // ---------------------------------------------------------------------
+        uint16_t *k_f16(int layer);
+        uint16_t *v_f16(int layer);
+        const uint16_t *k_f16(int layer) const;
+        const uint16_t *v_f16(int layer) const;
+
+        // ---- 数据访问（写）----
+        // ---------------------------------------------------------------------
+        // write_token: 写入某个位置 pos 的 K/V（全部 kv 头）
         //
         // 参数:
-        //   n: 推进的 token 数（通常为 1，prefill 时可能 > 1）
+        //   layer:  层索引
+        //   pos:    序列位置（通常 = 当前 seq_len_）
+        //   k_all:  该 token 的 K，[n_kv_heads * head_dim] 连续（所有头），fp32
+        //   v_all:  该 token 的 V，[n_kv_heads * head_dim] 连续（所有头），fp32
         //
-        // 说明:
-        //   seq_len += n，表示刚才写入了 n 个新 token 的 K/V。
-        //   如果 seq_len 超过 max_seq_len，直接 abort（fail fast，
-        //   见 primer 第 9 节），表示这个序列太长了，当前 KV 缓存装不下。
+        // 说明: 统一写入入口，内部按存储精度转换（fp32 直接 memcpy；fp16 先
+        //   fp32→fp16 再存）。调用方不再直接 memcpy 到 k()/v() 指针。
+        // ---------------------------------------------------------------------
+        void write_token(int layer, int pos, const float *k_all, const float *v_all);
+
+        // ---------------------------------------------------------------------
+        // advance: 将 seq_len 向前推进 n 个位置（超限 abort）
         // ---------------------------------------------------------------------
         void advance(int n);
 
         // ---------------------------------------------------------------------
-        // memory_bytes: 缓存占用的总字节数
-        //
-        // 返回值:
-        //   整个 KV 缓存占用的内存字节数 = data_.size() * sizeof(float)
-        //
-        // 说明:
-        //   用于打印内存占用信息，帮助用户了解资源消耗。
+        // memory_bytes: 缓存占用的总字节数（不含反量化 workspace）
         // ---------------------------------------------------------------------
-        size_t memory_bytes() const { return data_.size() * sizeof(float); }
+        size_t memory_bytes() const {
+            return use_fp16_ ? data_f16_.size() * sizeof(uint16_t)
+                             : data_.size() * sizeof(float);
+        }
 
     private:
-        // 下面这些参数在 init() 时确定，之后不再改变
-        int n_layers_ = 0;       // full attention 层数
-        int n_kv_heads_ = 0;     // 每层 KV 头数
-        int max_seq_len_ = 0;    // 最大序列长度
-        int head_dim_ = 0;       // 每个头的维度
-        int seq_len_ = 0;        // 当前已缓存的有效 token 数
+        int n_layers_ = 0;
+        int n_kv_heads_ = 0;
+        int max_seq_len_ = 0;
+        int head_dim_ = 0;
+        int seq_len_ = 0;
+        bool use_fp16_ = false;     // 存储精度开关
 
-        // 一层 K 或 V 占多少个 float 元素
-        // = n_kv_heads_ * max_seq_len_ * head_dim_
+        // 一层 K 或 V 占多少个元素 = n_kv_heads_ * max_seq_len_ * head_dim_
         size_t layer_stride_ = 0;
 
-        // 一整块 arena 内存
-        // 总大小 = 2 * n_layers_ * layer_stride_ 个 float
-        // 前半是 K（n_layers_ 层），后半是 V（n_layers_ 层）
+        // fp32 arena（use_fp16_=false 时用）
         std::vector<float> data_;
+        // fp16 arena（use_fp16_=true 时用）。attention 直接读 fp16、
+        // 寄存器内转 fp32（融合反量化），不做独立反量化遍历。
+        std::vector<uint16_t> data_f16_;
     };
 } // namespace tinyqwen
