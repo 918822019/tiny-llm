@@ -27,6 +27,7 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
 | `matvec/matvec_f32_neon_mt.cpp`        | fp32 + NEON + 多线程               |
 | `matvec/matvec_f16_neon_mt_kv_nt.cpp`  | fp16 权重满栈移植（流量减半）               |
 | `matvec/matvec_i4_sdot2.cpp`           | INT4 W4A8 SDOT + 预计算（首个反超 f16）  |
+| `matvec/matvec_i4_sdot4.cpp`           | **当前 decode 最佳**：W4A8 + work-stealing + 硬件 FCVT |
 
 ## 当前状态
 
@@ -37,10 +38,24 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
     `neon_mt` / `neon_mt_bal` / `neon_mt_kv` / `neon_mt_kv_nt`（CPU 阶梯顶层）
     / `cuda*` 系列（CUDA 构建）；
   - f16：`ref` / `neon_mt_kv_nt`（f16 满栈）/ `cuda_resident_coal(_ws)`；
-  - i4：`ref` / `neon` / `neon_mt` / `sdot(_mt)` / `sdot2(_mt)`（W4A8 SDOT，
-    预计算 + 2-row 并行，macOS 首次反超 f16）。
+  - i4：`ref` / `neon` / `neon_mt` / `sdot(_mt)` / `sdot2(_mt)` / `sdot3(_mt)` /
+    **`sdot4(_mt)`（当前 decode 最佳）** / `sdot5(_mt)`（对称量化实验，配
+    `--symmetric` 模型）。
+- **i4 kernel 阶梯**（归因用，只增不删）：
+  `sdot`（W4A8 SDOT 首版）→ `sdot2`（+预计算 scale/zero + 2-row 并行，首次反超 f16）
+  → `sdot3`（+work-stealing 调度 + 内联组头硬件 FCVT + 128 位解包）→
+  `sdot4`（修正 FCVT 特性守卫，4B 46.9→36.5 ms/tok）→ `sdot5`（对称量化，
+  无 zero 修正，实验性 1.045×）。**推荐 `sdot4_mt`**（非对称模型）/
+  `sdot5_mt`（对称模型）。
+- **被证伪的尝试**（代码保留供对照，默认不启用）：融合 W4A8 批量 matmul
+  （`qwen_forward_prefill_qwen35.cpp` 内，`TINYQWEN_FUSED_MM` 开关）——
+  手写 NEON SDOT 干不过 AMX sgemm，0.70×。
 - 非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax + GDN 四算子）共用 ops
   注册表：`ref` 兜底 + `neon` 变体，`--ops-impl` 开关选择；partial_rope 仅 ref。
+- **批量 prefill（Qwen3.5）**：`runtime/qwen_forward_prefill_qwen35.cpp`——
+  prompt ≥32 token 时，线性投影反量化到 fp32 走 Accelerate/AMX sgemm
+  （权重每层只读一遍），GDN 递归与因果 attention 保留逐 token 顺序扫描。
+  4B 61-token TTFT 2072→1206ms（1.72×）。
 - CUDA 两条腿：matvec 单算子变体（`matvec/*.cu`，走 dispatch）+ GPU-resident
   decode engine（`cuda/gpu_engine.cu`，`--engine cuda` 整段 forward，与逐算子
   分发正交）。runtime 侧另有逐算子 CUDABackend（`--backend cuda`，A/B 用）。

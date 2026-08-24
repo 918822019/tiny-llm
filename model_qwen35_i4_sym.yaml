@@ -1,0 +1,70 @@
+# =============================================================================
+# model_qwen35_i4_sym.yaml —— Qwen3.5-0.8B INT4 对称量化模型注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件记录 Qwen3.5-0.8B 的**对称量化**（--symmetric，zero 恒为 8）变体，
+#   与 model_qwen35_i4（HQQ 非对称）同模型不同量化方案。
+#
+#   对称量化 = llama.cpp Q4_0 同方案：scale = max(|vmin|,|vmax|)/7，
+#   反量化 = (q-8)*scale，无 zero 修正项。配套 kernel 是 sdot5（跳过
+#   zero 修正 + 激活前缀和）。
+#
+#   ⚠️ 实验性质：0.8B 实测 sdot5_mt 比 sdot4_mt（非对称）只快 1.045×
+#   （8.07→7.72 ms/tok）——省下的标量指令大部分被 OoO 隐藏，瓶颈是
+#   带宽/加载流水线而非标量。详见优化日志「sdot5_sym」小节（部分证伪）。
+# =============================================================================
+
+# Model registry: model_qwen35_i4_sym.tqwen（Qwen3.5-0.8B i4 对称 + lm_head i4）
+name: model_qwen35_i4_sym
+architecture: qwen3.5
+source: Qwen/Qwen3.5-0.8B
+dtype: i4
+file: model_qwen35_i4_sym.tqwen
+size_mb: 1375.3              # 与非对称版相同（格式一致，只是 zero 恒为 8）
+
+# 模型结构参数（与 model_qwen35_i4.yaml 一致）
+params:
+  n_layers: 24
+  hidden_size: 1024
+  intermediate_size: 3584
+  n_heads: 8
+  n_kv_heads: 2
+  head_dim: 256
+  vocab_size: 248320
+  tied_embeddings: true
+  model_type: qwen3_5
+  full_attention_interval: 4
+  attn_output_gate: true
+
+# GDN 层参数
+gdn:
+  linear_num_qk_heads: 16
+  linear_num_v_heads: 16
+  linear_qk_head_dim: 128
+  linear_v_head_dim: 128
+  linear_conv_kernel_dim: 4
+
+# 量化配置：对称量化（--method rtn --symmetric）
+quantization:
+  method: rtn
+  group_size: 64
+  symmetric: true            # zero 恒为 8，无零点修正
+  lm_head_quantized: true
+  note: scale = max(|vmin|,|vmax|)/7；反量化 = (q-8)*scale；llama.cpp Q4_0 同方案
+
+# 推荐的计算配方：对称量化专用 kernel
+recipe:
+  matvec_impl: sdot5_mt      # 对称量化变体（无 zero 修正 + 无前缀和）
+  ops_impl: neon
+  note: sdot5 仅适用于对称量化模型（zero=8）；对非对称模型数值不正确
+
+# 基准测试结果
+benchmark:
+  macos_m4:
+    topt_ms: 7.72            # decode 中位（同场 2 轮；vs sdot4_mt 非对称 8.07 = 1.045×）
+    ttft_ms: null
+    peak_rss_mb: null
+    device: Mac16,10（Apple M4，4P+6E，16GB）
+    commit: 75cb6dd
+    note: 实验性——只比非对称快 4.5%，标量开销被 OoO 隐藏；
+      输出与非对称模型不同（量化方案不同，预期）
