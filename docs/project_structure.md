@@ -113,6 +113,9 @@ main.cpp ──> QwenModel ──> IBackend ──> CPUBackend ──> dispatch 
 | Qwen3.5-0.8B | `model_qwen35_f16.tqwen` | f16 | `neon_mt_kv_nt` | ~17.9 ms/tok |
 
 - prompt ≥32 token 时自动走**批量 prefill GEMM 路径**（见上文 `qwen_forward_prefill_qwen35.cpp`）。
+- **fp16 KV cache（`--kv-f16`，opt-in）**：KV 存 fp16，attention 经 `attention_kv`
+  分发到融合 `attention_decode_f16kv_neon`（读 fp16、寄存器内转 fp32）。KV 内存减半、
+  长上下文可用，解码慢 ~8%（内存特性非提速）。
 - decode 是带宽瓶颈（batch=1 matvec，算术强度低），4B 当前用到持续带宽墙的 ~86%。
 - 完整数字与归因见 `optimization_log.md`；机器极限见 `../benchmarks/machine_ceiling/`。
 

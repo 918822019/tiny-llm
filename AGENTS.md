@@ -5,9 +5,9 @@
 
 ## 项目一句话
 
-tinyqwen：面向 **Qwen2.5-0.5B / Qwen3.5-0.8B**（decoder-only，Qwen3.5 为 Gated DeltaNet + full
-attention 3:1 混合架构）的端侧推理实验 runtime。C++17 + CMake 主线，Python 工具链（导出 / 对齐 /
-测速）。刻意**不做**通用推理框架、graph executor、C++ tokenizer。
+tinyqwen：面向 **Qwen2.5-0.5B / Qwen3.5-0.8B / Qwen3.5-4B**（decoder-only，Qwen3.5 为 Gated
+DeltaNet + full attention 3:1 混合架构）的端侧推理实验 runtime。C++17 + CMake 主线，
+Python 工具链（导出 / 对齐 / 测速）。刻意**不做**通用推理框架、graph executor、C++ tokenizer。
 
 ## 构建 & 测试
 
@@ -48,13 +48,18 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
 ## 常见坑（都已在本环境实际踩过）
 
 1. **测速默认 ref kernel，数字不是真速度**：`--matvec-impl` 默认 `ref`（标量兜底），Qwen3.5-0.8B 实测
-   ~595 ms/tok；必须显式传优化实现（见各 `model*.yaml` 的 `recipe` 字段）。f16 满栈例：
-   `--extra-args "--matvec-impl neon_mt_kv_nt --ops-impl neon"` → ~17.65 ms/tok（M4）。
+   ~595 ms/tok；必须显式传优化实现（见各 `model*.yaml` 的 `recipe` 字段）。当前最佳 i4 配方：
+   `--extra-args "--matvec-impl sdot4_mt --ops-impl neon"`（4B ≈36.5、0.8B ≈8.1 ms/tok，M4）。
+   f16 满栈例：`--matvec-impl neon_mt_kv_nt --ops-impl neon` → 0.8B ~17.65 ms/tok（M4）。
 2. **Qwen3.5 对齐要 transformers main**：见上「Python 环境」。
 3. **align 脚本依赖逐位置 dump**：已加 `--verbose` 强制逐 token prefill 恢复契约（`tools/align_fake_*.py`），勿删。
 4. **fake Qwen3.5 的 tied lm_head**：`make_fake_qwen35_model.py` 对 tied 模型**不写**独立 `lm_head.weight`
    （与真实导出器 `if not tie_word_embeddings` 守卫一致）。若写了与 embed 不同的独立 lm_head，runtime 的 tied
    绑定会拿错权重，C++ vs HF logits 偏差 ~1.9，对齐直接失败。
+5. **批量 prefill 有 token 阈值**：Qwen3.5 prompt ≥`kBatchPrefillMinQwen35`(=32) 才走 GEMM 批量路径，
+   否则回退逐 token。短 prompt 测速看不到批量收益，别误判"批量没用"。`--no-batch-prefill` 可关。
+6. **`--kv-f16` 是内存特性不是提速**：KV 存 fp16 + 融合 attention，KV 内存减半、长上下文可用，
+   但解码慢 ~8%（寄存器内 fp16→fp32 转换抵消读带宽减半）。短上下文用 fp32，长上下文内存不够才开。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

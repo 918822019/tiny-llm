@@ -5,21 +5,22 @@
 不追求通用推理框架，不做 graph executor。
 
 > **当前状态**
-> - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B，生成 token 与 HuggingFace 逐位一致；
-> - ✅ **已支持 Qwen3.5-0.8B 混合架构**（Gated DeltaNet + full attention 3:1）：
-    > v2 格式、GDN 递归/conv 状态、partial RoPE、QK-norm、输出门。已在 macOS 用真实
-    > Qwen3.5-0.8B 端到端生成连贯文本；随机权重小模型与 HF eager 对齐 max_abs_err ≈ 1e-6
+> - ✅ 已在 macOS 跑通真实 Qwen2.5-0.5B / Qwen3.5-0.8B / **Qwen3.5-4B**，生成 token
+    > 与 HuggingFace 逐位一致；随机权重小模型与 HF eager 对齐 max_abs_err ≈ 1e-6
     > （`tools/align_fake_qwen35_model.py`）；
-> - 性能：fp32 标量基线 230 ms/token → **fp16 满栈 + 全融合 ≈ 6.3 ms/token（36×）**。
-    > 已抵达带宽墙，fp16 路线正式关闭（结论与账本见 `docs/optimization_log.md`）；
+> - **当前最佳 decode 配方**（i4 HQQ@64，`--matvec-impl sdot4_mt --ops-impl neon`）：
+    > Qwen3.5-4B ≈ 36.5 ms/tok、Qwen3.5-0.8B ≈ 8.1 ms/tok（M4）。i4 kernel 阶梯
+    > `ref→neon→neon_mt→sdot→sdot2→sdot3→sdot4`（work-stealing + 内联组头硬件
+    > FCVT + 128 位解包）；`sdot5` 为对称量化实验变体（配 `--symmetric` 导出）。
+    > 数字与归因见 `docs/optimization_log.md`；
+> - **批量 prefill（Qwen3.5）**：prompt ≥32 token 时线性投影反量化 fp32 走
+    > Accelerate/AMX sgemm（权重每层只读一遍），4B 61-token TTFT 2072→1206ms（1.72×）；
+> - **fp16 KV cache（opt-in，`--kv-f16`）**：KV 存 fp16 + 融合 attention（寄存器内
+    > 转 fp32），KV 内存减半、长上下文可用；解码慢 ~8%（内存特性非提速）；
 > - 已就位：可复现基准（内置同场 A/B + 漂移警告）、优化日志、两套 kernel 分发层
     > （matvec / 非 matvec ops，变体自注册 + 未注册兜底 ref）、key=value 配置、
-    > 归因阶梯方法论、端侧资源采样（进程 RSS/峰值内存、各核实实时频率、KV cache 口径，
-    > 见 `docs/android.md` §6）；
-> - **INT4 已落地**：HQQ 量化导出（group=64）+ i4 kernel 阶梯（NEON → 多线程 →
-    > W4A8 SDOT → sdot2 预计算+2-row 并行）。macOS sdot2_mt 3.67 ms/tok **首次反超**
-    > f16 满栈（5.68）；Android i4 22.35 vs f16 17~21 ms/tok——优势在内存占用与热稳定，
-    > 见 `docs/optimization_log.md`；
+    > 归因阶梯方法论、机器极限账表（`benchmarks/machine_ceiling/`）、端侧资源采样
+    > （见 `docs/android.md` §6）；
 > - **后端抽象已就位**：`IBackend` 接口 + CPU 后端（包装 kernel dispatch，主线）；
     > CUDABackend（`--backend cuda`，逐算子，供 A/B）与 GPU-resident engine
     > （`--engine cuda`，整段 forward 常驻显存，A10 实测 4.89 ms/tok）并存，
@@ -171,6 +172,8 @@ tinyqwen --model <model.tqwen> [options]
 | `--engine NAME`           | 无      | decode engine：`cuda` = GPU-resident 整段 forward（需 CUDA 构建；仅 Qwen2.x + greedy） |
 | `--no-fuse-gate-up`       | 关      | 禁用 FFN gate/up 成对融合（A/B 用）                                                  |
 | `--no-fuse-qkv`           | 关      | 禁用 q/k/v 三路融合（A/B 用）                                                        |
+| `--kv-f16`                | 关      | KV cache 存 fp16（内存减半，长上下文用；解码慢 ~8%，内存特性非提速）                                    |
+| `--no-batch-prefill`      | 关      | 禁用 Qwen3.5 批量 prefill GEMM 路径（A/B 用；默认 prompt≥32 自动启用）                        |
 | `--verbose`               | 关      | 模型 summary + prefill 细节（stderr）                                             |
 
 ### 配置文件
@@ -180,12 +183,15 @@ tinyqwen --model <model.tqwen> [options]
 随时用命令行覆盖。当前可配：
 
 ```text
-matvec_impl = ref     # matvec kernel 实现（任意已注册名；变体自注册，见 kernels/dispatch.h）
-ops_impl = ref        # 非 matvec 算子实现（ref / neon）
-engine =              # decode engine（空 = CPU forward；cuda = GPU-resident）
-fuse_gate_up = true   # FFN gate/up 成对融合
-fuse_qkv = true       # q/k/v 三路融合
+matvec_impl = ref      # matvec kernel 实现（任意已注册名；变体自注册，见 kernels/dispatch.h）
+ops_impl = ref         # 非 matvec 算子实现（ref / neon）
+engine =               # decode engine（空 = CPU forward；cuda = GPU-resident）
+fuse_gate_up = true    # FFN gate/up 成对融合
+fuse_qkv = true        # q/k/v 三路融合
+batch_prefill = true   # Qwen3.5 批量 prefill GEMM 路径（prompt≥32 自动启用）
 ```
+
+注：`--kv-f16`（KV 存 fp16）仅 CLI 开关，不进配置文件。
 
 ```bash
 ./build/runtime/tinyqwen --config tinyqwen.conf --model model.tqwen ...
