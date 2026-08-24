@@ -13,6 +13,11 @@
     > `ref→neon→neon_mt→sdot→sdot2→sdot3→sdot4`（work-stealing + 内联组头硬件
     > FCVT + 128 位解包）；`sdot5` 为对称量化实验变体（配 `--symmetric` 导出）。
     > 数字与归因见 `docs/optimization_log.md`；
+> - **VQ2 2-bit 块向量量化 + BiIP 旋转**：块大小 d=4、码本 K=256（2 bit/权重），
+    > 查表反量化、字节对齐；旋转在量化前对权重做变换、推理时对激活做配对逆变换
+    > （自抵消）。朴素导出器 `tools/export_qwen_to_tiny_vq2.py`（无旋转、精度受限）；
+    > 精度可用版走 kronq 完整配方桥接（旋转+GPTQ+TwoPass+K-FAC）。
+    > 格式/旋转契约见 `docs/weight_format.md`，路径说明见 `docs/quantization_guide.md`；
 > - **批量 prefill（Qwen3.5）**：prompt ≥32 token 时线性投影反量化 fp32 走
     > Accelerate/AMX sgemm（权重每层只读一遍），4B 61-token TTFT 2072→1206ms（1.72×）；
 > - **fp16 KV cache（opt-in，`--kv-f16`）**：KV 存 fp16 + 融合 attention（寄存器内
@@ -217,11 +222,11 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | `docs/architecture.md`      | **分层架构**：IBackend 后端抽象 / WeightTensor 量化抽象 / 数据流 |
 | `docs/optimization.md`      | **优化手册**：kernel 怎么加（自注册）+ 性能怎么测（A/B/纪律）        |
 | `docs/optimization_log.md`  | **优化日志**：每次优化改了什么/提升多少/为什么                     |
-| `docs/weight_format.md`     | tiny binary format（header / tensor table / 对齐） |
+| `docs/weight_format.md`     | tiny binary format（header / tensor table / 对齐；INT4 与 VQ2 packing、BiIP 旋转参数） |
 | `docs/qwen_forward.md`      | Qwen forward 数学定义与 shape 约定                    |
 | `docs/profiling_schema.md`  | profiler JSON 输出 schema                        |
 | `docs/pytorch_alignment.md` | C++ 与 PyTorch reference 对齐流程                   |
-| `docs/quantization_guide.md`| 量化算法接入指南（新量化类型怎么加；INT4 布局细节）                 |
+| `docs/quantization_guide.md`| 量化算法接入指南（新量化类型怎么加；INT4 / VQ2 布局；BiIP 旋转两条路径） |
 | `docs/android.md`           | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
 | `docs/project_structure.md` | 目录职责说明                                         |
 | `docs/known_limitations.md` | v1 已知限制                                        |

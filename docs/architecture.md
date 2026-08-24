@@ -174,10 +174,15 @@ forward_token() / forward_prefill()
     ↓
 IBackend::matvec() / rmsnorm() / ...（WeightTensor 携带 quant_type）
     ↓
-CPUBackend::matvec() → matvec_f32() / matvec_f16() / matvec_i4()
+CPUBackend::matvec() → matvec_f32() / matvec_f16() / matvec_i4() / matvec_vq2()
     ↓
 具体 kernel（dispatch 按名字分发，未命中兜底 _ref）
 ```
+
+> **VQ2 + BiIP 旋转**：旋转量化模型（存在 `*.rot_sign`）在 `forward` 里每个量化
+> matvec 前先对激活做配对旋转（`mv_rot`/`mm_rot` → `biip_rotate_activation`），
+> 再走 `matvec_vq2`/`matmul_vq2` 查表。旋转使 qkv/gate-up 融合失效，旋转模型自动
+> 去融合。格式契约见 `weight_format.md`，两条导出路径见 `quantization_guide.md`。
 
 ## 扩展指南
 
