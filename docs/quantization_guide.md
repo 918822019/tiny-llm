@@ -36,6 +36,27 @@
 - `make_rotated_vq2_fake.py`：合成"旋转+VQ2"假模型，端到端验证格式可加载运行。
 - 单元：`tests/test_biip_rotate.cpp`（Hadamard）、`tests/test_matvec_vq2.cpp`（VQ2）。
 
+## PPL 评测（验证量化精度）
+
+测困惑度用 `--ppl` 模式（批量 prefill + 全位置 lm_head + 交叉熵，
+`forward_ppl`）+ `tools/eval_ppl.py` 编排。数据准备与计算解耦：
+
+```bash
+# 预分词输入（推荐；可在任何有 tokenizer 的机器先分好词）
+python tools/eval_ppl.py --model model_qwen25_vq2.tqwen \
+    --tokens-npy benchmarks/wikitext_test_tokens.npy --chunk-len 1024 \
+    --matvec-impl neon --label vq2-rot --json benchmarks/ppl_history.jsonl
+
+# 现场 tokenize（需 transformers + 模型 + 数据）
+python tools/eval_ppl.py --model model.tqwen --wikitext --split test \
+    --tokenizer models/Qwen2.5-0.5B --chunk-len 1024
+```
+
+- `--ppl --ppl-jsonl` 可单独使用：多序列一次进程加载、逐块 reset + 累加。
+- 已交叉验证：`--ppl` 与逐 token `--dump-logits` 参照 6 位小数一致
+  （Qwen2.x 假模型 + Qwen3.5-0.8B 真实模型）。
+- 对比量化前后 PPL（如 f16 基线 vs VQ2），即可判断 2-bit 精度是否可接受。
+
 ## 接入新的量化算法
 
 以 GPTQ 为例，说明接入流程。
