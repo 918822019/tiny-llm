@@ -327,6 +327,218 @@ void convert_f16_to_f32(const uint16_t *w, float *dst, size_t n) {
 
 } // namespace
 
+// ========================================================================
+// 融合 W4A8 批量 matmul：Y[M,N] = dequant(W_i4[M,K]) @ X[K,N]
+// ========================================================================
+// 替代"反量化到 fp32 + cblas_sgemm"：权重 i4 只读一遍、激活量化为 int8、
+// 用 SDOT 一次算完全部 N 个 token，省去 fp32 往返（写 + 读 ≈ 8B/权重）的
+// 访存。数值方案与 decode 的 sdot4 完全一致（W4A8），因此批量 prefill 与
+// 逐 token decode 数值口径统一。仅 aarch64 + dotprod 可用，否则返回 false
+// 由调用方回退 dequant+sgemm。
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+namespace {
+
+// ------------------------------------------------------------------------
+// unpack_group_i8: 把一组的 packed uint4 解包为 (q-8) 的 int8
+// ------------------------------------------------------------------------
+void unpack_group_i8(const uint8_t *pk, int8_t *w8, int elems) {
+    int i = 0;
+    const uint8x8_t m0F = vdup_n_u8(0x0F);
+    const uint8x8_t v8 = vdup_n_u8(8);
+    for (; i + 16 <= elems; i += 16) {
+        uint8x8_t raw = vld1_u8(pk + i / 2);
+        uint8x8_t lo = vand_u8(raw, m0F);       // 偶数位权重
+        uint8x8_t hi = vshr_n_u8(raw, 4);       // 奇数位权重
+        uint8x8x2_t z = vzip_u8(lo, hi);        // 还原原始顺序
+        vst1_u8(reinterpret_cast<uint8_t *>(w8) + i, vsub_u8(z.val[0], v8));
+        vst1_u8(reinterpret_cast<uint8_t *>(w8) + i + 8, vsub_u8(z.val[1], v8));
+    }
+    for (; i < elems; ++i) {
+        const int q = (i % 2 == 0) ? (pk[i / 2] & 0x0F) : ((pk[i / 2] >> 4) & 0x0F);
+        w8[i] = static_cast<int8_t>(q - 8);
+    }
+}
+
+// ------------------------------------------------------------------------
+// dot_i8: int8 点积（SDOT，16 元素/条；尾部标量）
+// ------------------------------------------------------------------------
+int dot_i8(const int8_t *a, const int8_t *b, int n) {
+    int i = 0;
+    int32x4_t d = vdupq_n_s32(0);
+    for (; i + 16 <= n; i += 16) {
+        d = vdotq_s32(d, vld1q_s8(a + i), vld1q_s8(b + i));
+    }
+    int acc = vaddvq_s32(d);
+    for (; i < n; ++i) acc += static_cast<int>(a[i]) * static_cast<int>(b[i]);
+    return acc;
+}
+
+// ------------------------------------------------------------------------
+// matmul_i4_sdot_rows: 处理第 [row_begin, row_end) 行
+// ------------------------------------------------------------------------
+// 对每行：跨组累加；每组的权重解包一次后复用给全部 N 个 token。
+// y 为 token 主序 [M, N]：y[m + n*M]。
+void matmul_i4_sdot_rows(const uint8_t *w, const int8_t *xq, const float *ax_scale,
+                         const int32_t *xqsum, float *y, int M, int K, int N,
+                         int group_size, int row_begin, int row_end) {
+    const int gpr = (K + group_size - 1) / group_size;
+    const int group_bytes = 4 + group_size / 2;
+    const size_t row_bytes = static_cast<size_t>(gpr) * group_bytes;
+    std::vector<int8_t> w8(group_size);   // 一组解包后的权重（q-8）
+    std::vector<float> acc(N);            // 当前行对 N 个 token 的累加
+
+    for (int m = row_begin; m < row_end; ++m) {
+        const uint8_t *row = w + static_cast<size_t>(m) * row_bytes;
+        for (int n = 0; n < N; ++n) acc[n] = 0.0f;
+        int col = 0;
+        for (int g = 0; g < gpr; ++g) {
+            const uint8_t *gp = row + static_cast<size_t>(g) * group_bytes;
+            uint16_t sh, zh;
+            std::memcpy(&sh, gp, 2);
+            std::memcpy(&zh, gp + 2, 2);
+            const float scale_w = half_bits_to_float_pf(sh);
+            const float zero_m8 = half_bits_to_float_pf(zh) - 8.0f;
+            const int group_elems = (col + group_size <= K) ? group_size : (K - col);
+            unpack_group_i8(gp + 4, w8.data(), group_elems);
+            // 本组对全部 N 个 token 做点积（权重解包一次，复用 N 次）
+            for (int n = 0; n < N; ++n) {
+                const int8_t *xq_gn = xq + static_cast<size_t>(n) * K + col;
+                const int dot = dot_i8(w8.data(), xq_gn, group_elems);
+                const float A = scale_w * ax_scale[n];
+                const float xs = static_cast<float>(xqsum[static_cast<size_t>(n) * gpr + g]);
+                acc[n] += A * static_cast<float>(dot) - (A * zero_m8) * xs;
+            }
+            col += group_size;
+        }
+        for (int n = 0; n < N; ++n) y[m + static_cast<size_t>(n) * M] = acc[n];
+    }
+}
+
+// ------------------------------------------------------------------------
+// MatmulI4Pool: 常驻行切分线程池（结构同 DequantPool）
+// ------------------------------------------------------------------------
+struct MatmulI4Pool {
+    const uint8_t *w = nullptr;
+    const int8_t *xq = nullptr;
+    const float *ax_scale = nullptr;
+    const int32_t *xqsum = nullptr;
+    float *y = nullptr;
+    int M = 0, K = 0, N = 0, group_size = 64;
+    int total_rows = 0, chunk_rows = 1;
+    std::atomic<int> next_row{0};
+
+    std::atomic<std::uint64_t> job_gen{0};
+    std::atomic<std::uint64_t> done_gen{0};
+    std::atomic<bool> shutdown{false};
+    std::vector<std::thread> workers;
+    std::uint64_t job_counter = 0;
+    std::uint64_t expected_done = 0;
+
+    MatmulI4Pool() {
+        const int p = default_parallelism_dq();
+        workers.reserve(static_cast<size_t>(p - 1));
+        for (int idx = 1; idx < p; ++idx) {
+            workers.emplace_back([this] { worker_main(); });
+        }
+    }
+    ~MatmulI4Pool() {
+        shutdown.store(true, std::memory_order_release);
+        job_gen.fetch_add(1, std::memory_order_release);
+        for (auto &t : workers) t.join();
+    }
+    void worker_main() {
+        std::uint64_t next_job = 1;
+        for (;;) {
+            spin_until_dq(job_gen, next_job);
+            if (shutdown.load(std::memory_order_acquire)) return;
+            do_work();
+            done_gen.fetch_add(1, std::memory_order_release);
+            ++next_job;
+        }
+    }
+    void do_work() {
+        for (;;) {
+            const int begin = next_row.fetch_add(chunk_rows, std::memory_order_relaxed);
+            if (begin >= total_rows) break;
+            const int end = (begin + chunk_rows < total_rows) ? begin + chunk_rows : total_rows;
+            matmul_i4_sdot_rows(w, xq, ax_scale, xqsum, y, M, K, N, group_size, begin, end);
+        }
+    }
+    void run(const uint8_t *w_, const int8_t *xq_, const float *ax_, const int32_t *xs_,
+             float *y_, int M_, int K_, int N_, int gs_) {
+        w = w_; xq = xq_; ax_scale = ax_; xqsum = xs_; y = y_;
+        M = M_; K = K_; N = N_; group_size = gs_;
+        total_rows = M;
+        const int p = static_cast<int>(workers.size()) + 1;
+        chunk_rows = M / (p * 4);
+        if (chunk_rows < 1) chunk_rows = 1;
+        next_row.store(0, std::memory_order_relaxed);
+        job_gen.store(++job_counter, std::memory_order_release);
+        do_work();
+        expected_done += workers.size();
+        spin_until_dq(done_gen, expected_done);
+    }
+};
+
+MatmulI4Pool &matmul_i4_pool() {
+    static MatmulI4Pool p;
+    return p;
+}
+
+} // namespace
+#endif // __aarch64__ && __ARM_FEATURE_DOTPROD
+
+// ------------------------------------------------------------------------
+// matmul_i4_batched: 量化激活 + 融合 matmul。返回 false 表示平台不支持。
+// ------------------------------------------------------------------------
+// xq / ax_scale / xqsum 为调用方（BatchPrefillBufs）提供的可复用 workspace。
+bool matmul_i4_batched(const void *w, const float *x, float *y, int M, int K, int N,
+                       int group_size, std::vector<int8_t> &xq,
+                       std::vector<float> &ax_scale, std::vector<int32_t> &xqsum) {
+#if !defined(__aarch64__) || !defined(__ARM_FEATURE_DOTPROD)
+    (void)w; (void)x; (void)y; (void)M; (void)K; (void)N; (void)group_size;
+    (void)xq; (void)ax_scale; (void)xqsum;
+    return false;
+#else
+    const int gpr = (K + group_size - 1) / group_size;
+    // 1) 逐 token 对称 int8 量化 + 逐组激活和（与 sdot4 的 quantize_x 同语义）
+    xq.resize(static_cast<size_t>(K) * N);
+    ax_scale.resize(N);
+    xqsum.resize(static_cast<size_t>(N) * gpr);
+    for (int n = 0; n < N; ++n) {
+        const float *xn = x + static_cast<size_t>(n) * K;
+        float amax = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float a = xn[k] < 0 ? -xn[k] : xn[k];
+            if (a > amax) amax = a;
+        }
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+        ax_scale[n] = scale;
+        const float inv = 1.0f / scale;
+        int8_t *xq_n = xq.data() + static_cast<size_t>(n) * K;
+        int32_t *gsum = xqsum.data() + static_cast<size_t>(n) * gpr;
+        for (int g = 0; g < gpr; ++g) gsum[g] = 0;
+        for (int k = 0; k < K; ++k) {
+            float v = xn[k] * inv;
+            v = v > 127.0f ? 127.0f : (v < -127.0f ? -127.0f : v);
+            const int q = static_cast<int>(v >= 0 ? v + 0.5f : v - 0.5f);
+            xq_n[k] = static_cast<int8_t>(q);
+            gsum[k / group_size] += q;
+        }
+    }
+    // 2) 行并行融合 matmul（小矩阵串行，省同步开销）
+    if (static_cast<std::size_t>(M) * K >= kMinParallelElemsDq &&
+        std::thread::hardware_concurrency() > 1) {
+        matmul_i4_pool().run(static_cast<const uint8_t *>(w), xq.data(),
+                             ax_scale.data(), xqsum.data(), y, M, K, N, group_size);
+    } else {
+        matmul_i4_sdot_rows(static_cast<const uint8_t *>(w), xq.data(),
+                            ax_scale.data(), xqsum.data(), y, M, K, N, group_size, 0, M);
+    }
+    return true;
+#endif
+}
+
 // ============================================================================
 // QwenModel::forward_prefill_qwen35_batch() — 批量 prefill 主入口
 // ============================================================================
@@ -408,8 +620,17 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
         return bp.deq.data();
     };
     // GEMM 包装：Y = W @ X（token 主序），失败即回退
+    // 实验开关：融合 W4A8 matmul 默认**关闭**——实测它比 dequant+AMX-sgemm
+    // 慢（4B-61tok 0.70×：手写 NEON SDOT 干不过 AMX，省下的访存填不平算力
+    // 差距，见优化日志"证伪归档"）。设置 TINYQWEN_FUSED_MM 可强制启用对照。
+    const bool use_fused_mm = std::getenv("TINYQWEN_FUSED_MM") != nullptr;
     const auto do_gemm = [&](const void *w, const float *x, float *y,
                              int M, int K) -> bool {
+        if (use_fused_mm && dtype_ == Dtype::kI4 &&
+            matmul_i4_batched(w, x, y, M, K, n, group_size_,
+                              bp.xq, bp.ax_scale, bp.xqsum)) {
+            return true;
+        }
         const float *wf = prep_w(w, M, K);
         return gemm_wx(wf, x, y, M, K, n);
     };

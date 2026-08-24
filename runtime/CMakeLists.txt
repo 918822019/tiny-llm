@@ -55,11 +55,12 @@ if (APPLE)
     target_link_libraries(tinyqwen_runtime PUBLIC "-framework Accelerate")
 endif ()
 
-# 批量 prefill 文件里的 fp16→fp32 组头转换走硬件指令，需要 +fp16
-# （守卫宏 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC，同 sdot4 的教训）。
+# 批量 prefill 文件里：融合 W4A8 matmul 需 +dotprod（SDOT），
+# fp16→fp32 组头转换走硬件需 +fp16（守卫 __ARM_FEATURE_FP16_SCALAR_ARITHMETIC，
+# 同 sdot4 的教训）。
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set_source_files_properties(qwen_forward_prefill_qwen35.cpp PROPERTIES
-            COMPILE_OPTIONS "-march=armv8.2-a+fp16")
+            COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16")
 endif ()
 
 # ---------------------------------------------------------------------------

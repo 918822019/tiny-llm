@@ -54,7 +54,8 @@
 | qwen35-4b-i4-sdot4_mt（macOS M4） | 8d5447f | **36.50** | 38.51 | 1.38×（4B 内，vs sdot2_mt 50.30） | **1.29×**（同场交替 3 轮 vs sdot3_mt 46.91） | 修组头转换特性守卫：clang +fp16 根本不定义 `__ARM_FEATURE_FP16`（实际是 `__ARM_FEATURE_FP16_SCALAR_ARITHMETIC`），**sdot3 的硬件 FCVT 从未生效**，热循环静默跑软件转换（~4.6G 条指令/token，sample 第一大头）。改 `_Float16` cast（fmov+fcvt 2 条）。单核 160→119（1.35×）；有效带宽 50.5→64.8 GB/s；**E 核由负转正**：10 线程 36.0 < 4 线程 39.6。0.8B 同场 10.19→8.08（1.26×）。数值与 sdot3 逐位一致 |
 | prefill_skip_logits（macOS M4，TTFT 专项） | 7fa8c9a | 36.49（TOPT 不变） | 38.42 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT 1.14×**（33-tok prompt 1320→1158ms） | Qwen3.5 prefill 逐 token 回退中，非末位 token 的 logits 被丢弃却全量计算 lm_head（4B 占单 token 16%）。forward_token 加 need_logits 门控跳过 final_norm+lm_head+argmax。微观证据：同 profile 内跳过位 29.96 vs 末位 35.77（Δ5.81≈lm_head 5.87ms）；0.8B TTFT ~21.4。对齐契约（--verbose 逐位置 dump）不受影响。TOPT 逐位不变 |
 | qwen35_batch_prefill（macOS M4，TTFT 专项） | e25e9ae | 35.72（TOPT 不变） | 37.23 | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**TTFT：4B-61tok 2072→1206ms（1.72×）、0.8B-33tok 214→156ms（1.38×）** | Qwen3.5 prefill GEMM 路径（`forward_prefill_qwen35_batch`）：权重每层反量化到 fp32 一次 + Accelerate/AMX sgemm，把全部线性投影摊薄到 N 个 token；GDN 递归与因果 attention 保留逐 token 顺序扫描。反量化是固定开销（~0.9s@4B），crossover≈30 token，阈值 32（低于阈值仍走逐 token，canonical 3-tok 不受影响）。⚠️ i4 数值：批量路径激活走 fp32（weight-only int4），decode 逐 token 走 W4A8（int8 激活），二者非逐位一致，临界 argmax 偶发不同（批量更贴近 HF） |
-| dequant_mt（macOS M4，TTFT 专项） | 本次 | 35.72（TOPT 不变） | — | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**批量 prefill TTFT 1.08×**（4B-33tok 1116→1037ms，同二进制交替 4 轮中位） | 批量 prefill 的 i4 反量化（每权重矩阵一遍、行独立）从串行改为常驻线程池工作窃取（结构同 RowPool；<262144 元素的小矩阵仍串行）。**关键实测：反量化并非批量路径大头**——串行化它只慢 79ms；真正瓶颈是 sgemm 小 N 的访存（权重反量化写 fp32 + 读 fp32 = 8B/权重）。跨构建 A/B 受热污染只有 1.01-1.04×，同二进制交替（唯一可信判据）才显出 1.08× |
+| dequant_mt（macOS M4，TTFT 专项） | 44d2439 | 35.72（TOPT 不变） | — | —（TTFT 专项，看右侧归因） | TOPT 1.00×；**批量 prefill TTFT 1.08×**（4B-33tok 1116→1037ms，同二进制交替 4 轮中位） | 批量 prefill 的 i4 反量化（每权重矩阵一遍、行独立）从串行改为常驻线程池工作窃取（结构同 RowPool；<262144 元素的小矩阵仍串行）。**关键实测：反量化并非批量路径大头**——串行化它只慢 79ms；真正瓶颈是 sgemm 小 N 的访存（权重反量化写 fp32 + 读 fp32 = 8B/权重）。跨构建 A/B 受热污染只有 1.01-1.04×，同二进制交替（唯一可信判据）才显出 1.08× |
+| fused_i4_batch_mm（macOS M4，**证伪归档**） | 本次 | 35.72（TOPT 不变，默认路径未用它） | — | —（TTFT 专项） | 批量 prefill TTFT **0.70×**（4B-61tok 1174→1675ms，更慢） | 融合 W4A8 批量 matmul（权重 i4 读一遍 + 激活 int8 + SDOT，省 fp32 往返）：数值正确（与 sdot4 逐位一致 + 单测），但**手写 NEON SDOT 干不过 AMX sgemm**——省下的访存填不平算力差距，N 越大越亏（61tok 0.70×、33tok 0.97×、0.8B 0.77×）。默认关闭，`TINYQWEN_FUSED_MM` 可启用对照。教训：AMX 面前别用裸 NEON 拼 GEMM |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
@@ -1972,6 +1973,44 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
      本线程池直接复用（只改反量化内核，不动池）。
 - **复现**：同二进制交替——默认 vs `TINYQWEN_MT_THREADS=1`，
   4B-33tok `first_token_ms` 各 4 轮取中位。
+
+---
+
+### fused_i4_batch_mm（2026-08-24，macOS M4，证伪归档——融合 W4A8 批量 matmul 干不过 AMX）
+
+- **优化栈**：qwen35_batch_prefill + dequant_mt 之上，把"反量化 fp32 + cblas_sgemm"
+  替换为融合 `matmul_i4_batched`（`runtime/qwen_forward_prefill_qwen35.cpp`）。
+- **是什么**：权重 i4 只读一遍、就地解包成 (q-8) int8，激活逐 token 对称量化
+  int8，用 SDOT 一次算完全部 N 个 token；行切分常驻线程池并行。意图是省掉
+  dequant 写 fp32 + sgemm 读 fp32 的往返（8B/权重 → 0.5625B/权重）。
+- **假设**：批量路径访存大头是 fp32 往返，省掉它应显著提速。
+- **结果**（同二进制交替 3 轮中位，融合默认关、`TINYQWEN_FUSED_MM` 开）：
+  - 4B-61tok：dequant+sgemm **1174ms** vs 融合 **1675ms** = **0.70×（更慢）**
+  - 4B-33tok：1056 vs 1094 = 0.97×（≈持平）
+  - 0.8B-33tok：149 vs 195 = 0.77×（更慢）
+  - **N 越大越亏**——与"省访存应随 N 摊薄越来越好"的预期相反，说明瓶颈
+    不在访存而在算力：手写 NEON SDOT 的有效吞吐远低于 AMX 的 fp32 GEMM。
+- **验证（数值是对的，慢不是错）**：
+  - 128 单测全过（新增 `matmul_i4_batched_matches_naive_w4a8`，与朴素 W4A8
+    参考逐 token 对照 max_err < 1e-4）；
+  - 真模型 4B 33/61-token 融合批量 vs 逐 token（sdot4，同为 W4A8）**逐位一致**
+    ——顺带消除了"批量 fp32 激活 / decode W4A8"的口径不一致（若启用融合，
+    批量与 decode 数值统一）。
+- **结论**：默认关闭融合路径（`do_gemm` 仅在 `TINYQWEN_FUSED_MM` 时启用），
+  保持 dequant+sgemm 为正式路径。代码与单测保留，供后续（如 AMX int8 可用、
+  或无 Accelerate 平台）复用。
+- **意外 / 教训**：
+  1. **省访存 ≠ 提速**：当原路径已被 AMX 这种专用硬件加速到算力主导时，
+     用通用 NEON 重写即使砍 14× 访存也追不回算力差距。优化前先判断目标是
+     访存墙还是算力墙（本例 dequant_mt 一条已提示"瓶颈是 sgemm 小 N 访存"，
+     但真正卡住的是 AMX 的算力，访存只是表象）。
+  2. 调研确认 **Accelerate 无 fp16/int8 GEMM**（cblas 仅 s/d/c/z，无 hgemm），
+     故"反量化到 fp16 减半流量"路线同样走不通——批量 prefill 的 GEMM 只能
+     吃 fp32 AMX，除非自研更优 kernel 或换后端。
+  3. 批量 prefill TTFT 到此基本触顶（4B-61tok ~1.15s），剩余大头是
+    AMX-sgemm（~77%）与单线程 GDN 递归扫描（~20%，跨 token 顺序依赖难并行）。
+- **复现**：`TINYQWEN_FUSED_MM=1 ./build/runtime/tinyqwen ... --profile-out`，
+  对照不设该变量，各 3 轮取中位。
 
 ---
 

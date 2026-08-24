@@ -581,3 +581,38 @@ TEST(dequant_i4_to_f32_parallel_pool_path) {
         TQ_FAIL("dequant_i4_to_f32 pool max_err=" + std::to_string(max_err));
     }
 }
+
+// ---------------------------------------------------------------------------
+// matmul_i4_batched（融合 W4A8 批量 matmul）
+//
+// 逐 token 与既有朴素 W4A8 参考（matvec_i4_w4a8_naive，同量化方案）对比：
+// 同一方案下每组的 A*dot - C*xqsum 计算与累加顺序一致，应几乎逐位相同。
+// 覆盖行并行（M 足够大走线程池）与多 token。
+// ---------------------------------------------------------------------------
+TEST(matmul_i4_batched_matches_naive_w4a8) {
+    const int M = 512, K = 384, N = 5, G = 64;   // M*K=196608，行并行阈值附近
+    const std::vector<float> w = random_vec(static_cast<size_t>(M) * K, 901);
+    const std::vector<uint8_t> packed = pack_i4_rtn(w, M, K, G);
+    // X [K, N] token 主序
+    const std::vector<float> X = random_vec(static_cast<size_t>(K) * N, 902);
+    std::vector<float> Y(static_cast<size_t>(M) * N, 0.0f);
+    std::vector<int8_t> xq; std::vector<float> ax; std::vector<int32_t> xs;
+    const bool ok = tinyqwen::matmul_i4_batched(packed.data(), X.data(), Y.data(),
+                                                 M, K, N, G, xq, ax, xs);
+    if (!ok) return;   // 平台无 dotprod，跳过
+    // 逐 token 对照朴素参考
+    double max_err = 0.0;
+    for (int n = 0; n < N; ++n) {
+        std::vector<float> x_n(K);
+        for (int k = 0; k < K; ++k) x_n[k] = X[k + static_cast<size_t>(n) * K];
+        const std::vector<float> ref = matvec_i4_w4a8_naive(packed, x_n, M, K, G);
+        for (int m = 0; m < M; ++m) {
+            const double err = std::fabs(static_cast<double>(Y[m + static_cast<size_t>(n) * M])
+                                         - ref[m]);
+            max_err = std::max(max_err, err);
+        }
+    }
+    if (max_err >= 1e-4) {
+        TQ_FAIL("matmul_i4_batched max_err=" + std::to_string(max_err));
+    }
+}

@@ -55,12 +55,14 @@
 
 - INT4 继续：sdot4 已兑现硬件组头转换（4B 46.9→36.5 ms/tok）；TTFT 侧已跳过
   非末位 prefill logits（1.14×）+ Qwen3.5 批量 prefill GEMM 化（4B-61tok 1.72×、
-  0.8B-33tok 1.38×）+ 反量化并行化（1.08×）；实测批量路径真正瓶颈 = sgemm
-  小 N 访存（反量化写 fp32 + 读 fp32 = 8B/权重），下一刀候选 =
-  **反量化到 fp16**（写流量减半，需 fp16 GEMM 后端）/ 融合 GEMM 调用
-  （gate+up 拼接）/ 调研 ACCELERATE_NEW_LAPACK 新接口；4-row 内循环 /
-  i4 gate_up·qkv 融合 / 激活量化 SIMD 仍是 decode 侧候选；Android 真机验证
-  sdot3/sdot4 与批量 prefill 未做（无 BLAS 后端时自动回退逐 token）；
+  0.8B-33tok 1.38×）+ 反量化并行化（1.08×）。批量 prefill 到此基本触顶：
+  **已调研确认两条路走不通**——① Accelerate 无 fp16/int8 GEMM（cblas 仅
+  s/d/c/z），"反量化到 fp16 减半流量"不可行；② 融合 W4A8 批量 matmul 实测
+  更慢（0.70×，手写 NEON SDOT 干不过 AMX，证伪归档，代码保留 `TINYQWEN_FUSED_MM`）。
+  剩余大头 = AMX-sgemm（~77%）+ 单线程 GDN 递归扫描（~20%，跨 token 顺序
+  依赖难并行）。4-row 内循环 / i4 gate_up·qkv 融合 / 激活量化 SIMD 仍是
+  decode 侧候选；Android 真机验证 sdot3/sdot4 与批量 prefill 未做
+  （无 BLAS 后端时自动回退逐 token）；
 - INT8 weight-only reference quantization；
 - KronQ packing；
 - GPTQ / AWQ 等量化算法（接入流程见 `quantization_guide.md`）；

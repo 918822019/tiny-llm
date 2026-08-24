@@ -78,6 +78,19 @@ namespace tinyqwen {
     // -------------------------------------------------------------------------
     void dequant_i4_to_f32(const uint8_t *w, float *dst, int M, int K, int group_size);
 
+    // -------------------------------------------------------------------------
+    // matmul_i4_batched: 融合 W4A8 批量 matmul（Qwen3.5 批量 prefill 用）
+    //
+    // Y[M,N] = dequant(W_i4[M,K]) @ X[K,N]，一次算完 N 个 token（token 主序）。
+    // 数值方案与 decode 的 sdot4 matvec 完全一致（W4A8：权重 (q-8)、激活对称
+    // int8、逐组 scale/zero 修正），因此批量与逐 token 逐位可比。
+    // 仅 aarch64+dotprod 可用，否则返回 false（调用方回退 dequant+sgemm）。
+    // xq / ax_scale / xqsum 为调用方提供的可复用 workspace。
+    // -------------------------------------------------------------------------
+    bool matmul_i4_batched(const void *w, const float *x, float *y, int M, int K, int N,
+                           int group_size, std::vector<int8_t> &xq,
+                           std::vector<float> &ax_scale, std::vector<int32_t> &xqsum);
+
     class QwenModel {
     public:
         // ---------------------------------------------------------------------
@@ -433,6 +446,10 @@ namespace tinyqwen {
             std::vector<float> gate;     // FFN gate [inter, N]
             std::vector<float> up;       // FFN up [inter, N]
             std::vector<float> deq;      // 权重反量化 fp32 scratch [max M*K]
+            // ---- 融合 W4A8 批量 matmul 的激活量化 workspace ----
+            std::vector<int8_t> xq;      // int8 激活 [K, N]（token 主序）
+            std::vector<float> ax_scale; // 每 token 激活量化 scale [N]
+            std::vector<int32_t> xqsum;  // 每 token×组 激活和 [N * gpr]
         };
         BatchPrefillBufs bp_;
         bool batch_prefill_enabled_ = true;  // --no-batch-prefill 可关闭
