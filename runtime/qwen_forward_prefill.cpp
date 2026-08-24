@@ -53,6 +53,7 @@ namespace tinyqwen {
                 out->values[i] = logits[idx[i]];
             }
         }
+
     } // namespace
 
     // =========================================================================
@@ -265,6 +266,31 @@ namespace tinyqwen {
         }
 
         // =====================================================================
+        // Step 3a（PPL 模式）: 全位置 norm + lm_head + 交叉熵
+        // =====================================================================
+        // ppl_mode_ 下不做生成，而是对每个位置 i 计算 logits 并对目标
+        // token_ids[i+1] 累加 log_softmax（i = 0..n-2，共 n-1 个计分位置）。
+        if (ppl_mode_) {
+            ScopedTimer t(prof, "ppl_all_positions");
+            for (int i = 0; i < n - 1; ++i) {
+                const float *h = hid_batch.data() + static_cast<size_t>(i) * hidden;
+                backend_->rmsnorm(h, final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
+                if (lm_head_is_f32_) {
+                    matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                               logits_.data(), vocab, hidden);
+                } else if (lm_head_is_f16_) {
+                    matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
+                               logits_.data(), vocab, hidden);
+                } else {
+                    mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+                }
+                ppl_sum_logprob_ += log_softmax_at(logits_.data(), vocab, token_ids[i + 1]);
+                ++ppl_count_;
+            }
+            return 0; // PPL 模式不产出下一 token
+        }
+
+        // =====================================================================
         // Step 3: 最终 norm + lm_head（仅取最后一个 token 的 hidden state）
         // =====================================================================
         // 批量 prefill 只关心最后一个 token 的输出（即第一个生成 token）
@@ -309,4 +335,23 @@ namespace tinyqwen {
         token_count_ += n;
         return next;
     }
+    // =========================================================================
+    // QwenModel::forward_ppl() — 批量 prefill + 全位置交叉熵（困惑度）
+    // =========================================================================
+    // 置 ppl_mode_ 后复用 forward_prefill 的层计算；其 Step 3a 分支完成
+    // 全位置 norm + lm_head + log_softmax 累加。返回平均 NLL。
+    double QwenModel::forward_ppl(const int *token_ids, int n, long *out_count) {
+        ppl_mode_ = true;
+        ppl_sum_logprob_ = 0.0;
+        ppl_count_ = 0;
+        if (cfg_.model_type == ModelType::kQwen35) {
+            forward_prefill_qwen35_batch(token_ids, n, nullptr, 0); // Qwen3.5 批量路径
+        } else {
+            forward_prefill(token_ids, n, nullptr, 0);              // Qwen2.x
+        }
+        ppl_mode_ = false;
+        if (out_count) *out_count = ppl_count_;
+        return ppl_count_ > 0 ? -ppl_sum_logprob_ / static_cast<double>(ppl_count_) : 0.0;
+    }
+
 } // namespace tinyqwen

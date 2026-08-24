@@ -17,10 +17,24 @@
 //   - 每个 kernel 在 tests/ 都有小 shape 单元测试。
 // ============================================================================
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
 namespace tinyqwen {
+    // =========================================================================
+    // log_softmax 在 target 处的取值（数值稳定：先减最大值）
+    // = logits[target] - logsumexp(logits)。PPL 评测（forward_ppl）用它对
+    // 每个位置的 logits 按目标 token 计负对数似然。
+    // =========================================================================
+    inline double log_softmax_at(const float *logits, int vocab, int target) {
+        float mx = logits[0];
+        for (int v = 1; v < vocab; ++v) if (logits[v] > mx) mx = logits[v];
+        double sum = 0.0;
+        for (int v = 0; v < vocab; ++v) sum += std::exp(static_cast<double>(logits[v]) - mx);
+        return (static_cast<double>(logits[target]) - mx) - std::log(sum);
+    }
+
     // =========================================================================
     // IEEE binary16（half）<-> float32 的可移植位操作转换
     //

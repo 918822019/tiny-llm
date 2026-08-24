@@ -28,6 +28,7 @@
 // ============================================================================
 
 #include <chrono>       // 高精度计时（std::chrono::steady_clock）
+#include <cmath>         // std::exp（PPL）
 #include <cstdio>        // 标准输入输出（fprintf, printf, fflush）
 #include <cstdlib>       // 标准库（atoi, exit）
 #include <cstring>       // C 字符串操作
@@ -65,6 +66,8 @@ namespace {
         bool no_fuse_qkv = false;       // 禁用 Q/K/V 投影融合
         bool no_batch_prefill = false;  // 禁用 Qwen3.5 批量 prefill（A/B 对照用）
         bool kv_fp16 = false;           // KV cache 用 fp16 存储（内存/带宽减半，opt-in）
+        bool ppl = false;               // PPL 模式：teacher-forcing 困惑度（不生成）
+        std::string ppl_jsonl;          // PPL 多序列输入 JSONL（每行 {"tokens": [...]}）
         std::string config;             // 配置文件路径（可选）
         std::string matvec_impl;        // matvec 实现选择；空 = 未指定
         std::string ops_impl;           // 非 matvec 算子实现；空 = 未指定
@@ -123,6 +126,8 @@ namespace {
             else if (a == "--tokens") out->tokens_csv = value("--tokens");
             else if (a == "--tokens-json") out->tokens_json = value("--tokens-json");
             else if (a == "--batch-tokens-jsonl") out->batch_tokens_jsonl = value("--batch-tokens-jsonl");
+            else if (a == "--ppl") out->ppl = true;
+            else if (a == "--ppl-jsonl") out->ppl_jsonl = value("--ppl-jsonl");
             else if (a == "--batch-out") out->batch_out = value("--batch-out");
             else if (a == "--max-new-tokens") out->max_new_tokens = std::atoi(value("--max-new-tokens").c_str());
             else if (a == "--max-seq-len") out->max_seq_len = std::atoi(value("--max-seq-len").c_str());
@@ -156,9 +161,11 @@ namespace {
         // 三种输入模式必须且只能提供一个
         const bool has_batch = !out->batch_tokens_jsonl.empty();
         const int modes = (!out->tokens_csv.empty()) + (!out->tokens_json.empty()) + has_batch;
-        if (modes != 1) {
+        const bool ppl_jsonl_only = out->ppl && !out->ppl_jsonl.empty();
+        if (modes != 1 && !(ppl_jsonl_only && modes == 0)) {
             std::fprintf(stderr, "error: provide exactly one of "
-                                 "--tokens / --tokens-json / --batch-tokens-jsonl\n");
+                                 "--tokens / --tokens-json / --batch-tokens-jsonl"
+                                 "（--ppl --ppl-jsonl 可单独使用）\n");
             return false;
         }
         if (has_batch) {
@@ -561,11 +568,16 @@ int main(int argc, char **argv) {
     };
 
     // prompt 的 token ids（由 Python 侧 tools/tokenize_prompt.py 生成）
-    std::vector<int> tokens =
-            args.tokens_csv.empty() ? parse_tokens_json(args.tokens_json) : parse_csv(args.tokens_csv);
-    if (tokens.empty()) {
-        std::fprintf(stderr, "error: empty token list\n");
-        return 2;
+    // --ppl --ppl-jsonl 模式下序列来自 ppl_jsonl，此处无需解析
+    std::vector<int> tokens;
+    const bool ppl_jsonl_only = args.ppl && !args.ppl_jsonl.empty();
+    if (!ppl_jsonl_only) {
+        tokens = args.tokens_csv.empty() ? parse_tokens_json(args.tokens_json)
+                                         : parse_csv(args.tokens_csv);
+        if (tokens.empty()) {
+            std::fprintf(stderr, "error: empty token list\n");
+            return 2;
+        }
     }
     // 融合开关：CLI > 配置文件 > 默认 true
     const bool fuse_gate_up = args.no_fuse_gate_up ? false
@@ -604,6 +616,47 @@ int main(int argc, char **argv) {
         }
         std::printf("\n");
     };
+
+    // ---- PPL 模式：teacher-forcing 困惑度（不生成）----
+    if (args.ppl) {
+        std::vector<std::vector<int>> seqs;
+        if (!args.ppl_jsonl.empty()) {
+            seqs = parse_batch_jsonl(args.ppl_jsonl);
+        } else {
+            seqs.push_back(tokens); // 单序列：来自 --tokens / --tokens-json
+        }
+        double weighted_nll = 0.0; // Σ (nll_i × count_i)
+        long total_count = 0;
+        for (size_t si = 0; si < seqs.size(); ++si) {
+            const std::vector<int> &tok = seqs[si];
+            const int n = static_cast<int>(tok.size());
+            if (n < 2) {
+                std::fprintf(stderr, "[ppl] seq %zu 太短(%d)，跳过\n", si, n);
+                continue;
+            }
+            if (n > args.max_seq_len) {
+                std::fprintf(stderr, "error: seq %zu 长度 %d > max_seq_len %d（加大 --max-seq-len）\n",
+                             si, n, args.max_seq_len);
+                return 2;
+            }
+            model->reset();
+            model->set_prompt_len(n);
+            long cnt = 0;
+            const double nll = model->forward_ppl(tok.data(), n, &cnt);
+            weighted_nll += nll * static_cast<double>(cnt);
+            total_count += cnt;
+        }
+        if (total_count == 0) {
+            std::fprintf(stderr, "error: 没有可计分的 token\n");
+            return 1;
+        }
+        const double mean_nll = weighted_nll / static_cast<double>(total_count);
+        std::printf("ppl_nll %.6f\n", mean_nll);
+        std::printf("ppl %.6f\n", std::exp(mean_nll));
+        std::printf("ppl_tokens %ld\n", total_count);
+        if (logits_out) std::fclose(logits_out);
+        return 0;
+    }
 
     // ---- prefill 阶段 ----
     int next = 0;

@@ -166,6 +166,18 @@ namespace tinyqwen {
         int forward_prefill(const int *token_ids, int n, TopKResult *topk = nullptr, int topk_k = 5);
 
         // ---------------------------------------------------------------------
+        // forward_ppl: 批量 prefill + 全位置 lm_head + 交叉熵，计算困惑度
+        //
+        // 对 token_ids[0..n-1] 做 teacher-forcing：位置 i 的 logits 预测
+        // token_ids[i+1]，累加 log_softmax（i=0..n-2，共 n-1 个计分位置）。
+        // 复用批量 prefill 的层计算（GEMM），仅末段对每个位置做 norm+lm_head+CE。
+        //
+        // 返回平均负对数似然 NLL = -Σlog p / count；*out_count 输出计分位置数。
+        // PPL = exp(NLL) 由调用方计算。调用前需 reset()。
+        // ---------------------------------------------------------------------
+        double forward_ppl(const int *token_ids, int n, long *out_count);
+
+        // ---------------------------------------------------------------------
         // forward_prefill_qwen35_batch: Qwen3.5 批量 prefill（GEMM 路径）
         //
         // 权重每层只读一遍（i4 按组反量化到 fp32 / f16 转换 / f32 直用），
@@ -187,6 +199,11 @@ namespace tinyqwen {
 
         // 开关：--no-batch-prefill 关闭（A/B 对照与回退用）
         void set_batch_prefill(bool v) { batch_prefill_enabled_ = v; }
+
+        // PPL 累加器（forward_prefill 在 ppl_mode_ 下写入）
+        bool ppl_mode_ = false;
+        double ppl_sum_logprob_ = 0.0;
+        long ppl_count_ = 0;
 
         // ---------------------------------------------------------------------
         // reset: 清空 KV cache 和 token 计数

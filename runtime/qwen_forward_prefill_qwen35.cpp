@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "dispatch.h"  // matvec_f32, argmax
+#include "ref_ops.h"   // log_softmax_at（PPL）
 #include "ref_ops.h"   // half_to_float
 
 #if defined(__APPLE__)
@@ -837,6 +838,31 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
             for (size_t j = 0; j < static_cast<size_t>(hidden) * N; ++j)
                 bp.hid.data()[j] += bp.out.data()[j];
         }
+    }
+
+    // =====================================================================
+    // Step 3a（PPL 模式）: 全位置 final norm + lm_head + 交叉熵
+    // =====================================================================
+    if (ppl_mode_) {
+        ScopedTimer t(prof, "ppl_all_positions");
+        for (int i = 0; i < n - 1; ++i) {
+            const float *h = bp.hid.data() + static_cast<size_t>(i) * hidden;
+            backend_->rmsnorm(h, final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
+            if (lm_head_is_f32_) {
+                matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                           logits_.data(), vocab, hidden);
+            } else if (lm_head_is_f16_) {
+                matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
+                           logits_.data(), vocab, hidden);
+            } else {
+                mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+            }
+            ppl_sum_logprob_ += log_softmax_at(logits_.data(), vocab, token_ids[i + 1]);
+            ++ppl_count_;
+        }
+        kv_.advance(n);
+        token_count_ += n;
+        return 0; // PPL 模式不产出下一 token
     }
 
     // =====================================================================
