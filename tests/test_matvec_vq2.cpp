@@ -196,6 +196,16 @@ TEST(matvec_vq2_neon_mr_mt_matches_naive_small) { check_matvec_vq2_impl("neon_mr
 TEST(matvec_vq2_neon_mr_mt_matches_naive_mt)    { check_matvec_vq2_impl("neon_mr_mt", 512, 896, 1e-2); }
 TEST(matvec_vq2_neon_mr_mt_matches_naive_tail)  { check_matvec_vq2_impl("neon_mr_mt", 513, 896, 1e-2); }
 
+// neon_mr_mt_wl（+索引 32 位字加载，内置尺寸门：索引区 ≥8MB 才走字加载体）：
+// 小形状覆盖 块对齐/块尾(50%4=2)/(13%4=1) + 行起点非 4 对齐（走字节体）；
+// 16384×2048（索引区 8.4MB）过门，覆盖字加载体
+TEST(matvec_vq2_neon_mr_mt_wl_matches_naive_small) { check_matvec_vq2_impl("neon_mr_mt_wl", 32, 128, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_wl_matches_naive_mt)    { check_matvec_vq2_impl("neon_mr_mt_wl", 512, 896, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_wl_matches_naive_tail)  { check_matvec_vq2_impl("neon_mr_mt_wl", 513, 896, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_wl_matches_naive_unaligned) { check_matvec_vq2_impl("neon_mr_mt_wl", 33, 200, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_wl_matches_naive_blk13) { check_matvec_vq2_impl("neon_mr_mt_wl", 100, 52, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_wl_matches_naive_wlbody) { check_matvec_vq2_impl("neon_mr_mt_wl", 16384, 2048, 1e-2); }
+
 // ---------------------------------------------------------------------------
 // pair / qkv 融合入口（v1 拆成多次 matvec_vq2）结果须与独立 naive 一致
 // ---------------------------------------------------------------------------
