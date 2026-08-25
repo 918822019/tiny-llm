@@ -137,6 +137,10 @@ namespace tinyqwen {
                     std::memcpy(dst, static_cast<const float *>(embed_) +
                                     static_cast<size_t>(tid) * hidden,
                                 hidden * sizeof(float));
+                } else if (embed_dtype_ == Dtype::kI4) {
+                    // 紧凑 INT4 embed：反量化该行
+                    dequant_i4_row(static_cast<const uint8_t *>(embed_), tid, hidden,
+                                   group_size_, dst);
                 } else {
                     // f16 文件：逐元素转为 fp32
                     const uint16_t *row = static_cast<const uint16_t *>(embed_) +
@@ -281,6 +285,9 @@ namespace tinyqwen {
                 } else if (lm_head_is_f16_) {
                     matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                                logits_.data(), vocab, hidden);
+                } else if (lm_head_is_i4_) {
+                    matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
+                              logits_.data(), vocab, hidden, group_size_);
                 } else {
                     mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
                 }
@@ -310,6 +317,10 @@ namespace tinyqwen {
                 // VQ2 tied（embed 存 f16）：lm_head 走 f16 matvec
                 matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                            logits_.data(), vocab, hidden);
+            } else if (lm_head_is_i4_) {
+                // 紧凑 INT4 tied embed：lm_head 走 i4 matvec
+                matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
+                          logits_.data(), vocab, hidden, group_size_);
             } else {
                 // 正常路径：通过 backend 的 matvec
                 mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);

@@ -132,7 +132,7 @@ namespace tinyqwen {
             const bool ok = (dtype_ == Dtype::kI4)
                     ? (t->dtype == Dtype::kI4 || t->dtype == Dtype::kF32)
                     : (t->dtype == Dtype::kVQ2 || t->dtype == Dtype::kF32 ||
-                       t->dtype == Dtype::kF16);
+                       t->dtype == Dtype::kF16 || t->dtype == Dtype::kI4);
             if (!ok) {
                 if (err)
                     *err = "tensor " + name + " dtype mismatch: quant file allows quant/f32, got " +
@@ -400,6 +400,7 @@ namespace tinyqwen {
                 // lm_head 投影按 embed 的真实 dtype 路由（i4 embed=f32；vq2 embed 可为 f16）
                 if (m->embed_dtype_ == Dtype::kF32) m->lm_head_is_f32_ = true;
                 else if (m->embed_dtype_ == Dtype::kF16) m->lm_head_is_f16_ = true;
+                else if (m->embed_dtype_ == Dtype::kI4) m->lm_head_is_i4_ = true;
             }
         } else {
             // 非 tied embeddings：lm_head 必须独立存在

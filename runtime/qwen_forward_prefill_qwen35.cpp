@@ -648,6 +648,9 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
                 std::memcpy(dst, static_cast<const float *>(embed_) +
                                          static_cast<size_t>(tid) * hidden,
                             hidden * sizeof(float));
+            } else if (embed_dtype_ == Dtype::kI4) {
+                dequant_i4_row(static_cast<const uint8_t *>(embed_), tid, hidden,
+                               group_size_, dst);
             } else {
                 const uint16_t *row = static_cast<const uint16_t *>(embed_) +
                                       static_cast<size_t>(tid) * hidden;
@@ -854,6 +857,9 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
             } else if (lm_head_is_f16_) {
                 matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                            logits_.data(), vocab, hidden);
+            } else if (lm_head_is_i4_) {
+                matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
+                          logits_.data(), vocab, hidden, group_size_);
             } else {
                 mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
             }
@@ -882,6 +888,9 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
         } else if (lm_head_is_f16_) {
             matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
                        logits_.data(), vocab, hidden);
+        } else if (lm_head_is_i4_) {
+            matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
+                      logits_.data(), vocab, hidden, group_size_);
         } else {
             mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
         }

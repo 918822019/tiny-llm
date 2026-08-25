@@ -159,4 +159,35 @@ namespace tinyqwen {
                                      const uint16_t *v_cache, int seq_len, int max_seq_len,
                                      int n_heads, int n_kv_heads, int head_dim, float scale,
                                      float *out);
+
+    // =========================================================================
+    // dequant_i4_row：把 INT4 packed 嵌入表的一行反量化为 fp32
+    // （INT4 紧凑 embed 查表用；布局与 tiny_format.h 的 i4 packing 一致：
+    //   每组 [scale_fp16(2B)|zero_fp16(2B)|packed_uint4(gs/2 B)]，低 nibble 在前）
+    //   embed: [vocab, dim] 逐行 i4 packed；row_bytes = ceil(dim/gs)*(4+gs/2)
+    // =========================================================================
+    inline void dequant_i4_row(const uint8_t *embed, int row, int dim, int group_size,
+                               float *out) {
+        const int groups = (dim + group_size - 1) / group_size;
+        const int group_total = 4 + group_size / 2;
+        const uint8_t *r = embed + static_cast<size_t>(row) * groups * group_total;
+        int col = 0;
+        for (int g = 0; g < groups; ++g) {
+            const uint8_t *gp = r + g * group_total;
+            uint16_t scale_h, zero_h;
+            std::memcpy(&scale_h, gp, 2);
+            std::memcpy(&zero_h, gp + 2, 2);
+            const float scale = half_to_float(scale_h);
+            const float zero = half_to_float(zero_h);
+            const uint8_t *packed = gp + 4;
+            const int elems = (col + group_size <= dim) ? group_size : (dim - col);
+            for (int i = 0; i < elems; ++i) {
+                const uint8_t v = (i % 2 == 0) ? (packed[i / 2] & 0x0F)
+                                               : ((packed[i / 2] >> 4) & 0x0F);
+                out[col + i] = (static_cast<float>(v) - zero) * scale;
+            }
+            col += group_size;
+        }
+    }
+
 } // namespace tinyqwen

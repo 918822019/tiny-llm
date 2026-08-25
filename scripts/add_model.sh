@@ -12,7 +12,8 @@
 #   ./scripts/add_model.sh <HF 模型目录> [选项]
 #
 # 选项：
-#   --dtype i4|f16      导出精度（默认 i4）
+#   --dtype i4|f16|vq2  导出精度（默认 i4；vq2=朴素 2-bit 块 VQ，验证链路用）
+#   --vq2-iters N       vq2 k-means 迭代（默认 8）；--embed-i4 导出后把 embed 压 INT4
 #   --method hqq|rtn    i4 量化算法（默认 hqq；rtn 快好几倍，快速试跑用）
 #   --group-size N      i4 量化组大小（默认 64，须为 32 倍数）
 #   --workers N         i4 并行量化进程数（默认 0=自动）
@@ -42,6 +43,8 @@ DTYPE="i4"                                    # 导出精度
 METHOD="hqq"                                  # i4 量化算法
 GROUP_SIZE="64"                               # i4 量化组大小
 WORKERS="0"                                   # 并行度（0=自动）
+VQ2_ITERS="8"                                 # vq2 k-means 迭代次数
+EMBED_I4="0"                                  # vq2 导出后是否把 embed 压成 INT4
 PROMPT="请用三句话介绍一下量子计算的基本原理。"  # 冒烟 prompt
 SMOKE_TOKENS="32"                             # 冒烟生成长度
 
@@ -51,6 +54,8 @@ while [[ $# -gt 0 ]]; do
         --method)       METHOD="$2"; shift 2 ;;
         --group-size)   GROUP_SIZE="$2"; shift 2 ;;
         --workers)      WORKERS="$2"; shift 2 ;;
+        --vq2-iters)    VQ2_ITERS="$2"; shift 2 ;;
+        --embed-i4)     EMBED_I4="1"; shift ;;
         --prompt)       PROMPT="$2"; shift 2 ;;
         --smoke-tokens) SMOKE_TOKENS="$2"; shift 2 ;;
         -*)             echo "未知参数: $1" >&2; exit 1 ;;
@@ -108,8 +113,19 @@ case "$DTYPE" in
         time "$PY" tools/export_qwen_to_tiny.py \
             --model "$MODEL_DIR" --out "$OUT" --dtype f16
         ;;
+    vq2)
+        # 朴素块 VQ（k-means，无旋转）：2-bit 链路/格式验证用；精度受限
+        time "$PY" tools/export_qwen_to_tiny_vq2.py \
+            --model "$MODEL_DIR" --out "$OUT" --kmeans-iters "$VQ2_ITERS"
+        if [[ "$EMBED_I4" == "1" ]]; then
+            echo "      压缩 embed 为紧凑 INT4..."
+            "$PY" tools/quantize_embed_i4.py --in "$OUT" --out "$OUT.ei4" \
+                --group-size "$GROUP_SIZE"
+            mv "$OUT.ei4" "$OUT"
+        fi
+        ;;
     *)
-        echo "错误: 不支持的 dtype: $DTYPE（可选 i4 / f16）" >&2
+        echo "错误: 不支持的 dtype: $DTYPE（可选 i4 / f16 / vq2）" >&2
         exit 1
         ;;
 esac

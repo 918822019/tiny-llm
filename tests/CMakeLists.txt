@@ -17,6 +17,7 @@ add_executable(tinyqwen_tests
         test_matvec_i4.cpp      # INT4 matvec/matmul 专项测试
         test_matvec_vq2.cpp     # VQ2（2-bit 向量量化）matvec/pair/qkv/matmul 测试
         test_biip_rotate.cpp    # BiIP 激活旋转（分块快速 Hadamard）正确性测试
+        test_quant_ops.cpp      # 评测/量化 helper（log_softmax_at / dequant_i4_row）
         test_softmax_argmax.cpp # Softmax / Argmax 测试
         test_attention.cpp      # Attention decode 测试
         test_kv_cache.cpp       # KV Cache 内存管理测试

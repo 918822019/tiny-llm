@@ -428,6 +428,7 @@ namespace tinyqwen {
         int group_size_ = 0;          // INT4 量化 group size（kI4 时 > 0，否则 0）
         bool lm_head_is_f32_ = false; // tied 时 lm_head=embed（fp32），需走 f32 matvec
         bool lm_head_is_f16_ = false; // tied 时 lm_head=embed（fp16），需走 f16 matvec
+        bool lm_head_is_i4_ = false;  // tied 时 lm_head=embed（紧凑 INT4），需走 i4 matvec
         // embed 张量的真实 dtype（可与文件级 dtype_ 不同，如 vq2 文件里 embed 存 f16）。
         // embed 查表与 tied-lm_head 投影都按它路由，而不是按文件级 dtype_。
         Dtype embed_dtype_ = Dtype::kF32;

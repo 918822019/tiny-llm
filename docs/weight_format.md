@@ -114,6 +114,9 @@ o_proj 与 MLP 无 bias。bias 必须在 RoPE 之前加到 q/k/v 上。
 - **反量化**：`w[4b+j] = codebook[index_b][j]`（纯查表，零算术）。
 - **约束**：`cols` 必须被 d=4 整除；`nbytes == 2048 + rows*(cols/4)`。
 - **混合 dtype**：线性层走 VQ2；embed（INT4 量化后以 f16 存）/ norm / bias 保留原精度。
+- **embed 可选紧凑 INT4**：embed 默认 f16；用 `tools/quantize_embed_i4.py` 可转成
+  per-group INT4（dtype=kI4，组大小写进 header `quant_group_size`），查表走
+  `dequant_i4_row`、tied lm_head 走 `matvec_i4`。0.5B 模型 embed 272MB→~68MB。
 
 ### BiIP 旋转参数（旋转量化模型）
 

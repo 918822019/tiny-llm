@@ -233,9 +233,10 @@ namespace tinyqwen {
             } else if (static_cast<Dtype>(header_.dtype) == Dtype::kVQ2) {
                 if (e.dtype != static_cast<uint32_t>(Dtype::kVQ2) &&
                     e.dtype != static_cast<uint32_t>(Dtype::kF32) &&
-                    e.dtype != static_cast<uint32_t>(Dtype::kF16)) {
+                    e.dtype != static_cast<uint32_t>(Dtype::kF16) &&
+                    e.dtype != static_cast<uint32_t>(Dtype::kI4)) {
                     fail(err, "tensor #" + std::to_string(i) + ": vq2 file allows only "
-                              "vq2/f32/f16 tensors, got dtype " + std::to_string(e.dtype));
+                              "vq2/f32/f16/i4 tensors, got dtype " + std::to_string(e.dtype));
                     return false;
                 }
             } else {
@@ -437,6 +438,27 @@ namespace tinyqwen {
                 if (t.nbytes != expected) {
                     fail(err, "tensor '" + kv.first + "': vq2 nbytes mismatch, expected " +
                               std::to_string(expected) + " got " + std::to_string(t.nbytes));
+                    return false;
+                }
+            }
+            // INT4 紧凑 embed 校验（vq2 文件里 embed 可存 i4）
+            for (const auto &kv : tensors_) {
+                const TensorView &t = kv.second;
+                if (t.dtype != Dtype::kI4) continue;
+                if (t.ndim != 2) {
+                    fail(err, "tensor '" + kv.first + "': i4 embed must be 2D");
+                    return false;
+                }
+                const int gs = static_cast<int>(config_.quant_group_size);
+                if (gs <= 0) {
+                    fail(err, "vq2 file with i4 embed requires quant_group_size > 0");
+                    return false;
+                }
+                const uint64_t exp_i4 = t.shape[0] * i4_row_bytes(
+                    static_cast<int>(t.shape[1]), gs);
+                if (t.nbytes != exp_i4) {
+                    fail(err, "tensor '" + kv.first + "': i4 embed nbytes mismatch, expected " +
+                              std::to_string(exp_i4) + " got " + std::to_string(t.nbytes));
                     return false;
                 }
             }
