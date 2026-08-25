@@ -90,7 +90,7 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 2. **CMake**：把新 `.cpp` 加进 `kernels/CMakeLists.txt`。
    到此 `--matvec-impl neon` / `tinyqwen.conf` 即可选用。
 3. **正确性门禁**（第 5 节）：单测对齐 ref——**先证明算对了**。
-4. **测速 + 记录**（第 6、8 节）：
+4. **测速 + 记录**（第 6、7、9 节）：先用 `./scripts/bench_kernels.sh` 测 kernel 级加速比，再
    `./scripts/record.sh neon --extra-args "--matvec-impl neon"`，
    人工补全日志归因后 `commit_opt.sh` 提交。
 
@@ -113,9 +113,44 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 测试里切换实现必须断言成功：`EXPECT_TRUE(set_matvec_impl_by_name("neon"))`
 ——set 失败时 dispatch 会静默兜底到 ref，不断言就是假通过。
 
-## 6. 测量方法论
+## 6. 算子微基准管线（bench_kernels）
 
-### 6.1 固定负载：改负载 = 换尺子
+第 5 节的单测只证明"小 shape 算对了"；**生产形状上快了多少、对不对**，
+交给 `bench_kernels`：它枚举 dispatch 四套 matvec 注册表（vq2/i4/f16/f32）
+的全部已注册实现，每个实现 × 形状做**校验（对齐 ref）+ 计时**。
+
+```bash
+./scripts/bench_kernels.sh                  # 全族 × Qwen2.5-0.5B 形状，落 CSV 并对比基线
+./scripts/bench_kernels.sh --family vq2     # 只测一族（透传 bench_kernels 全部参数）
+./build/benchmarks/bench_kernels --out 4864 --in 896 --impls ref,neon   # 单形状点名
+```
+
+输出三元组（每个实现一行）：
+
+- **verdict**——同一份量化权重上对齐 `ref`：PASS（≤5e-4，浮点累加顺序级差异）/
+  TOL（≤5e-2，有损可接受，如 W4A8 激活量化）/ FAIL（算错）。
+  注意 `sdot5(_mt)` 是对称量化专用变体，基准用非对称随机权重，其 FAIL 为预期。
+- **ms/call、GB/s、GFLOP/s**——自适应迭代数（0.25s 预算/实现×形状，
+  `--budget-ms` 调）；权重字节口径与加载器一致（vq2 = 2048B 码本 + 1B/权重）。
+- **speedup**——相对同形状 ref；多线程变体受 `TINYQWEN_MT_THREADS` 控制。
+
+新变体的标准闭环（第 4 节流程第 4 步的展开）：
+
+1. 新 impl 自注册 → 自动被枚举，不改本管线；
+2. `./scripts/bench_kernels.sh --family <族>` → verdict 必须 PASS/TOL；
+3. 脚本自动对照 `benchmarks/results/kernels_baseline.csv`，标出 ±10% 以上的
+   ms/call 变化——小幅优化在这里就能看见，不必等端到端；
+4. 确认收益后再跑端到端 `record.sh` 记账。
+
+已知坑（实测踩过）：
+
+- **指针键缓存**：`sdot2` 按权重指针缓存预计算结果（`g_pre_cache`），运行时
+  权重常驻所以安全；任何"按指针缓存"的新内核，评测与使用方都必须保证权重
+  缓冲常驻、地址不复用，否则旧缓存命中 → 静默错值。
+
+## 7. 测量方法论
+
+### 8.1 固定负载：改负载 = 换尺子
 
 比较两次性能必须用**完全相同**的输入。`tools/bench.py` 把负载写死了：
 
@@ -126,7 +161,7 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 | 预热丢弃       | 前 4 个                               | 冷启动有抖动，丢掉才是稳态                |
 | batch / 采样 | batch=1、greedy                      | 排除随机性                        |
 
-### 6.2 中位数为主指标
+### 8.2 中位数为主指标
 
 单次测量受 CPU 频率波动、后台进程、温度降频影响。
 
@@ -138,7 +173,7 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 `record_optimization.py` 每遍取 27 个稳态 token 的中位数，再对多遍取
 "中位数的中位数"抗单次波动。
 
-### 6.3 同场 A/B：小幅优化的唯一可信判据
+### 8.3 同场 A/B：小幅优化的唯一可信判据
 
 **机器状态会漂移**（实测同配置跨天差 ~4–10%），所以：
 
@@ -147,7 +182,7 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
   升级 A/B 模式——每遍先测对照（同 binary、无额外参数，当前即 ref）
   再测变体，交错进行抗慢漂移，日志自动填 A/B 比值；
 - 日志同时记**两个**加速比：vs 原始基线（总共快多少）+ vs 上一配置
-  （这一步贡献多少）。叠加优化不能简单相乘（第 7 节）。
+  （这一步贡献多少）。叠加优化不能简单相乘（第 8 节）。
 
 配套机制：
 
@@ -156,18 +191,18 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 - **`record.sh --skip-verify`**：刚跑过门禁、快速迭代调参时跳过重复验证
   （默认每次都跑，别滥用）。
 
-### 6.4 测量纪律：一次只改一个变量
+### 7.4 测量纪律：一次只改一个变量
 
 想验证"INT8 量化让 matvec 变快"，就**只**改量化这一件事。同时改量化、
 线程数、布局，测出变快也不知道是谁的功劳——**无法归因，等于白做**。
 
-### 6.5 数字可追溯到代码版本
+### 7.5 数字可追溯到代码版本
 
 1. **每个优化单独一个 commit**（`commit_opt.sh` 把代码 + 日志放一个 commit）；
 2. bench.py 自动在日志记录 git commit；
 3. 里程碑打 tag（如 `v0.1-fp32-baseline`）。
 
-### 6.6 解释"为什么提升"：归因四分类
+### 7.6 解释"为什么提升"：归因四分类
 
 | 类别   | 例子                                    |
 |------|---------------------------------------|
@@ -180,7 +215,7 @@ forward ──> IBackend::matvec(WeightTensor) ──CPUBackend──> matvec_f1
 说明 matvec 是主攻方向。top op 是指南针——每加一个优化重新 profile，
 瓶颈会转移（Amdahl 的另一面）。
 
-### 6.7 指令级定位 + 快路径验尸（sdot4 一轮学到的）
+### 7.7 指令级定位 + 快路径验尸（sdot4 一轮学到的）
 
 **top op 只告诉你"哪个算子慢"，不告诉你"慢在哪条指令"。** 端侧 kernel
 走到深水区（单核效率 < 能力的 30%）时，用系统采样器下到指令级：
@@ -211,9 +246,9 @@ otool -tV <bin> > /tmp/dis.txt      # 偏移 = 采样地址 − 基址
 **诊断先于设计**：本轮若按原计划直接做 4-row 内循环，预期 ~10%；
 sample 把真正的瓶颈（软件转换）指出来后，一条守卫修正拿到单核 1.35×。
 
-## 7. 进阶：多个优化叠加时怎么评测
+## 8. 进阶：多个优化叠加时怎么评测
 
-### 7.1 最大的坑：加速比不能直接相乘
+### 8.1 最大的坑：加速比不能直接相乘
 
 "NEON 2× × 多线程 4× = 8×"实测往往达不到，因为多个优化可能抢同一资源。
 
@@ -225,20 +260,20 @@ sample 把真正的瓶颈（软件转换）指出来后，一条守卫修正拿�
 例子：NEON 让每线程算得更快 → 更快撞到**内存带宽**墙 → 再加线程也搬不进
 更多数据 → 多线程收益打折。**组合收益必须实测，不能拍脑袋相乘。**
 
-### 7.2 用"优化栈"记录
+### 8.2 用"优化栈"记录
 
 每个配置是"基线 + 若干优化"组成的栈。只测增量序列：
 基线 → +A → +A+B → +A+B+C，每步记 vs-上一配置（这正是最终的真实叠加顺序）。
 只有**怀疑某两个优化打架**时才专门测那一对算交互系数。
 不要为"全面"去测所有 2^N 组合。
 
-### 7.3 每个配置可独立复现
+### 8.3 每个配置可独立复现
 
 - 每个配置一个独立 commit/tag，能 checkout 回去复测；
 - 换配置**必须重新干净编译**，别让旧二进制混入别的优化；
 - 配置命名清晰：`fp32-scalar` / `fp32-neon` / `fp32-neon-mt4` / `int8-neon-mt4`。
 
-## 8. 工具速查
+## 9. 工具速查
 
 ### 本地（macOS / Linux）
 
@@ -274,7 +309,7 @@ sample 把真正的瓶颈（软件转换）指出来后，一条守卫修正拿�
 | `tools/profile_diff.py <before> <after>` | Profile 对比 | op 级 delta + 分类汇总 + top 改善/回退               |
 | `tools/visualize.py all <profile.json>`  | 可视化        | 火焰图 + token 时序 + op 占比 + 优化历史趋势，独立 HTML 零依赖 |
 
-## 9. 当前状态
+## 10. 当前状态
 
 - 已接入 dispatch 的算子：**matvec**（唯一热点，优化主攻方向）。
   已注册实现构成一条**归因阶梯**（每层只加一个技术，便于 A/B 归因）：

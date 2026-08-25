@@ -85,3 +85,10 @@ if (TINYQWEN_BUILD_TESTS)
     enable_testing()                    # 启用 CTest 测试框架
     add_subdirectory(tests)             # 构建测试子目录
 endif ()
+
+# 算子级微基准（可选）：枚举各注册表全部 matvec 实现，校验 + 计时对比。
+# 新增算子变体自注册后即自动纳入评测，见 benchmarks/bench_kernels.cpp。
+option(TINYQWEN_BUILD_BENCHMARKS "Build tinyqwen kernel benchmarks" ON)
+if (TINYQWEN_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif ()
