@@ -59,6 +59,9 @@ add_library(tinyqwen_kernels OBJECT
         # 反量化纯查表（2.0bit 部署洁净点）。ref=double 累加锚；neon=fp32+4路ILP。
         matvec/matvec_vq2_ref.cpp
         matvec/matvec_vq2_neon.cpp
+        # neon_mr = neon + 4 行并行（独立 FMA 链隐藏延迟 + 共享 x4 加载），
+        # 归因阶梯下一层（对齐 i4 族 sdot2 的 multi-row 路径；仅 aarch64）。
+        matvec/matvec_vq2_neon_mr.cpp
         # BiIP 激活旋转（推理时对激活施加旋转配对逆变换，配合旋转量化权重）。
         biip/biip_rotate.cpp
         # W4A8 SDOT：权重解包 int8 + 激活 int8 对称量化 + SDOT 整数点积（armv8.2

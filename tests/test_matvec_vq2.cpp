@@ -184,6 +184,12 @@ TEST(matvec_vq2_neon_matches_naive_small) { check_matvec_vq2_impl("neon", 32, 12
 TEST(matvec_vq2_neon_matches_naive_mid)   { check_matvec_vq2_impl("neon", 96, 384, 1e-2); }
 TEST(matvec_vq2_neon_matches_naive_big)   { check_matvec_vq2_impl("neon", 256, 896, 1e-2); }
 
+// neon_mr（4 行并行）：与 naive 对齐；含非 4 倍数行数（尾部单行路径）
+TEST(matvec_vq2_neon_mr_matches_naive_small) { check_matvec_vq2_impl("neon_mr", 32, 128, 1e-2); }
+TEST(matvec_vq2_neon_mr_matches_naive_mid)   { check_matvec_vq2_impl("neon_mr", 96, 384, 1e-2); }
+TEST(matvec_vq2_neon_mr_matches_naive_big)   { check_matvec_vq2_impl("neon_mr", 256, 896, 1e-2); }
+TEST(matvec_vq2_neon_mr_matches_naive_tail)  { check_matvec_vq2_impl("neon_mr", 33, 200, 1e-2); }
+
 // ---------------------------------------------------------------------------
 // pair / qkv 融合入口（v1 拆成多次 matvec_vq2）结果须与独立 naive 一致
 // ---------------------------------------------------------------------------

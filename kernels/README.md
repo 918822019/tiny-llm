@@ -33,7 +33,7 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
 
 - 参考实现齐全：rmsnorm / rope / matvec（f32/f16/i4）/ matmul（f32/i4，prefill 用）/
   softmax / attention / silu / argmax + GDN 四算子（Qwen3.5）。
-- matvec 走**三套独立注册表**（f32/f16/i4，按模型 dtype 解析，配错 fail fast）：
+- matvec 走**四套独立注册表**（f32/f16/i4/vq2，按模型 dtype 解析，配错 fail fast）：
   - f32：`ref`（默认）/ `double_2_float` / `acc4` / `neon_nofma` / `neon` /
     `neon_mt` / `neon_mt_bal` / `neon_mt_kv` / `neon_mt_kv_nt`（CPU 阶梯顶层）
     / `cuda*` 系列（CUDA 构建）；
@@ -41,6 +41,12 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
   - i4：`ref` / `neon` / `neon_mt` / `sdot(_mt)` / `sdot2(_mt)` / `sdot3(_mt)` /
     **`sdot4(_mt)`（当前 decode 最佳）** / `sdot5(_mt)`（对称量化实验，配
     `--symmetric` 模型）。
+  - vq2（2-bit 块向量量化）：`ref` / `neon` / **`neon_mr`（当前最佳）**。
+- **vq2 kernel 阶梯**（归因用，只增不删）：
+  `ref`（double 累加锚，纯标量查表）→ `neon`（4 宽 SIMD：查表喂 1 条
+  float32x4 FMA 链）→ `neon_mr`（+4 行并行：4 条独立 FMA 链隐藏延迟 +
+  共享 x4 加载，gate_up 2.9×、lm_head 2.95× vs neon）。
+  评测用 `./scripts/bench_kernels.sh --family vq2`（见 docs/optimization.md §6）。
 - **i4 kernel 阶梯**（归因用，只增不删）：
   `sdot`（W4A8 SDOT 首版）→ `sdot2`（+预计算 scale/zero + 2-row 并行，首次反超 f16）
   → `sdot3`（+work-stealing 调度 + 内联组头硬件 FCVT + 128 位解包）→
