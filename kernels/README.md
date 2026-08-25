@@ -41,11 +41,14 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
   - i4：`ref` / `neon` / `neon_mt` / `sdot(_mt)` / `sdot2(_mt)` / `sdot3(_mt)` /
     **`sdot4(_mt)`（当前 decode 最佳）** / `sdot5(_mt)`（对称量化实验，配
     `--symmetric` 模型）。
-  - vq2（2-bit 块向量量化）：`ref` / `neon` / **`neon_mr`（当前最佳）**。
+  - vq2（2-bit 块向量量化）：`ref` / `neon` / `neon_mr` /
+    **`neon_mr_mt`（当前最佳，推荐）**。
 - **vq2 kernel 阶梯**（归因用，只增不删）：
   `ref`（double 累加锚，纯标量查表）→ `neon`（4 宽 SIMD：查表喂 1 条
   float32x4 FMA 链）→ `neon_mr`（+4 行并行：4 条独立 FMA 链隐藏延迟 +
-  共享 x4 加载，gate_up 2.9×、lm_head 2.95× vs neon）。
+  共享 x4 加载，vs neon 2.9–3.5×）→ `neon_mr_mt`（+常驻线程池行切分，
+  粒度阈值 262144 元素，vs neon_mr 再 3.2–3.8×；gate_up 0.069 ms、
+  lm_head 1.9 ms，127–144 GFLOP/s）。合计 **vs ref 40–58×**。
   评测用 `./scripts/bench_kernels.sh --family vq2`（见 docs/optimization.md §6）。
 - **i4 kernel 阶梯**（归因用，只增不删）：
   `sdot`（W4A8 SDOT 首版）→ `sdot2`（+预计算 scale/zero + 2-row 并行，首次反超 f16）

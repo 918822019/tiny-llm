@@ -190,6 +190,12 @@ TEST(matvec_vq2_neon_mr_matches_naive_mid)   { check_matvec_vq2_impl("neon_mr", 
 TEST(matvec_vq2_neon_mr_matches_naive_big)   { check_matvec_vq2_impl("neon_mr", 256, 896, 1e-2); }
 TEST(matvec_vq2_neon_mr_matches_naive_tail)  { check_matvec_vq2_impl("neon_mr", 33, 200, 1e-2); }
 
+// neon_mr_mt（4 行并行 + 线程池行切分）：小形状走单线程路径，
+// ≥262144 元素走多线程路径；513 行带区间尾行
+TEST(matvec_vq2_neon_mr_mt_matches_naive_small) { check_matvec_vq2_impl("neon_mr_mt", 32, 128, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_matches_naive_mt)    { check_matvec_vq2_impl("neon_mr_mt", 512, 896, 1e-2); }
+TEST(matvec_vq2_neon_mr_mt_matches_naive_tail)  { check_matvec_vq2_impl("neon_mr_mt", 513, 896, 1e-2); }
+
 // ---------------------------------------------------------------------------
 // pair / qkv 融合入口（v1 拆成多次 matvec_vq2）结果须与独立 naive 一致
 // ---------------------------------------------------------------------------

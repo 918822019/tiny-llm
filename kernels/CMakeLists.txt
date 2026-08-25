@@ -62,6 +62,9 @@ add_library(tinyqwen_kernels OBJECT
         # neon_mr = neon + 4 行并行（独立 FMA 链隐藏延迟 + 共享 x4 加载），
         # 归因阶梯下一层（对齐 i4 族 sdot2 的 multi-row 路径；仅 aarch64）。
         matvec/matvec_vq2_neon_mr.cpp
+        # neon_mr_mt = neon_mr + 常驻线程池行切分（对齐 i4 族 *_mt 路径，
+        # 粒度阈值 262144 元素；仅 aarch64）。
+        matvec/matvec_vq2_neon_mr_mt.cpp
         # BiIP 激活旋转（推理时对激活施加旋转配对逆变换，配合旋转量化权重）。
         biip/biip_rotate.cpp
         # W4A8 SDOT：权重解包 int8 + 激活 int8 对称量化 + SDOT 整数点积（armv8.2
