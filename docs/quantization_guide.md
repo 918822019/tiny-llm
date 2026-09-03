@@ -10,6 +10,7 @@
 | INT4 (HQQ) | `kI4` | 较小 | 4× | `tools/export_qwen_to_tiny_i4.py --hqq` |
 | VQ2 朴素 (k-means) | `kVQ2` | **大（无旋转，退化）** | 8×（线性层） | `tools/export_qwen_to_tiny_vq2.py` |
 | VQ2 完整配方 (旋转+TwoPass) | `kVQ2` | 小 | 8×（线性层） | kronq 仓 `scripts/export_tiny_vq2.py`（GPU） |
+| VQ2 + VQ-QAT (旋转+QAT) | `kVQ2` | 小 | 8×（线性层） | `tools/export_qat_vq2_to_tiny.py`（桥接 QAT 产物） |
 
 ## VQ2（2-bit 块向量量化）与 BiIP 旋转
 
@@ -30,6 +31,31 @@
 量化 matvec 前对激活施加 `x → blockHadamard((x/scale)⊙sign)`（内核
 `kernels/biip/biip_rotate.cpp`）。旋转使 q/k/v、gate/up 融合失效，旋转模型自动
 去融合逐子层投影；非旋转模型路径不受影响。
+
+**桥接 VQ-QAT 产物**（`tools/export_qat_vq2_to_tiny.py`）：上游 QAT 训完会给一个
+自含 deploy pack（`cb_*.pt` 码本 / `idx_*.pt` 索引 / `rot_*.pt` 旋转参数 /
+`extra_fp16.pt` 各 norm / `embed_int4.pt`）。首选直读 pack：
+
+```bash
+python tools/export_qat_vq2_to_tiny.py --model models/Qwen3-0.6B \
+    --pack vq_qat_qwen3_06b/deploy_qwen3_06b_vq_2bit \
+    --out model_qwen3_06b_vq2_ei4.tqwen
+```
+
+三条硬契约：
+
+- **码本 / 索引 / embed 都是逐位转码，不做二次量化**。QAT 权重每 4 维块只取 ≤256
+  个唯一向量，码本值精确落在 fp16 上；embed 已是 INT4（行内分组 minmax，gs=64），
+  与 .tqwen 的 i4 布局语义完全一致，只需搬 nibble。tied 模型的 embed 同时充当
+  lm_head，在已量化的格点上再取整是纯损失。
+- **embed 位宽决定 decode 速度**。tied 模型里 embed/lm_head 是 decode 的流量大头
+  （Qwen3-0.6B：f16 存储时 311 MB/token）。embed 存 f16 时 2-bit 模型比 f16 模型
+  **更慢**（19.70 vs 13.42 ms/tok）；换 INT4 后才真正变快（11.33）。详见
+  `optimization_log.md` 的 `qwen3_06b_vq2_qat`。
+- **没有 pack 时可反解兜底**（`--qat-dir`）：块 Hadamard 正交且对称，`W_rot · Hn`
+  即可回到原基逐列回归。sign 还能用 `seed = layer*100 + 子层序号` 确定性复现
+  （实测与 pack 逐位一致）；scaleH 需要校准数据，用
+  `tools/compute_biip_scaleh.py` 复算（实测与 pack 偏差 ≤0.3%）。
 
 **验证手段**（都在 `tools/`）：
 - `add_biip_rotation.py`：给已有模型注入旋转，做**自抵消测试**（旋转前后输出须一致）。

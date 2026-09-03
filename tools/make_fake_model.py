@@ -42,18 +42,23 @@ def main() -> None:
     p.add_argument("--out", default="fake.tqwen")      # 输出文件路径
     p.add_argument("--seed", type=int, default=0)      # 随机种子（可复现）
     p.add_argument("--tied", type=int, default=1)      # 是否 tied embedding（1=tied, 0=untied）
+    p.add_argument("--arch", choices=["qwen2", "qwen3"], default="qwen2",
+                   help="qwen2=带 q/k/v bias；qwen3=无 bias + QK RMSNorm")
     args = p.parse_args()
 
     rng = np.random.default_rng(args.seed)  # 创建可复现的随机数生成器
+    is_qwen3 = args.arch == "qwen3"
 
     # 与真实 Qwen2.5 同构但极小的配置（GQA：4 个 q head 共享 2 个 kv head）。
+    # qwen3 刻意取 head_dim=6，使 q_dim(24) != hidden(16)——真实 Qwen3-0.6B
+    # 也是这样（head_dim=128, n_heads=16, hidden=1024），覆盖该维度不匹配路径。
     cfg = {
         "n_layers": 2,              # transformer 层数（极少，加速测试）
         "hidden_size": 16,          # 隐藏层维度（极小）
         "intermediate_size": 32,    # MLP 中间维度（通常为 hidden 的 2-4 倍）
         "n_heads": 4,               # 注意力 Q head 数
         "n_kv_heads": 2,            # KV head 数（GQA：4/2=2 个 Q head 共享 1 个 KV head）
-        "head_dim": 4,              # 每个 head 的维度
+        "head_dim": 6 if is_qwen3 else 4,  # 每个 head 的维度
         "vocab_size": 64,           # 词表大小
         "max_seq_len": 32,          # 最大序列长度
         "tied": args.tied,          # embedding/lm_head 是否共享权重
@@ -89,10 +94,17 @@ def main() -> None:
         tensors[pfx + "self_attn.q_proj.weight"] = w((qd, H))   # Q 投影：[q_dim, hidden]
         tensors[pfx + "self_attn.k_proj.weight"] = w((kvd, H))  # K 投影：[kv_dim, hidden]
         tensors[pfx + "self_attn.v_proj.weight"] = w((kvd, H))  # V 投影：[kv_dim, hidden]
-        # Qwen2/2.5 的 attention 带 q/k/v bias（attention_bias=True）。
-        tensors[pfx + "self_attn.q_proj.bias"] = w((qd,))    # Q 偏置：[q_dim]
-        tensors[pfx + "self_attn.k_proj.bias"] = w((kvd,))   # K 偏置：[kv_dim]
-        tensors[pfx + "self_attn.v_proj.bias"] = w((kvd,))   # V 偏置：[kv_dim]
+        if is_qwen3:
+            # Qwen3 稠密：无 attention bias，改为 per-head QK RMSNorm（标准 RMSNorm，不折 +1）。
+            # 取 1+噪声：近中性不溢出，同时能区分"真的施加了 norm"与"没施加"。
+            D = cfg["head_dim"]
+            tensors[pfx + "self_attn.q_norm.weight"] = (1.0 + w((D,))).astype(np.float32)
+            tensors[pfx + "self_attn.k_norm.weight"] = (1.0 + w((D,))).astype(np.float32)
+        else:
+            # Qwen2/2.5 的 attention 带 q/k/v bias（attention_bias=True）。
+            tensors[pfx + "self_attn.q_proj.bias"] = w((qd,))    # Q 偏置：[q_dim]
+            tensors[pfx + "self_attn.k_proj.bias"] = w((kvd,))   # K 偏置：[kv_dim]
+            tensors[pfx + "self_attn.v_proj.bias"] = w((kvd,))   # V 偏置：[kv_dim]
         tensors[pfx + "self_attn.o_proj.weight"] = w((H, qd))  # O 投影：[hidden, q_dim]
         tensors[pfx + "post_attention_layernorm.weight"] = np.ones(H, dtype=np.float32)  # 后 RMSNorm
         tensors[pfx + "mlp.gate_proj.weight"] = w((I, H))    # MLP gate：[inter, hidden]

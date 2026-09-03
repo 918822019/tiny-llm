@@ -33,8 +33,8 @@ namespace tinyqwen {
 //   sign       — ±1 符号向量 [dim]（fp32）
 //   block_size — Hadamard 分块大小（2 的幂）
 // 说明：butterfly 每块做 log2(block_size) 级加减，最后乘 1/sqrt(block_size)。
-void biip_rotate_activation(const float *x, float *y, int dim,
-                            const float *scale, const float *sign, int block_size) {
+void biip_rotate_activation_ref(const float *x, float *y, int dim,
+                                const float *scale, const float *sign, int block_size) {
     // 1+2. 逐元素：除 scale、乘 sign
     if (scale) {
         for (int j = 0; j < dim; ++j) {

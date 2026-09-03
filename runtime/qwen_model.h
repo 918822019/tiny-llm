@@ -260,7 +260,8 @@ namespace tinyqwen {
         //       换来 rmsnorm/bias 热点路径完全不改）。
         //
         // 架构说明:
-        //   - Qwen2.x 层: 使用 input_ln, q/k/v/o_proj, post_ln, gate/up/down
+        //   - Qwen2.x 层: 使用 input_ln, q/k/v/o_proj + q/k/v_bias, post_ln, gate/up/down
+        //   - Qwen3 稠密层: 同上但无 q/k/v_bias，额外使用 q_norm, k_norm
         //   - Qwen3.5 full attention 层: 额外使用 q_norm, k_norm
         //   - Qwen3.5 linear attention 层: 使用 gdn_* 系列权重
         // ---------------------------------------------------------------------
@@ -303,11 +304,15 @@ namespace tinyqwen {
             const void *up = nullptr;    // up 投影 [intermediate, hidden]（dtype 随模型）
             const void *down = nullptr;  // down 投影 [hidden, intermediate]（dtype 随模型）
 
+            // ---- QK per-head RMSNorm（Qwen3 稠密 / Qwen3.5 full_attention）----
+            // Qwen2.x 没有这两个权重（nullptr）。语义按架构不同：Qwen3.5 是
+            // zero-centered RMSNorm，导出时已折 +1；Qwen3 稠密是标准 RMSNorm，不折。
+            const float *q_norm = nullptr;  // [head_dim]（恒 fp32）
+            const float *k_norm = nullptr;  // [head_dim]（恒 fp32）
+
             // ---- v2 / Qwen3.5 full_attention 层专用 ----
             // q_proj 输出 2*q_dim（前半 query、后半输出门 gate，按 head 交错），
             // 在 create() 里绑成 [2*q_dim, hidden]。gate 用 sigmoid 乘到 attn 输出上
-            const float *q_norm = nullptr;  // per-head RMSNorm（zero-centered，导出时已 +1）
-            const float *k_norm = nullptr;  // per-head RMSNorm（zero-centered，导出时已 +1）
 
             // ---- v2 / Qwen3.5 linear_attention（Gated DeltaNet）层专用 ----
             const void *gdn_in_qkv = nullptr;   // 混合 qkv 投影 [conv_dim, hidden]

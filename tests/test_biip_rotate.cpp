@@ -8,9 +8,11 @@
 // ============================================================================
 
 #include "test_framework.h"
-#include "dispatch.h"   // biip_rotate_activation
+#include "dispatch.h"   // biip_rotate_activation / set_ops_impl_by_name
+#include "ref_ops.h"    // biip_rotate_activation_ref（逐位对照锚点）
 
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -104,6 +106,83 @@ TEST(biip_rotate_bs128_no_scale)     { check_biip(896, 128, false); }
 TEST(biip_rotate_bs256_with_scale)   { check_biip(4864, 256, true); }
 TEST(biip_rotate_bs64)               { check_biip(256, 64, true); }
 TEST(biip_rotate_single_block)       { check_biip(128, 128, true); }
+
+namespace {
+
+// 当前选中的实现 vs _ref 的逐位对照。
+// NEON 变体的设计前提是"不改变任何运算的顺序与结合方式"，故差应恒为 0；
+// 一旦有人为了提速引入 vrecpe 近似除法或 butterfly 重结合，这里立刻失败。
+void check_bitexact_vs_ref(int dim, int block_size, bool with_scale) {
+    const std::vector<float> x = rand_vec(dim, 11, -1.0f, 1.0f);
+    std::vector<float> sign(dim);
+    {
+        std::mt19937 rng(12);
+        std::uniform_int_distribution<int> b(0, 1);
+        for (auto &s : sign) s = b(rng) ? 1.0f : -1.0f;
+    }
+    std::vector<float> scale;
+    const float *scale_ptr = nullptr;
+    if (with_scale) {
+        scale = rand_vec(dim, 13, 0.5f, 2.0f);
+        scale_ptr = scale.data();
+    }
+    std::vector<float> got(dim), want(dim);
+    tinyqwen::biip_rotate_activation(x.data(), got.data(), dim, scale_ptr, sign.data(),
+                                     block_size);
+    tinyqwen::biip_rotate_activation_ref(x.data(), want.data(), dim, scale_ptr, sign.data(),
+                                        block_size);
+    for (int i = 0; i < dim; ++i) {
+        if (got[i] != want[i]) {
+            TQ_FAIL("biip_rotate " + std::string(tinyqwen::ops_impl_name()) +
+                    " 与 ref 不逐位一致 dim=" + std::to_string(dim) +
+                    " bs=" + std::to_string(block_size) + " i=" + std::to_string(i));
+            return;
+        }
+    }
+}
+
+} // namespace
+
+// NEON 变体：真实部署形状（in_dim ∈ {1024, 2048, 3072}，block=256）+ 退化块大小。
+// 非 aarch64 上没有 neon 变体，set_ops_impl_by_name 会拒绝 → 跳过。
+TEST(biip_rotate_neon_matches_ref) {
+    if (!tinyqwen::set_ops_impl_by_name("neon")) {
+        std::printf("[skip] current build has no 'neon' ops (not aarch64)\n");
+        return;
+    }
+    for (int dim : {1024, 2048, 3072}) {
+        check_biip(dim, 256, true);                 // 数学正确性（vs 朴素 Hadamard）
+        check_bitexact_vs_ref(dim, 256, true);      // 与 ref 逐位一致
+        check_bitexact_vs_ref(dim, 256, false);     // scaleH 被中和的路径
+    }
+    // 退化/边界块大小：h=1、h=2 两级的向量化分支，以及 block_size < 4 的 ref 回退
+    check_bitexact_vs_ref(256, 4, true);
+    check_bitexact_vs_ref(256, 2, true);
+    check_bitexact_vs_ref(896, 128, true);
+    EXPECT_TRUE(tinyqwen::set_ops_impl_by_name("ref"));
+}
+
+// NEON 变体的原地安全性（x 与 y 同址）
+TEST(biip_rotate_neon_inplace_safe) {
+    if (!tinyqwen::set_ops_impl_by_name("neon")) {
+        std::printf("[skip] current build has no 'neon' ops (not aarch64)\n");
+        return;
+    }
+    const int dim = 1024, bs = 256;
+    const std::vector<float> x = rand_vec(dim, 21, -1.0f, 1.0f);
+    const std::vector<float> scale = rand_vec(dim, 22, 0.5f, 2.0f);
+    std::vector<float> sign(dim, -1.0f);
+    std::vector<float> y1(dim), y2 = x;
+    tinyqwen::biip_rotate_activation(x.data(), y1.data(), dim, scale.data(), sign.data(), bs);
+    tinyqwen::biip_rotate_activation(y2.data(), y2.data(), dim, scale.data(), sign.data(), bs);
+    for (int i = 0; i < dim; ++i) {
+        if (y1[i] != y2[i]) {
+            TQ_FAIL("biip_rotate neon 原地不安全 i=" + std::to_string(i));
+            break;
+        }
+    }
+    EXPECT_TRUE(tinyqwen::set_ops_impl_by_name("ref"));
+}
 
 // 自抵消性质：对同一向量连续施加两次"正变换"不回到原点（正变换不自逆，
 // 因为 sign 在 matmul 之前）；但 biip_rotate(配对逆) 与 kronq 权重正变换配对后

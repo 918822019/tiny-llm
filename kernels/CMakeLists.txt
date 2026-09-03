@@ -70,6 +70,9 @@ add_library(tinyqwen_kernels OBJECT
         matvec/matvec_vq2_neon_mr_mt_wl.cpp
         # BiIP 激活旋转（推理时对激活施加旋转配对逆变换，配合旋转量化权重）。
         biip/biip_rotate.cpp
+        # NEON 变体：逐元素段向量化 + butterfly 三段向量化（h=1/2 用 uzp/zip 与
+        # 64 位半交换，h>=4 直接向量加减）。与 ref 逐位一致，仅 aarch64。
+        biip/biip_rotate_neon.cpp
         # W4A8 SDOT：权重解包 int8 + 激活 int8 对称量化 + SDOT 整数点积（armv8.2
         # dotprod；把 unpack 指令/字节从 ~3.5 打到 ~0.9，目标逼近带宽墙）。
         matvec/matvec_i4_sdot.cpp

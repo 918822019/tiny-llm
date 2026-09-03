@@ -207,6 +207,10 @@ namespace tinyqwen {
     // ================================================================
     // y = blockHadamard( (x / scale) ⊙ sign )；scale==nullptr 表示被中和(跳过除法)。
     // 与量化权重旋转自抵消：x_rot @ W_rot^T == x @ W^T。
+    // 走与 rmsnorm/rope 同一套 ops 分发（共用 --ops-impl 名字），未注册兜底 _ref。
+    using BiipRotateFn = void (*)(const float *x, float *y, int dim,
+                                  const float *scale, const float *sign, int block_size);
+    void register_biip_rotate_impl(const char *name, BiipRotateFn fn);
     void biip_rotate_activation(const float *x, float *y, int dim,
                                 const float *scale, const float *sign, int block_size);
 
@@ -454,6 +458,10 @@ namespace tinyqwen {
 #define TINYQWEN_ARGMAX_VARIANT(fn, name)                                            \
     [[maybe_unused]] static const bool tqwen_reg_argmax_## fn =                       \
             (tinyqwen::register_argmax_impl(name, fn), true)
+
+#define TINYQWEN_BIIP_ROTATE_VARIANT(fn, name)                                       \
+    [[maybe_unused]] static const bool tqwen_reg_biip_## fn =                         \
+            (tinyqwen::register_biip_rotate_impl(name, fn), true)
 
 // GPU decode engine 的自注册宏：engine 的 .cu 文件末尾调用一次，登记
 // create/step/reset/destroy/logits 五个函数指针。仅 CUDA 构建会执行到这里；

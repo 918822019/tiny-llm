@@ -337,8 +337,9 @@ namespace tinyqwen {
                 }
 
             } else {
-                // ---- Qwen2.x attention 路径（与 v1 完全一致）----
-                // 2b. q/k/v 投影 + bias。Qwen2/2.5 的 q/k/v 有 bias，且必须加在 RoPE 之前
+                // ---- Qwen2.x / Qwen3 稠密 attention 路径 ----
+                // 2b. q/k/v 投影 + 可选 bias。Qwen2.x 有 bias（须加在 RoPE 之前），
+                //     Qwen3 稠密 attention_bias=false 无 bias（权重为 nullptr）
                 if (rotated_) {
                     // 旋转模型：q/k/v 旋转各不相同，不能融合，逐个旋转+投影
                     ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
@@ -346,32 +347,42 @@ namespace tinyqwen {
                     mv_rot(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden, w.rot_k);
                     mv_rot(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden, w.rot_v);
                     // bias 在输出侧，不受输入旋转影响
-                    for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
-                    for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
-                    for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
+                    if (w.q_bias) for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
+                    if (w.k_bias) for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
+                    if (w.v_bias) for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
                 } else if (fuse_qkv_) {
                     // 融合 QKV 投影：一次计算三个投影
                     ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
                     mv_qkv(w.q_proj, w.k_proj, w.v_proj, normed_.data(),
                             q_.data(), k_.data(), v_.data(), q_dim_, kv_dim_, hidden);
-                    // bias 加法（Qwen2.x 特有）
-                    for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
-                    for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
-                    for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
+                    if (w.q_bias) for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
+                    if (w.k_bias) for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
+                    if (w.v_bias) for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
                 } else {
                     // 非融合版本：分别计算 Q、K、V 投影
                     {
                         ScopedTimer t(prof, scope("layer_%d.q_proj", i));
                         mv(w.q_proj, normed_.data(), q_.data(), q_dim_, hidden);
-                        for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
+                        if (w.q_bias) for (int j = 0; j < q_dim_; ++j) q_[j] += w.q_bias[j];
                     }
                     {
                         ScopedTimer t(prof, scope("layer_%d.kv_proj", i));
                         mv_pair(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
                                 kv_dim_, hidden);
-                        for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
-                        for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
+                        if (w.k_bias) for (int j = 0; j < kv_dim_; ++j) k_[j] += w.k_bias[j];
+                        if (w.v_bias) for (int j = 0; j < kv_dim_; ++j) v_[j] += w.v_bias[j];
                     }
+                }
+
+                // 2b'. QK per-head RMSNorm（Qwen3 稠密有，Qwen2.x 无；须在 RoPE 之前）
+                if (w.q_norm) {
+                    ScopedTimer t(prof, scope("layer_%d.qk_norm", i));
+                    for (int h = 0; h < n_heads; ++h)
+                        backend_->rmsnorm(q_.data() + h * head_dim, w.q_norm,
+                                          q_.data() + h * head_dim, head_dim, cfg_.rms_norm_eps);
+                    for (int h = 0; h < n_kv_heads; ++h)
+                        backend_->rmsnorm(k_.data() + h * head_dim, w.k_norm,
+                                          k_.data() + h * head_dim, head_dim, cfg_.rms_norm_eps);
                 }
 
                 // 2c. RoPE 旋转位置编码：把"位置 pos"的信息编进 q/k（v 不需要）

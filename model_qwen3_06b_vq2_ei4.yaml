@@ -1,0 +1,87 @@
+# =============================================================================
+# model_qwen3_06b_vq2_ei4.yaml —— Qwen3-0.6B VQ2 2-bit（BiIP 旋转 + VQ-QAT）注册表
+# =============================================================================
+# 文件级别说明：
+#   本文件记录 **Qwen3 稠密架构**首次接入 tinyqwen 的模型：Qwen3-0.6B，权重来自
+#   kronq 的 VQ-QAT 训练产物（旋转域 2-bit），经 tools/export_qat_vq2_to_tiny.py
+#   桥接为 .tqwen VQ2 格式。
+#
+#   与 Qwen2.5 的架构差异（runtime 按权重存在性自动识别，无需格式标志）：
+#     - attention_bias = false → 没有 q/k/v_proj.bias
+#     - 有 self_attn.q_norm / k_norm（per-head RMSNorm，RoPE 之前施加）。
+#       注意是**标准** RMSNorm，导出时不折 +1（区别于 Qwen3.5 的 zero-centered）
+#     - head_dim(128) * n_heads(16) = 2048 != hidden_size(1024)
+#
+#   码本提取是**逐位无损**的：QAT 权重每 4 维块只取 ≤256 个唯一向量之一，
+#   且码本值精确落在 fp16 上（往返误差 0），所以桥接不引入新的量化误差。
+# =============================================================================
+
+name: model_qwen3_06b_vq2_ei4
+architecture: qwen3
+source: Qwen/Qwen3-0.6B
+dtype: vq2
+file: model_qwen3_06b_vq2_ei4.tqwen
+size_mb: 191.3                 # 线性层 2-bit ~105 MB + embed INT4 83.5 MB
+                               # 对比：embed 存 f16 的变体 404.6 MB；纯 f16 模型 1136.9 MB
+
+params:
+  n_layers: 28
+  hidden_size: 1024
+  intermediate_size: 3072
+  n_heads: 16
+  n_kv_heads: 8
+  head_dim: 128                # 注意 != hidden_size / n_heads
+  vocab_size: 151936
+  tied_embeddings: true
+  model_type: qwen2            # Qwen3 纯文本归入 MODEL_QWEN2 族（同层结构）
+  attention_bias: false
+  qk_norm: true                # per-head q_norm/k_norm，标准 RMSNorm
+
+quantization:
+  method: vq_qat               # BiIP 旋转 + GPTQ-VQ + TwoPass 码本 + KL 蒸馏 QAT
+  codebook_entries: 256        # K（实际用到 251~256，写盘补齐到 256）
+  block_dim: 4                 # d → 码率 log2(256)/4 = 2 bit/权重
+  embed_bits: 4                # 上游已量化的 INT4 表，逐位转码（tied，不可二次量化）
+  embed_group_size: 64
+  qat_steps: 5000
+  qat_lr: 1.0e-4
+  seed: 42
+  rotation:
+    kind: biip                 # blockHadamard((W * scaleH) ⊙ sign) 沿输入维
+    block_size: 256            # = find_hadamard_block_size(1024/2048/3072)
+    source: deploy_pack        # rot_<层>_<子层>.pt 自带 scale/sign_vec/block_size
+    scaleh_neutralized: 2      # 196 个子层里 2 个（layer 2/27 down_proj）被中和
+  note: |
+    桥接自 kronq VQ-QAT 的 deploy pack；码本+索引与 embed 都是逐位转码，不引入新量化误差。
+    旋转参数曾在拿到 pack 之前独立复现过：sign 由 seed=layer*100+子层序号 确定性生成
+    （196/196 逐位一致），scaleH 由校准数据复算（最大偏差 0.3%，中和位置一致）。
+
+recipe:
+  matvec_impl: neon_mr_mt_wl_nt  # VQ2 最快变体（4 行并行 + 多线程 + 索引流 LDNP）
+  ops_impl: neon
+  note: |
+    lm_head 走 i4 注册表（tied embed）。VQ2 的 mm 会退化为逐列 matvec，
+    长 prompt 的 prefill/PPL 仍慢于 f16（但 LDNP 把这块拉近了不少）。
+
+accuracy:
+  # 同协议对照：wikitext-2 test，非重叠 512-token 窗口，前 10240 token
+  wikitext2_ppl:
+    vq2_qat_embed_i4: 36.10    # 本配置
+    vq2_qat_embed_f16: 35.96   # 仅换 embed 存储；INT4 embed 代价 +0.4%
+    f16_baseline: 30.61
+    naive_kmeans_vq2: 1380890  # 对照：无旋转无 QAT 的免校准 k-means，完全退化
+    degradation_vs_f16: 1.180
+    protocol: chunk_len=512, tokens=10220, benchmarks/wikitext2_test_tokens_qwen3.npy
+  upstream_reported_ppl: 25.88 # GPU 侧数字，评测协议不同（chunk 更长），仅作参照
+
+benchmark:
+  macos_m4:
+    topt_ms: 10.16             # decode 中位（6 轮交替取最优）；f16 基线 13.42 → 1.32×
+    ttft_ms: 17.5              # prompt 3 tok；54-token prompt 的批量 prefill 同样受益
+    peak_rss_mb: null
+    device: Mac16,10（Apple M4，4P+6E，16GB）
+    note: |
+      演进：embed 存 f16 的变体 19.70 ms/tok（405 MB 里 311 MB 是 f16 的
+      embed/lm_head，decode 每 token 都要读一遍）→ 换上游 INT4 embed 11.33
+      → BiIP 旋转 NEON 化 10.87 → 索引流 LDNP（neon_mr_mt_wl_nt）10.16。
+      剩余瓶颈仍是 VQ2 matvec 的查表依赖链。

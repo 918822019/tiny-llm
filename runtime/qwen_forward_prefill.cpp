@@ -196,6 +196,16 @@ namespace tinyqwen {
                     if (w.k_bias) for (int j = 0; j < kv_dim_; ++j) kc[j] += w.k_bias[j];
                     if (w.v_bias) for (int j = 0; j < kv_dim_; ++j) vc[j] += w.v_bias[j];
 
+                    // QK per-head RMSNorm（Qwen3 稠密特有，同样在 RoPE 之前）
+                    if (w.q_norm) {
+                        for (int h = 0; h < n_heads; ++h)
+                            backend_->rmsnorm(qc + h * head_dim, w.q_norm, qc + h * head_dim,
+                                              head_dim, cfg_.rms_norm_eps);
+                        for (int h = 0; h < n_kv_heads; ++h)
+                            backend_->rmsnorm(kc + h * head_dim, w.k_norm, kc + h * head_dim,
+                                              head_dim, cfg_.rms_norm_eps);
+                    }
+
                     // RoPE 旋转位置编码：将位置 pos 的信息注入 Q 和 K
                     backend_->rope(qc, kc, n_heads, n_kv_heads, head_dim, pos, cfg_.rope_theta);
 

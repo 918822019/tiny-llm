@@ -41,7 +41,7 @@ import numpy as np
 # 复用基座导出器的格式契约与工具（与 i4 导出器同一套基础设施）
 sys.path.insert(0, str(Path(__file__).parent))
 from export_qwen_to_tiny import (  # noqa: E402
-    MAGIC, FORMAT_VERSION, DTYPE_F32, DTYPE_F16, MAX_NAME,
+    MAGIC, FORMAT_VERSION, DTYPE_F32, DTYPE_F16, DTYPE_VQ2, MAX_NAME,
     HEADER_FMT, ENTRY_FMT,
     align_up, find_local_dir, load_config, plan_tensors,
     print_table_summary, pack_v2_ext, MODEL_QWEN35,
@@ -49,8 +49,6 @@ from export_qwen_to_tiny import (  # noqa: E402
 # 复用 i4 导出器的懒加载与"该不该量化"判定
 from export_qwen_to_tiny_i4 import LazyTensors, should_quantize  # noqa: E402
 
-# VQ2 dtype 编号，与 runtime/tiny_format.h 的 Dtype::kVQ2 一致
-DTYPE_VQ2 = 4
 # 块向量量化参数：K=256 码本条目、d=4 块大小 → 码率 = log2(K)/d = 2 bit/权重
 VQ2_K = 256
 VQ2_BLOCK = 4

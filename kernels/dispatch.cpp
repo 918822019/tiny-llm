@@ -611,6 +611,10 @@ namespace tinyqwen {
             static std::unordered_map<std::string, ArgmaxFn> r;
             return r;
         }
+        std::unordered_map<std::string, BiipRotateFn> &biip_rotate_registry() {
+            static std::unordered_map<std::string, BiipRotateFn> r;
+            return r;
+        }
 
         // ---- GDN 算子注册表 ----
         // Qwen3.5 的 GDN 层专属算子：causal conv1d / l2norm / gdn_step / rmsnorm_gated
@@ -644,6 +648,9 @@ namespace tinyqwen {
     }
     void register_swiglu_impl(const char *name, SwigluFn fn) { swiglu_registry()[name] = fn; }
     void register_argmax_impl(const char *name, ArgmaxFn fn) { argmax_registry()[name] = fn; }
+    void register_biip_rotate_impl(const char *name, BiipRotateFn fn) {
+        biip_rotate_registry()[name] = fn;
+    }
 
     // GDN 算子注册函数
     void register_causal_conv1d_update_impl(const char *name, CausalConv1dUpdateFn fn) {
@@ -674,7 +681,7 @@ namespace tinyqwen {
         const std::string n = name;
         const bool any = rmsnorm_registry().count(n) || rope_registry().count(n) ||
                          attention_registry().count(n) || swiglu_registry().count(n) ||
-                         argmax_registry().count(n) ||
+                         argmax_registry().count(n) || biip_rotate_registry().count(n) ||
                          conv1d_registry().count(n) || l2norm_registry().count(n) ||
                          gdn_step_registry().count(n) || rmsnorm_gated_registry().count(n);
         if (!any) return false;  // 没有任何算子注册该名 → 拒绝
@@ -747,6 +754,18 @@ namespace tinyqwen {
             return it->second(logits, n);
         }
         return argmax_ref(logits, n);  // 兜底
+    }
+
+    // BiIP 激活旋转通用入口
+    void biip_rotate_activation(const float *x, float *y, int dim,
+                                const float *scale, const float *sign, int block_size) {
+        const auto &r = biip_rotate_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(x, y, dim, scale, sign, block_size);
+            return;
+        }
+        biip_rotate_activation_ref(x, y, dim, scale, sign, block_size);  // 兜底
     }
 
     // ====================================================================

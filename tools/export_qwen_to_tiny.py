@@ -53,6 +53,7 @@ ALIGN = 64
 DTYPE_F32 = 0   # float32，每元素 4 字节
 DTYPE_F16 = 1   # float16，每元素 2 字节（与 runtime/tiny_format.h 的 Dtype 枚举保持一致）
 DTYPE_I4 = 3    # INT4 量化，仅 i4 导出脚本使用
+DTYPE_VQ2 = 4   # 2-bit 块向量量化（码本+索引），仅 vq2 导出脚本使用
 # tensor 名字最大长度（字节），超过则报错
 MAX_NAME = 64
 
@@ -72,9 +73,9 @@ HEADER_FMT = "<8s12Iff4Q96s"  # 总大小 192 字节
 ENTRY_FMT = "<64sII4QQQ"  # 总大小 120 字节
 # v2 扩展块（TinyHeaderV2Ext）：放进 header.reserved 的前 64 字节。
 # 字段顺序须与 C++ 结构体一致：7 个 u32 -> float partial_rotary_factor ->
-# u32 eos_token_id -> u32 pad -> 24 字节 reserved。
-# 用于存储 Qwen3.5 混合架构特有的线性注意力参数
-EXT_FMT = "<7If2I24s"  # 总大小 64 字节
+# u32 eos_token_id -> u32 pad -> u32 quant_group_size -> 20 字节 reserved。
+# 用于存储 Qwen3.5 混合架构特有的线性注意力参数与 INT4 组大小
+EXT_FMT = "<7If3I20s"  # 总大小 64 字节
 
 # 编译期断言：确保 Python 侧 struct 格式与 C++ 头文件大小完全匹配
 assert struct.calcsize(HEADER_FMT) == 192   # header 必须恰好 192 字节
@@ -127,7 +128,8 @@ def pack_v2_ext(ext: dict) -> bytes:
         float(g("partial_rotary_factor")),  # 部分 RoPE 的比例因子
         int(g("eos_token_id")),           # EOS token ID
         0,                                # pad 字段，保留对齐
-        b"\x00" * 24,                     # 尾部 24 字节保留区，全零填充
+        int(g("quant_group_size")),       # INT4 每组元素数（0 = 未量化）
+        b"\x00" * 20,                     # 尾部 20 字节保留区，全零填充
     )
 
 
@@ -145,7 +147,8 @@ def unpack_v2_ext(reserved: bytes) -> dict:
     """
     # 从 reserved 的前 64 字节解包所有 v2 扩展字段
     (model_type, qk_h, v_h, qk_d, v_d, conv, interval,
-     rotary, eos, _pad, _rsv) = struct.unpack(EXT_FMT, reserved[: struct.calcsize(EXT_FMT)])
+     rotary, eos, _pad, quant_gs, _rsv) = struct.unpack(
+        EXT_FMT, reserved[: struct.calcsize(EXT_FMT)])
     return {
         "model_type": model_type,                    # 架构族标识
         "linear_num_qk_heads": qk_h,                 # 线性注意力 QK head 数
@@ -156,6 +159,7 @@ def unpack_v2_ext(reserved: bytes) -> dict:
         "full_attention_interval": interval,          # full attention 层间隔
         "partial_rotary_factor": rotary,             # 部分 RoPE 比例
         "eos_token_id": eos,                         # EOS token ID
+        "quant_group_size": quant_gs,                # INT4 每组元素数（0 = 未量化）
     }
 
 
@@ -323,9 +327,9 @@ def print_table_summary(out_path: str | Path) -> None:
         # 校验版本号在合法范围
         assert FORMAT_VERSION_MIN <= version <= FORMAT_VERSION, f"bad version {version}"
         # 校验 dtype 是已知值
-        assert dtype in (DTYPE_F32, DTYPE_F16, DTYPE_I4)
-        # I4 文件是混合 dtype（大矩阵 i4、小向量 f32），逐 tensor 取自己的标签。
-        dtype_names = {DTYPE_F32: "f32", DTYPE_F16: "f16", DTYPE_I4: "i4"}
+        assert dtype in (DTYPE_F32, DTYPE_F16, DTYPE_I4, DTYPE_VQ2)
+        # I4 / VQ2 文件是混合 dtype（大矩阵量化、小向量 f32），逐 tensor 取自己的标签。
+        dtype_names = {DTYPE_F32: "f32", DTYPE_F16: "f16", DTYPE_I4: "i4", DTYPE_VQ2: "vq2"}
         # fields 下标: 0 magic, 1 version, 2 dtype, 3..12 十个 u32,
         #   13 eps, 14 theta, 15 tensor_count, 16 tensor_table_offset,
         #   17 data_offset, 18 total, 19 reserved
@@ -637,7 +641,13 @@ def plan_tensors(tcfg: dict, model_type: int):
             # 非 tied 时单独导出 lm_head 权重
             add("lm_head.weight", "lm_head.weight")
     else:
-        # ===== Qwen2.x 标准 Transformer 的 tensor 映射 =====
+        # ===== Qwen2.x / Qwen3 稠密 标准 Transformer 的 tensor 映射 =====
+        # 两者层结构相同，差异只在两处可选权重（runtime 按权重存在性识别，无需格式标志）：
+        #   - attention bias：Qwen2.x 有，Qwen3 稠密 attention_bias=false 没有
+        #   - QK per-head RMSNorm：Qwen3 稠密有，Qwen2.x 没有。注意 Qwen3 的
+        #     q_norm/k_norm 是标准 RMSNorm，**不**折 +1（区别于 Qwen3.5 的 zero-centered）
+        is_qwen3_dense = tcfg.get("model_type") == "qwen3"
+        attn_bias = bool(tcfg.get("attention_bias", not is_qwen3_dense))
         add("model.embed_tokens.weight", "model.embed_tokens.weight")  # embedding 层
         for i in range(tcfg["num_hidden_layers"]):
             p = f"model.layers.{i}."  # 第 i 层的前缀
@@ -645,9 +655,13 @@ def plan_tensors(tcfg: dict, model_type: int):
             add(p + "self_attn.q_proj.weight", p + "self_attn.q_proj.weight")    # Q 投影权重
             add(p + "self_attn.k_proj.weight", p + "self_attn.k_proj.weight")    # K 投影权重
             add(p + "self_attn.v_proj.weight", p + "self_attn.v_proj.weight")    # V 投影权重
-            add(p + "self_attn.q_proj.bias", p + "self_attn.q_proj.bias")        # Q 投影偏置
-            add(p + "self_attn.k_proj.bias", p + "self_attn.k_proj.bias")        # K 投影偏置
-            add(p + "self_attn.v_proj.bias", p + "self_attn.v_proj.bias")        # V 投影偏置
+            if attn_bias:
+                add(p + "self_attn.q_proj.bias", p + "self_attn.q_proj.bias")    # Q 投影偏置
+                add(p + "self_attn.k_proj.bias", p + "self_attn.k_proj.bias")    # K 投影偏置
+                add(p + "self_attn.v_proj.bias", p + "self_attn.v_proj.bias")    # V 投影偏置
+            if is_qwen3_dense:
+                add(p + "self_attn.q_norm.weight", p + "self_attn.q_norm.weight")  # Q RMSNorm，不折 +1
+                add(p + "self_attn.k_norm.weight", p + "self_attn.k_norm.weight")  # K RMSNorm，不折 +1
             add(p + "self_attn.o_proj.weight", p + "self_attn.o_proj.weight")    # O 投影权重
             add(p + "post_attention_layernorm.weight", p + "post_attention_layernorm.weight")  # 后 RMSNorm
             add(p + "mlp.gate_proj.weight", p + "mlp.gate_proj.weight")          # MLP gate

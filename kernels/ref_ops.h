@@ -161,6 +161,13 @@ namespace tinyqwen {
                                      float *out);
 
     // =========================================================================
+    // biip_rotate_activation_ref：BiIP 激活旋转的标量参考实现（正确性锚点）
+    // y = blockHadamard( (x / scale) ⊙ sign )；scale==nullptr = 被中和，跳过除法。
+    // =========================================================================
+    void biip_rotate_activation_ref(const float *x, float *y, int dim,
+                                    const float *scale, const float *sign, int block_size);
+
+    // =========================================================================
     // dequant_i4_row：把 INT4 packed 嵌入表的一行反量化为 fp32
     // （INT4 紧凑 embed 查表用；布局与 tiny_format.h 的 i4 packing 一致：
     //   每组 [scale_fp16(2B)|zero_fp16(2B)|packed_uint4(gs/2 B)]，低 nibble 在前）

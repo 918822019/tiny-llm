@@ -85,6 +85,24 @@ static const std::vector<Shape> kQwen05bShapes = {
     {"lm_head", 151936, 896, true},  // big：f32 下 ~545MB，默认不测
 };
 
+// Qwen3-0.6B 的真实投影形状（hidden=1024, intermediate=3072,
+// q_dim=16×128=2048, kv_dim=8×128=1024, vocab=151936）。旋转 VQ2 模型跑这组。
+// 末两个是**融合等价形状**：把 q/k/v 与 gate/up 各自的输出维拼起来。
+// 用 time(qkv_fused) vs time(q)+time(k)+time(v) 就能量出逐调用开销
+// （fork-join + 线程池唤醒），回答"融合值不值得做"。
+static const std::vector<Shape> kQwen3_06bShapes = {
+    {"q_proj", 2048, 1024, false},
+    {"k_proj", 1024, 1024, false},
+    {"v_proj", 1024, 1024, false},
+    {"o_proj", 1024, 2048, false},
+    {"gate", 3072, 1024, false},
+    {"up", 3072, 1024, false},
+    {"down", 1024, 3072, false},
+    {"qkv_fused", 4096, 1024, false},      // = q(2048) + k(1024) + v(1024)
+    {"gate_up_fused", 6144, 1024, false},  // = gate(3072) + up(3072)
+    {"lm_head", 151936, 1024, true},       // big：f32 下 ~622MB，默认不测
+};
+
 // ============================================================================
 // 权重缓冲构造：同一份 f32 基础矩阵 → 各族布局，保证族内各实现输入一致
 // ============================================================================
@@ -293,7 +311,9 @@ int main(int argc, char **argv) {
         if (a == "--family") family = need("--family");
         else if (a == "--preset") {
             std::string p = need("--preset");
-            if (p != "qwen05b") { std::printf("unknown preset: %s\n", p.c_str()); return 2; }
+            if (p == "qwen05b") shapes = kQwen05bShapes;
+            else if (p == "qwen3_06b") shapes = kQwen3_06bShapes;
+            else { std::printf("unknown preset: %s (qwen05b | qwen3_06b)\n", p.c_str()); return 2; }
         }
         else if (a == "--out") custom_out = std::atoi(need("--out"));
         else if (a == "--in") custom_in = std::atoi(need("--in"));
@@ -476,24 +496,47 @@ int main(int argc, char **argv) {
     }
 
     // ---------- BiIP 激活旋转（VQ2 旋转推理路径开销，带宽型小算子） ----------
+    // 形状取真实部署值：in_dim ∈ {hidden 1024, q_dim 2048, intermediate 3072}，
+    // block 一律 256（= find_hadamard_block_size 对这三个维度的取值）。
+    // 旋转模型每层 7 个子层各旋一次且不能融合，故逐调用开销要乘 7×n_layers
+    // 才是每 token 的真实代价——这里直接折算打印。
     if (want("vq2")) {
-        const int dim = 896;
-        std::vector<float> x(dim), yr(dim), sign(dim), scale(dim);
-        Rng rng(0xB11B);
-        for (auto &v : x) v = rng.next_f32();
-        for (auto &v : sign) v = (rng.next_u32() & 1) ? 1.0f : -1.0f;
-        for (auto &v : scale) v = 0.5f + 0.5f * std::fabs(rng.next_f32());
-        std::printf("\n=== biip_rotate_activation | dim=%d ===\n", dim);
-        for (int bs : {4, 8, 16, 64}) {
-            auto fn = [&]() {
-                biip_rotate_activation(x.data(), yr.data(), dim, scale.data(), sign.data(), bs);
-                soak(yr.data(), dim);
-            };
-            int iters = 0;
-            const double s = time_kernel(fn, timer, &iters);
-            const double gb = (2.0 * dim * 4 + 2.0 * dim * 4) / s / 1e9;  // 读 x+sign/scale 写 y（近似）
-            std::printf("  block=%-3d %9.4f us %8.2f GB/s (%d it)\n", bs, s * 1e6, gb, iters);
+        const int block = 256;
+        // Qwen3-0.6B 每层 7 个子层的输入维度：q/k/v/gate/up = 1024, o = 2048, down = 3072
+        const int per_layer[] = {1024, 1024, 1024, 2048, 1024, 1024, 3072};
+        const int n_layers = 28;
+        std::printf("\n=== biip_rotate_activation | block=%d ===\n", block);
+        for (const char *impl : {"ref", "neon"}) {
+            if (!set_ops_impl_by_name(impl)) {
+                std::printf("  [skip] 无 '%s' ops 变体\n", impl);
+                continue;
+            }
+            double per_token_us = 0.0;
+            for (int dim : {1024, 2048, 3072}) {
+                std::vector<float> x(dim), yr(dim), sign(dim), scale(dim);
+                Rng rng(0xB11B);
+                for (auto &v : x) v = rng.next_f32();
+                for (auto &v : sign) v = (rng.next_u32() & 1) ? 1.0f : -1.0f;
+                for (auto &v : scale) v = 0.5f + 0.5f * std::fabs(rng.next_f32());
+                auto fn = [&]() {
+                    biip_rotate_activation(x.data(), yr.data(), dim, scale.data(), sign.data(),
+                                           block);
+                    soak(yr.data(), dim);
+                };
+                int iters = 0;
+                const double s = time_kernel(fn, timer, &iters);
+                const double gb = (4.0 * dim * 4) / s / 1e9;  // 读 x+scale+sign、写 y
+                int calls = 0;
+                for (int d : per_layer) calls += (d == dim) ? 1 : 0;
+                calls *= n_layers;
+                per_token_us += s * 1e6 * calls;
+                std::printf("  %-5s dim=%-5d %9.4f us %8.2f GB/s (%d it, 每 token %d 次)\n",
+                            impl, dim, s * 1e6, gb, iters, calls);
+            }
+            std::printf("  %-5s -> 每 token 旋转总开销 %.3f ms（%d 层 x 7 子层）\n",
+                        impl, per_token_us / 1000.0, n_layers);
         }
+        set_ops_impl_by_name("ref");
     }
 
     // ---------- CSV 落盘 ----------

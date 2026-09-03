@@ -336,9 +336,14 @@ int main(int argc, char **argv) {
         if (!tinyqwen::set_matvec_f16_impl_by_name(impl_name.c_str())) {
             tinyqwen::set_matvec_f16_impl_by_name("neon_mt_kv_nt");
         }
-        std::fprintf(stderr, "[init] matvec impl: %s (vq2 weights; lm_head f32: %s / f16: %s)\n",
+        // 同理，embed/lm_head 存紧凑 INT4 时 i4 注册表也要选优化内核
+        if (!tinyqwen::set_matvec_i4_impl_by_name(impl_name.c_str())) {
+            tinyqwen::set_matvec_i4_impl_by_name("sdot4_mt");
+        }
+        std::fprintf(stderr,
+                     "[init] matvec impl: %s (vq2 weights; lm_head f32: %s / f16: %s / i4: %s)\n",
                      tinyqwen::matvec_vq2_impl_name(), tinyqwen::matvec_impl_name(),
-                     tinyqwen::matvec_f16_impl_name());
+                     tinyqwen::matvec_f16_impl_name(), tinyqwen::matvec_i4_impl_name());
     } else if (is_i4) {
         if (!tinyqwen::set_matvec_i4_impl_by_name(impl_name.c_str())) {
             std::fprintf(stderr,

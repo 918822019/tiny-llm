@@ -28,11 +28,12 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
 | `matvec/matvec_f16_neon_mt_kv_nt.cpp`  | fp16 权重满栈移植（流量减半）               |
 | `matvec/matvec_i4_sdot2.cpp`           | INT4 W4A8 SDOT + 预计算（首个反超 f16）  |
 | `matvec/matvec_i4_sdot4.cpp`           | **当前 decode 最佳**：W4A8 + work-stealing + 硬件 FCVT |
+| `biip/biip_rotate_neon.cpp`            | BiIP 激活旋转 NEON 版（旋转 VQ2 模型必经，与 ref 逐位一致） |
 
 ## 当前状态
 
 - 参考实现齐全：rmsnorm / rope / matvec（f32/f16/i4）/ matmul（f32/i4，prefill 用）/
-  softmax / attention / silu / argmax + GDN 四算子（Qwen3.5）。
+  softmax / attention / silu / argmax + GDN 四算子（Qwen3.5）+ BiIP 激活旋转。
 - matvec 走**四套独立注册表**（f32/f16/i4/vq2，按模型 dtype 解析，配错 fail fast）：
   - f32：`ref`（默认）/ `double_2_float` / `acc4` / `neon_nofma` / `neon` /
     `neon_mt` / `neon_mt_bal` / `neon_mt_kv` / `neon_mt_kv_nt`（CPU 阶梯顶层）
@@ -42,7 +43,7 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
     **`sdot4(_mt)`（当前 decode 最佳）** / `sdot5(_mt)`（对称量化实验，配
     `--symmetric` 模型）。
   - vq2（2-bit 块向量量化）：`ref` / `neon` / `neon_mr` / `neon_mr_mt` /
-    **`neon_mr_mt_wl`（当前最佳，推荐）**。
+    `neon_mr_mt_wl` / **`neon_mr_mt_wl_nt`（当前最佳，推荐）**。
 - **vq2 kernel 阶梯**（归因用，只增不删）：
   `ref`（double 累加锚，纯标量查表）→ `neon`（4 宽 SIMD：查表喂 1 条
   float32x4 FMA 链）→ `neon_mr`（+4 行并行：4 条独立 FMA 链隐藏延迟 +
@@ -50,8 +51,17 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
   粒度阈值 262144 元素，vs neon_mr 再 3.2–3.8×）→ `neon_mr_mt_wl`
   （+索引 32 位字加载：4 块展开，每块 load 数 9→6；**尺寸门**——实测
   收益只在 DRAM 流式大形状，索引区 ≥8MB 才走字加载体，否则退回字节体。
-  lm_head 1.35 ms（分进程实测 1.48×），中小形状零回归）。
-  lm_head vs ref 合计 **~76×**。
+  lm_head 1.35 ms（分进程实测 1.48×），中小形状零回归）
+  → **`neon_mr_mt_wl_nt`**（+索引流一条 `ldnp x,x` 取 **16** 个索引。
+  **归因（做过隔离实验）**：收益来自**载入变宽**——每层 7 投影之和 0.313→0.205 ms
+  （**1.53×**，用同宽度的普通 `ldp` 测得）；而 `ldnp` 的**非临时语义拿不出证据**，
+  换成 `ldp` 后 lm_head 读数与之完全重叠（效应在噪声之下）。原假设"码本 4KB
+  必须常驻 L1、索引流会挤它"的**前提也未验证**（4KB 落在 128KB 8 路 L1、每周期
+  都访问，可能压根没被挤过）。名字里的 `nt` 只表示用了哪条指令。
+  用 GPR 对而非 q 寄存器对，因为索引要参与地址计算。
+  端到端 decode 1.077×、Qwen3.5-0.8B VQ2 1.28×，逐位一致。
+  行起点须 8B 对齐（`n_blocks % 8 == 0`），否则退回上一级）。
+  lm_head vs ref 合计 **~89×**。
   评测用 `./scripts/bench_kernels.sh --family vq2`（见 docs/optimization.md §6；
   mt 变体对比须分进程，避免常驻池互扰）。
 - **i4 kernel 阶梯**（归因用，只增不删）：
@@ -63,8 +73,14 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
 - **被证伪的尝试**（代码保留供对照，默认不启用）：融合 W4A8 批量 matmul
   （`qwen_forward_prefill_qwen35.cpp` 内，`TINYQWEN_FUSED_MM` 开关）——
   手写 NEON SDOT 干不过 AMX sgemm，0.70×。
-- 非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax + GDN 四算子）共用 ops
-  注册表：`ref` 兜底 + `neon` 变体，`--ops-impl` 开关选择；partial_rope 仅 ref。
+- 非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax + GDN 四算子 + BiIP
+  激活旋转）共用 ops 注册表：`ref` 兜底 + `neon` 变体，`--ops-impl` 开关选择；
+  partial_rope 仅 ref。
+- **BiIP 激活旋转**：`biip/biip_rotate.cpp`（ref）+ `biip/biip_rotate_neon.cpp`。
+  旋转量化模型每个子层有各自的 sign/scale，旋转不能复用也不能融合——
+  Qwen3-0.6B 每 token 调 196 次（7 子层 × 28 层），是 decode 的必经开销。
+  NEON 版内核 2.30×（1.047→0.456 ms/token），**与 ref 逐位一致**：除法用
+  `vdivq_f32` 不用近似倒数、butterfly 不重结合、末尾 `1/sqrt(bs)` 单独一遍。
 - **批量 prefill（Qwen3.5）**：`runtime/qwen_forward_prefill_qwen35.cpp`——
   prompt ≥32 token 时，线性投影反量化到 fp32 走 Accelerate/AMX sgemm
   （权重每层只读一遍），GDN 递归与因果 attention 保留逐 token 顺序扫描。

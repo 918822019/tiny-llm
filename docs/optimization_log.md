@@ -2120,6 +2120,235 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
 
 ---
 
+### qwen3_06b_vq2_qat（2026-08-28，macOS，真实 2-bit 旋转模型端到端落地）
+
+兑现 `vq2_kernel_ladder` 留下的「端到端待真实旋转 2-bit 模型落地后补测」。
+
+- **优化栈**：VQ2 kernel 阶梯（neon_mr_mt_wl）+ 本次的 Qwen3 稠密架构支持 +
+  QAT 产物桥接 + embed INT4。
+- **是什么**：把 kronq VQ-QAT（BiIP 旋转 + GPTQ-VQ + TwoPass 码本 + KL 蒸馏）
+  训出的 Qwen3-0.6B 2-bit 权重跑进 runtime。三块工作：① runtime 接入 Qwen3
+  稠密架构；② 新增桥接导出器 `tools/export_qat_vq2_to_tiny.py`；③ embed 用上游
+  已量化的 INT4 表逐位转码。
+
+- **端到端结果**（M4；PPL 为 wikitext-2 test 非重叠 512-token 窗口，前 10240 token）：
+  | 配置 | 体积 | decode 中位 ms/tok | PPL |
+  |---|---:|---:|---:|
+  | f16 基线 | 1136.9 MB | 13.42 | 30.61 |
+  | VQ2-QAT + embed f16 | 404.6 MB | 19.70 | 35.96 |
+  | **VQ2-QAT + embed INT4** | **191.3 MB** | **11.33** | **36.10** |
+  | 对照：免校准 k-means VQ2 | 403.5 MB | — | **1380890** |
+  最终配置 vs f16：体积 **5.9×** 小、decode **1.18×** 快、PPL +18%。
+
+- **反直觉归因（本条最值钱的部分）**：**2-bit 本身没带来提速，提速来自 embed。**
+  线性层 f16→2-bit 把权重流量砍 8×，但 decode 反而从 13.42 变慢到 19.70 ms/tok。
+  原因是 405 MB 里 311 MB 是 f16 的 embed/lm_head（tied，decode 每 token 读一遍
+  151936×1024），两个配置都在付这笔钱；而 VQ2 matvec 是 gather 绑（见
+  `vq2_kernel_ladder` 的瓶颈定位），单位字节效率远低于 f16 的顺序流式。
+  把 embed 换成 INT4 后 lm_head 从 111 ms 降到 35 ms，decode 才真正低于 f16。
+  → **量化收益要按"谁占 decode 流量"分配，不是按"哪层参数多"**。
+
+- **修掉的缺陷**：VQ2 文件的 impl 选择只给 f32/f16 注册表设了优化内核（`main.cpp`
+  里还专门注释了「否则 lm_head 落 ref」），**漏了 i4 注册表**。于是 VQ2 + INT4
+  embed 这个组合的 lm_head 一直落在标量 ref 上：lm_head 2930 ms、decode
+  101.04 ms/tok。补上后 lm_head 35.28 ms（**83×**）、decode 11.33（**8.9×**）。
+  教训：每加一种 embed dtype 组合，都要回头检查所有 dtype 注册表的选择路径。
+
+- **Qwen3 稠密架构接入**：与 Qwen2.5 的差异只有两处可选权重，runtime 按**权重
+  存在性**识别，不改文件格式（沿用 `bind_rot` 的既有惯例）：
+  - `attention_bias=false` → 无 q/k/v bias。decode 路径三处 bias 加法此前无守卫
+    （batch prefill 已有），补齐；
+  - 有 `q_norm`/`k_norm`（RoPE 之前的 per-head RMSNorm）。此前只在 Qwen3.5
+    full-attention 分支实现，补到 Qwen2 族的 decode 与 batch prefill 两条路径。
+    注意 Qwen3 的是**标准** RMSNorm，导出时不折 +1（Qwen3.5 是 zero-centered 要折）；
+  - `head_dim(128) * n_heads(16) = 2048 != hidden(1024)`：runtime 原本就按 head_dim
+    推导维度，无需改动。
+
+- **旋转参数：先反解，后与 ground truth 对照**。拿到上游 deploy pack 之前，
+  旋转参数只能从工作区内反解，过程与结论都可复现：
+  - **块大小可证伪**：扫描候选 B，R2 在 **B=256 处尖峰**（0.756）而相邻
+    B=128/512 骤降到 0.228 —— 恰好等于 `find_hadamard_block_size(1024)`；
+  - **sign 是确定性的**：`seed = layer*100 + 子层序号` 播种 `torch.randint`，
+    与盲反解一致率 99.98%；
+  - **scaleH 不可省**：最初误判"已被中和"，只写 sign 的模型生成退化；
+    `(diagH/diagW²)^0.25` 复算后 PPL **42.05 → 35.96**（最小二乘反解的 scaleH
+    在退化列上有 1e3~1e4 量级离群估计，真 scaleH 是四次根不可能这么大）。
+  - **拿到 pack 后逐项验证**：sign **196/196 逐位一致**、scaleH 最大偏差 0.3%、
+    中和子层数与位置都一致（2 个：layer 2/27 的 down_proj）。两种来源导出的
+    700 个张量里唯一不同的就是 194 个 `rot_scale`。
+
+- **验证**：
+  - `align_fake_model.py --arch qwen3` vs HF `Qwen3ForCausalLM`：worst
+    max_abs_err **4.17e-7**（tol 1e-5）；Qwen2 回归 3.28e-7 无变化；
+  - 批量 prefill vs 逐 token prefill（54-token prompt）生成 token 逐个一致；
+  - 码本+索引提取：pack 的 `cb[idx]` 与 QAT 稠密权重**逐位一致**，
+    码本值精确落在 fp16 上（往返误差 0）——桥接不引入新量化误差；
+  - `ctest` 166 单测全过，`./scripts/verify.sh` 干净。
+
+- **意外 / 教训**：
+  - **免校准 k-means VQ2 的 PPL 是 138 万**——文档说的"2-bit 无旋转退化"不是
+    修辞。旋转 + QAT 带来 3.8 万× 的 PPL 改善，这是 2-bit 能不能用的分水岭。
+  - 绝对 PPL 强依赖评测协议：同一个 f16 模型在 1022 token / 2 块下是 24.47，
+    在 10220 token / 20 块下是 30.61。跨机器比 PPL 必须先对齐 chunk 长度与切片，
+    上游报的 25.88 与本地 36.10 的差距主要来自这里，不是部署不忠实。
+- **复现**：
+  ```bash
+  python tools/export_qat_vq2_to_tiny.py --model models/Qwen3-0.6B \
+      --pack vq_qat_qwen3_06b/deploy_qwen3_06b_vq_2bit --out model_qwen3_06b_vq2_ei4.tqwen
+  python tools/bench.py --model model_qwen3_06b_vq2_ei4.tqwen \
+      --binary build/runtime/tinyqwen --label qwen3-06b-vq2-qat-ei4 \
+      --extra-args "--matvec-impl neon_mr_mt_wl --ops-impl neon"
+  python tools/eval_ppl.py --model model_qwen3_06b_vq2_ei4.tqwen \
+      --tokens-npy benchmarks/wikitext2_test_tokens_qwen3.npy --chunk-len 512 \
+      --matvec-impl neon_mr_mt_wl
+  ```
+
+---
+
+### biip_rotate_neon（2026-08-28，macOS，旋转 VQ2 热路径最后一个标量算子）
+
+- **优化栈**：`qwen3_06b_vq2_qat`（VQ2-QAT + embed INT4 + neon_mr_mt_wl + ops neon）
+  + 本次的 BiIP 激活旋转 NEON 化。
+- **是什么**：`biip_rotate_activation` 此前只有一个标量实现、且**不在任何变体
+  注册表里**（`kernels/biip/` 只有一个文件）。把它接入与 rmsnorm/rope 共用的
+  ops 分发（共享 `--ops-impl` 名字、未注册兜底 `_ref`），并加 NEON 变体。
+- **为什么它值得动**：旋转模型每个子层有各自的 sign/scale，**旋转不能跨子层复用
+  也不能融合**——Qwen3-0.6B 每 token 要调 196 次（7 子层 × 28 层）。剖析时它藏在
+  `qkv_proj`/`gate_up_proj` 等 scope 内部，端到端 profile 看不见，必须靠微基准隔离。
+- **先补微基准**：`bench_kernels` 的 biip 段原本只测 dim=896、block 4/8/16/64，
+  与真实形状（in_dim ∈ {1024, 2048, 3072}、block 一律 256）完全不符。补成真实形状
+  并按 ref/neon 两个变体枚举、折算每 token 开销。
+- **内核结果**（M4，同进程 A/B）：
+  | dim | ref | neon | |
+  |---|---:|---:|---|
+  | 1024（每 token 140 次） | 3.90 us / 4.20 GB/s | 1.65 us / 9.92 GB/s | |
+  | 2048（28 次） | 7.77 us / 4.22 GB/s | 3.53 us / 9.28 GB/s | |
+  | 3072（28 次） | 10.13 us / 4.85 GB/s | 4.51 us / 10.90 GB/s | |
+  | **每 token 合计** | **1.047 ms** | **0.456 ms** | **2.30×** |
+- **端到端**：decode 中位 **11.33 → 10.87 ms/tok（1.04×）**，TTFT 27.64 → 24.6 ms。
+- **隔离归因的做法（可复用）**：ops 分发共享一个实现名，`--ops-impl ref` 会把
+  6 个算子一起打回标量，A/B 不干净。做法是**临时给 NEON biip 加第二个注册名**
+  （只有 biip 注册它），于是 `--ops-impl <该名>` = 仅 biip 走 NEON、其余 5 个回落
+  ref，与 `--ops-impl ref` 对照即精确隔离。测完删掉。结果可加且自洽：
+  | 配置 | decode ms/tok |
+  |---|---:|
+  | 全 ref | 12.46 |
+  | 仅 biip NEON | 12.04（−0.42） |
+  | 全 6 个 ops NEON | 10.95（再 −1.09） |
+  反推"5 ops NEON + biip 标量" = 11.37，与改动前实测 11.33 吻合。
+- **为什么端到端（0.42 ms）小于内核（0.59 ms）**：旋转紧跟在 VQ2 matvec 之前，
+  它的一部分延迟被 matvec 的访存停顿掩盖——微基准里没有这个重叠。
+- **验证**：NEON 版与 `_ref` **逐位一致**（差恒为 0，非容差比较），
+  新增 `biip_rotate_neon_matches_ref` / `_inplace_safe` 两个用例覆盖真实形状
+  1024/2048/3072 + 边界块大小 128/4/2 + scaleH 中和路径 + 原地安全（168 单测）。
+  逐位一致是设计前提：除法用 `vdivq_f32`（不用 `vrecpe` 近似）、butterfly 不做
+  重结合、末尾 `1/sqrt(bs)` 仍单独一遍（block=128 时它不是 2 的幂，提前折进
+  逐元素段会改变舍入）。端到端生成 token 逐个不变。
+- **瓶颈转移**：旋转从 9.2% 降到 ~4%。剖析占比仍是线性层 4 组投影 **88.9%**
+  （gate_up 31.2 / qkv 27.2 / down 17.5 / o 13.0），即 VQ2 matvec 本身——
+  而 `vq2_kernel_ladder` 已把它归因为"load 发射 + 依赖查表绑"且 CPU 侧常规空间耗尽。
+  下一刀的候选（按预期收益排序）：① 减少 fork-join：旋转使 q/k/v、gate/up 去融合，
+  每 token 196 次 fork-join（融合态是 112），需要"多权重 + 多输入"的 matvec 变体；
+  ② butterfly 改 radix-4，访存往返 8 级降到 4 级（内核再 ~1.7×，但只剩 0.46 ms 可省）。
+- **本轮的两个探索（均未落地，证伪/待定归档）**：
+  - **fork-join 融合——证伪**。假设"旋转使 q/k/v、gate/up 去融合，每 token
+    196 次 fork-join（融合态 112）是可观开销"。做法是往 `bench_kernels` 加
+    Qwen3-0.6B 真实形状 + **融合等价形状**（q/k/v 输出维拼成 4096×1024、
+    gate/up 拼成 6144×1024），直接对比"拆开测之和"与"一次测"：
+    | | 拆开之和 | 融合形状 | 省 |
+    |---|---:|---:|---:|
+    | q+k+v | 0.034+0.026+0.019 = 0.079 ms | 0.071 ms | 0.008 ms |
+    | gate+up | 0.049+0.050 = 0.099 ms | 0.099 ms | **0** |
+    gate/up 融合省 **0**；q/k/v 那 0.008 ms 还落在噪声里（k_proj 0.026 与
+    v_proj 0.019 形状完全相同却差 0.007 ms）。折算全模型上限 0.22 ms，
+    不值得"多权重 + 多输入"那套新 API。**先加融合等价形状再决定，省下了整套实现。**
+  - **字加载尺寸门 8MB 偏高——待定**。分进程重测没能复现"中小形状倒退 2.3×"
+    （196KB 处字加载反而快 1.45×，28KB 处持平）；而 Qwen3-0.6B 各层索引区仅
+    0.25–0.75 MB 全被门挡住，且它们在真实 decode 里是 DRAM 冷的（微基准重复
+    同一矩阵使其常驻 L2，条件相反）。一次成对测量给出 decode 1.064× +
+    prefill TTFT 1.33×，但持续压测后热噪声升到 ±3ms（同配置 10.59 vs 14.01）
+    无法复现，且有一轮显示既有 Qwen3.5 VQ2 模型退化 1.07×。
+    **按"优化后必须复测"的纪律未改默认值**，线索与复现方法记在
+    `matvec_vq2_neon_mr_mt_wl.cpp` 文件头，待冷机 ABA 成对测量。
+    教训：长时间连续压测会让 M4 的噪声超过待测效应，成对 A/B 必须冷机做。
+- **复现**：
+  ```bash
+  ./scripts/bench_kernels.sh --family vq2                       # biip ref vs neon A/B
+  ./build/benchmarks/bench_kernels --family vq2 --preset qwen3_06b  # 真实形状+融合等价形状
+  python tools/bench.py --model model_qwen3_06b_vq2_ei4.tqwen \
+      --binary build/runtime/tinyqwen --label biip_rotate_neon \
+      --extra-args "--matvec-impl neon_mr_mt_wl --ops-impl neon"
+  ```
+
+---
+
+### vq2_wl_nt（2026-08-28，macOS，索引流非临时加载——补上 vq2 阶梯缺失的 nt 级）
+
+- **优化栈**：`biip_rotate_neon` + 本次的索引流 LDNP。
+- **是什么**：vq2 内核阶梯停在 `neon_mr_mt_wl`，**没有 nt 级**——而 f32/f16 两族
+  早就有（`matvec_f32_neon_mt_kv_nt.cpp` / `matvec_f16_...`）。新增
+  `neon_mr_mt_wl_nt`：索引流改用内联汇编 `ldnp x0, x1, [p]`。
+- **假设（原以为是缓存驻留类）**：码本 fp32 展开只有 **4KB**，却每个索引都要
+  访问；而索引流每 token 有 105 MB、全是用一次就不再用的数据，普通 load 会
+  持续在 L1/L2 分配行挤压码本 —— LDNP 的非临时提示正是治这个。顺带第二重
+  收益：一条 LDNP 取 **16** 个索引（`wl` 的 32 位 LDR 只取 4 个）。
+- **⚠️ 归因修正（隔离实验证伪了前一半）**：把 `ldnp` 换成**同宽度**的普通 `ldp`
+  做对照，lm_head（37MB，真流式）上两组读数**完全重叠**：
+  ldp 1.853/1.753/1.570 vs ldnp 1.510/2.089/1.652——最优对最优 1.04×，但 ldnp
+  有一轮比 ldp 全部读数都差。**非临时提示的效应在噪声之下。**
+  - 真正的收益全部来自**载入变宽**：逐字节体 0.313 → 16 宽 `ldp` 0.205 ms = **1.53×**。
+  - 而"码本会被挤出 L1"这个前提**也从未验证**：4KB 落在 128KB 8 路 L1 里、
+    每周期都在访问，很可能压根没被挤出去过——那正好解释了提示为什么不起作用。
+    要证实需要 L1D miss 的硬件计数器，本机没现成通路。
+  - 保留 `ldnp`：同宽同对齐要求、实测不更差，且与 f32/f16 的 nt 级同一条指令。
+    但**变体名里的 `nt` 只是描述用了哪条指令，不代表非临时语义带来了收益**。
+  教训：一个改动同时动了两个变量（宽度 + 缓存语义）时，必须各自做一次隔离
+  实验才能写归因。这条我第一版写错了。
+- **为什么用 GPR 对而不是 q 寄存器对**：索引要参与地址计算，留在通用寄存器里
+  才不用付向量→GPR 搬运的代价（aarch64 上是每字节一条 `umov`）。f32 那级用
+  `ldnp q,q` 是因为它加载的是直接进 FMA 的权重，不需要回到 GPR。
+- **内核结果**（分进程 A/B，`--impls ref,<单一实现>`）：
+  | 形状 | wl | wl_nt | |
+  |---|---:|---:|---:|
+  | q_proj 2048×1024 | 0.040 ms | 0.022 ms | 1.82× |
+  | o_proj 1024×2048 | 0.040 ms | 0.023 ms | 1.74× |
+  | gate 3072×1024 | 0.068 ms | 0.039 ms | 1.74× |
+  | down 1024×3072 | 0.068 ms | 0.034 ms | **2.00×** |
+  | lm_head 151936×1024 | 1.607 ms | 1.358 ms | 1.18× |
+  | **每层 7 投影之和** | **0.313 ms** | **0.184 ms** | **1.70×** |
+- **端到端**（6 轮交替 A/B，各取最优读数）：
+  - Qwen3-0.6B VQ2：decode **10.94 → 10.16 ms/tok（1.077×）**；TTFT 明显改善
+    （4/4 轮，均值 29.6 → 20.0 ms）。且 wl_nt **更稳**：4/6 轮落在 10.45，
+    而 wl 有 3/6 轮飙到 18.5——指令更少、热压力更小。
+  - 既有 Qwen3.5-0.8B VQ2：**23.33 → 18.24 ms/tok（1.28×）**，输出逐 token 一致。
+- **为什么微基准 1.70× 只兑现成端到端 1.077×**：微基准把同一个 0.3–0.8 MB 矩阵
+  重复几千次，它常驻 L2，量的是**发射侧吞吐**；真实 decode 每 token 要从 DRAM
+  取 105 MB 索引 + 83 MB i4 embed，内核省下的指令大部分被 DRAM 延迟掩盖。
+  **这条也解释了为什么 lm_head(37MB，真流式) 只有 1.18× 而小形状有 1.7–2.0×。**
+  教训：VQ2 这种"权重每 token 只读一次"的形状，微基准的增益上限要按 DRAM 侧
+  折价看，不能直接外推。
+- **验证**：`rel` 误差与 `wl` **完全相同**（3.41e-07 / 4.48e-07 / 6.17e-07 / 5.43e-07
+  逐项一致）→ 逐位一致；两个 VQ2 模型生成 token 逐个不变；168 单测全过；
+  `./scripts/verify.sh` 干净；Qwen3 对齐仍 4.17e-07。
+  守卫：LDNP 用 GPR 对需行起点 8B 对齐（行起点 = idx_base + row×n_blocks，
+  故要求 `n_blocks % 8 == 0`），不满足就退回上一级——与 f32 nt 级同款。
+- **瓶颈转移**：VQ2 matvec 从剖析 88.9% 降下来一截，但仍是大头。查表依赖链
+  （idx → 算地址 → 载码本）没被触动——那需要向量 gather，而 M4 没有：
+  `FEAT_SVE` 键不存在（无非流式 SVE），SME 有但 SVE gather 在 streaming 模式下
+  架构禁止；NEON 只有 `TBL`，表上限 4 个向量寄存器 = **64 字节**，装不下 4KB 码本
+  （差 64×）。要用上 TBL 只能改成乘积/残差 VQ（8-bit 索引拆两个 4-bit，
+  16 条目子码本 × 4 维 × int8 = 恰好 64B），那是换量化方案、要上游重训。
+- **复现**：
+  ```bash
+  ./build/benchmarks/bench_kernels --family vq2 --preset qwen3_06b \
+      --impls ref,neon_mr_mt_wl_nt          # 分进程，勿与其它 mt 变体同测
+  python tools/bench.py --model model_qwen3_06b_vq2_ei4.tqwen \
+      --binary build/runtime/tinyqwen --label vq2_wl_nt \
+      --extra-args "--matvec-impl neon_mr_mt_wl_nt --ops-impl neon"
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

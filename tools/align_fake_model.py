@@ -164,11 +164,16 @@ def main() -> None:
     """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--binary", default="build/runtime/tinyqwen")  # C++ binary 路径
+    p.add_argument("--arch", choices=["qwen2", "qwen3"], default="qwen2",
+                   help="qwen2=带 q/k/v bias；qwen3=无 bias + QK RMSNorm")
     args = p.parse_args()
 
     import numpy as np   # 数值计算
     import torch         # PyTorch tensor 操作
-    from transformers import Qwen2Config, Qwen2ForCausalLM  # HF Qwen2 模型
+    if args.arch == "qwen3":
+        from transformers import Qwen3Config as HFConfig, Qwen3ForCausalLM as HFModel
+    else:
+        from transformers import Qwen2Config as HFConfig, Qwen2ForCausalLM as HFModel
 
     # 在临时目录中生成 fake 模型并运行 C++ binary
     with tempfile.TemporaryDirectory() as tmp_d:
@@ -176,7 +181,8 @@ def main() -> None:
         model_path = tmp / "fake.tqwen"  # fake 模型的临时路径
         # 调用 make_fake_model.py 生成随机权重的小模型
         subprocess.run([sys.executable, "tools/make_fake_model.py",
-                        "--out", str(model_path)], check=True, capture_output=True)
+                        "--out", str(model_path), "--arch", args.arch],
+                       check=True, capture_output=True)
         # 读取 fake 模型的配置和权重
         cfg, tensors = read_tqwen(model_path)
         # 运行 C++ runtime 获取生成结果和 logits
@@ -184,7 +190,7 @@ def main() -> None:
 
     # 用完全相同的配置和权重构造 HF 参考模型。
     # 配置必须与 fake 模型完全一致，确保两侧计算图等价。
-    hf_cfg = Qwen2Config(
+    hf_cfg = HFConfig(
         hidden_size=cfg["hidden_size"],                   # 隐藏层维度
         intermediate_size=cfg["intermediate_size"],       # MLP 中间维度
         num_hidden_layers=cfg["n_layers"],                # transformer 层数
@@ -200,7 +206,7 @@ def main() -> None:
     )
     # 强制使用 eager attention（非 flash/sdpa），避免优化实现引入数值差异
     hf_cfg._attn_implementation = "eager"
-    model = Qwen2ForCausalLM(hf_cfg).eval()  # 创建模型并设为 eval 模式
+    model = HFModel(hf_cfg).eval()  # 创建模型并设为 eval 模式
     # 将 numpy 权重转为 torch tensor 并加载到 HF 模型
     missing, unexpected = model.load_state_dict(
         {k: torch.from_numpy(v) for k, v in tensors.items()}, strict=False)

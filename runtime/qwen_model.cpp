@@ -372,6 +372,14 @@ namespace tinyqwen {
             *out = m->bind_f32_vector(t); // 小向量转为 fp32 副本
             return true;
         };
+        // 可选小向量：文件里没有就留 nullptr，存在则照常校验形状。
+        // Qwen2.5 有 attention bias 无 QK norm，Qwen3 稠密反之——两者共用
+        // MODEL_QWEN2 族分支，靠权重存在性区分（与 bind_rot 同一惯例）。
+        const auto opt_vec = [&](const char *name, std::vector<uint64_t> shape,
+                                 const float **out) -> bool {
+            if (!file.get(name)) return true;
+            return bind_vec(name, std::move(shape), out);
+        };
 
         // 绑定单个子层的 BiIP 旋转参数（可选）：存在 {prefix}.rot_sign 才视为被旋转。
         // sign/scale 存 f16，转 fp32 副本；block_size 由 in_f 推导。命中即置 rotated_。
@@ -477,13 +485,24 @@ namespace tinyqwen {
                     return false;
                 if (!bind_mat((p + "self_attn.v_proj.weight").c_str(), {kvd, hidden}, &w.v_proj))
                     return false;
-                // Qwen2.x 的 q/k/v 有 bias 向量
-                if (!bind_vec((p + "self_attn.q_proj.bias").c_str(), {qd}, &w.q_bias))
+                // q/k/v bias：Qwen2.x 有，Qwen3 稠密（attention_bias=false）没有
+                if (!opt_vec((p + "self_attn.q_proj.bias").c_str(), {qd}, &w.q_bias))
                     return false;
-                if (!bind_vec((p + "self_attn.k_proj.bias").c_str(), {kvd}, &w.k_bias))
+                if (!opt_vec((p + "self_attn.k_proj.bias").c_str(), {kvd}, &w.k_bias))
                     return false;
-                if (!bind_vec((p + "self_attn.v_proj.bias").c_str(), {kvd}, &w.v_bias))
+                if (!opt_vec((p + "self_attn.v_proj.bias").c_str(), {kvd}, &w.v_bias))
                     return false;
+                // QK per-head RMSNorm：Qwen3 稠密有，Qwen2.x 没有
+                if (!opt_vec((p + "self_attn.q_norm.weight").c_str(), {cfg.head_dim}, &w.q_norm))
+                    return false;
+                if (!opt_vec((p + "self_attn.k_norm.weight").c_str(), {cfg.head_dim}, &w.k_norm))
+                    return false;
+                if ((w.q_norm == nullptr) != (w.k_norm == nullptr)) {
+                    if (err)
+                        *err = "layer " + std::to_string(i) +
+                               ": q_norm/k_norm must both be present or both absent";
+                    return false;
+                }
                 if (!bind_mat((p + "self_attn.o_proj.weight").c_str(), {hidden, qd}, &w.o_proj))
                     return false;
                 // BiIP 旋转参数（旋转量化模型才有；否则全部 no-op）
