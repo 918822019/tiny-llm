@@ -39,6 +39,7 @@
 #include "backend_cpu.h"
 #include "config.h"
 #include "dispatch.h"
+#include "metal_prefill.h"
 #include "model_loader.h"
 #include "profiler.h"
 #include "qwen_model.h"
@@ -100,7 +101,7 @@ namespace {
                      "                          argmax): ref (default) / neon\n"
                      "  --kv-f16                store KV cache in fp16 (halves KV memory + attn\n"
                      "                          read bandwidth; store fp16, compute fp32)\n"
-                     "  --engine NAME           decode engine: '' = CPU forward (default) / cuda\n"
+                     "  --engine NAME           engine: '' = CPU forward (default) / cuda (decode) / metal (prefill)\n"
                      "                          (GPU-resident whole-forward; requires CUDA build)\n"
                      "  --backend NAME          compute backend: '' = CPU (default) / cuda\n"
                      "                          (per-operator CUDA; requires CUDA build)\n"
@@ -538,28 +539,50 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    // ---- 选择 decode engine（GPU-resident forward，opt-in）----
+    // ---- 选择 engine（GPU 上的整段 forward，opt-in）----
+    //
+    // 两个引擎管不同阶段，互斥：cuda 管 decode，metal 管 prefill。
+    // metal 接管 prefill 后 decode 仍走 CPU：它把 post-RoPE 的 K/V 写进
+    // model->kv_cache() 并 advance(n)，CPU decode 才能从位置 n 接续。
     std::string engine_name = args.engine;
     if (engine_name.empty()) engine_name = config.get("engine", "");
     tinyqwen::GpuDecodeEngine *engine = nullptr;
+    tinyqwen::MetalPrefillEngine *metal_engine = nullptr;
     if (!engine_name.empty()) {
-        if (!tinyqwen::set_gpu_decode_impl_by_name(engine_name.c_str())) {
-            std::fprintf(stderr, "error: unknown engine '%s' (available: %s)\n",
-                         engine_name.c_str(), tinyqwen::available_gpu_decode_impls());
-            return 2;
-        }
-        if (args.topk > 0 || !args.dump_logits.empty()) {
-            std::fprintf(stderr,
-                         "error: --topk / --dump-logits 在 --engine 下暂不支持（v1）\n");
-            return 2;
-        }
         std::string eerr;
-        if (!tinyqwen::gpu_decode_create(&file, args.max_seq_len, &eerr, &engine)) {
-            std::fprintf(stderr, "error: gpu engine create failed: %s\n", eerr.c_str());
-            return 1;
+        if (engine_name == "metal") {
+            if (!tinyqwen::metal_prefill_available()) {
+                std::fprintf(stderr, "error: --engine metal 仅在 Apple 平台可用\n");
+                return 2;
+            }
+            if (args.topk > 0) {
+                std::fprintf(stderr, "error: --topk 在 --engine metal 下暂不支持（用 --dump-logits）\n");
+                return 2;
+            }
+            if (!tinyqwen::metal_prefill_create(&file, args.max_seq_len, &eerr, &metal_engine)) {
+                std::fprintf(stderr, "error: metal engine create failed: %s\n", eerr.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "[init] prefill engine: metal (%s)\n",
+                         tinyqwen::metal_prefill_device_name(metal_engine).c_str());
+        } else {
+            if (!tinyqwen::set_gpu_decode_impl_by_name(engine_name.c_str())) {
+                std::fprintf(stderr, "error: unknown engine '%s' (available: cuda, metal)\n",
+                             engine_name.c_str());
+                return 2;
+            }
+            if (args.topk > 0 || !args.dump_logits.empty()) {
+                std::fprintf(stderr,
+                             "error: --topk / --dump-logits 在 --engine 下暂不支持（v1）\n");
+                return 2;
+            }
+            if (!tinyqwen::gpu_decode_create(&file, args.max_seq_len, &eerr, &engine)) {
+                std::fprintf(stderr, "error: gpu engine create failed: %s\n", eerr.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "[init] decode engine: %s (GPU-resident forward)\n",
+                         tinyqwen::gpu_decode_impl_name());
         }
-        std::fprintf(stderr, "[init] decode engine: %s (GPU-resident forward)\n",
-                     tinyqwen::gpu_decode_impl_name());
     }
 
     // engine 路径下由 main 驱动 profiler（forward_token 被绕过，不再自己记）
@@ -607,9 +630,9 @@ int main(int argc, char **argv) {
         }
     }
     // dump lambda：每次 forward 追加一行 vocab 个 fp32 logits
-    const auto dump = [&]() {
+    const auto dump = [&](const float *lg) {
         if (logits_out) {
-            std::fwrite(model->last_logits(), sizeof(float), file.config().vocab_size, logits_out);
+            std::fwrite(lg, sizeof(float), file.config().vocab_size, logits_out);
         }
     };
 
@@ -666,6 +689,8 @@ int main(int argc, char **argv) {
     // ---- prefill 阶段 ----
     int next = 0;
     tinyqwen::TopKResult topk;
+    const size_t vocab = file.config().vocab_size;
+    std::vector<float> metal_logits;
     if (engine) {
         // GPU-resident engine 没有批量 prefill 入口，只能逐 token 喂进去
         for (size_t i = 0; i < tokens.size(); ++i) {
@@ -675,13 +700,37 @@ int main(int argc, char **argv) {
                              tokens[i], next);
             }
         }
+    } else if (metal_engine) {
+        // Apple GPU 批量 prefill：整批一次前向。post-RoPE 的 K/V 写进 kv_cache
+        // 并 advance(n)，后面的 decode 仍走 CPU 路径。
+        // dump 口径：默认只写末位一行（与 CPU 批量 prefill 一致）；--verbose 时
+        // 写全部 n 行，供逐位置对齐用 —— 引擎本来就算了全部位置的 logits。
+        metal_logits.assign(tokens.size() * vocab, 0.0f);
+        std::string merr;
+        profiler.begin_token(0, 0, /*is_prefill=*/true);
+        next = tinyqwen::metal_prefill_run(metal_engine, tokens.data(),
+                                           static_cast<int>(tokens.size()), metal_logits.data(),
+                                           &model->kv_cache(), &merr);
+        profiler.end_token();
+        if (next < 0) {
+            std::fprintf(stderr, "error: metal prefill failed: %s\n", merr.c_str());
+            if (logits_out) std::fclose(logits_out);
+            tinyqwen::metal_prefill_destroy(metal_engine);
+            return 1;
+        }
+        if (args.verbose) {
+            for (size_t i = 0; i < tokens.size(); ++i)
+                dump(metal_logits.data() + i * vocab);
+        } else {
+            dump(metal_logits.data() + (tokens.size() - 1) * vocab);
+        }
     } else if (args.verbose) {
         // 逐 token prefill：可打印每步详情
         for (size_t i = 0; i < tokens.size(); ++i) {
             const bool last_prefill = i + 1 == tokens.size();
             const bool need_topk = args.topk > 0 && last_prefill;
             next = model->forward_token(tokens[i], need_topk ? &topk : nullptr, args.topk);
-            dump();
+            dump(model->last_logits());
             std::fprintf(stderr, "[prefill] %zu/%zu id=%d -> next=%d\n", i + 1, tokens.size(),
                          tokens[i], next);
         }
@@ -694,7 +743,7 @@ int main(int argc, char **argv) {
         profiler.end_token();
         // --dump-logits 时补一份 prefill 末位 logits（批量 prefill 对齐验证用；
         // 此前非 verbose 路径只 dump decode 位。现有对齐脚本走 --verbose，不受影响）
-        dump();
+        dump(model->last_logits());
     }
     std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
     if (args.topk > 0) print_topk(topk);
@@ -713,7 +762,7 @@ int main(int argc, char **argv) {
             next = engine_step(next, false);
         } else {
             next = model->forward_token(next, args.topk > 0 ? &topk : nullptr, args.topk);
-            dump();
+            dump(model->last_logits());
         }
         if (args.topk > 0) print_topk(topk);
     }
@@ -725,6 +774,7 @@ int main(int argc, char **argv) {
     profiler.set_counts(tokens.size(), generated.size());
 
     if (engine) tinyqwen::gpu_decode_destroy(engine);
+    if (metal_engine) tinyqwen::metal_prefill_destroy(metal_engine);
 
     if (!args.profile_out.empty()) {
         std::string werr;

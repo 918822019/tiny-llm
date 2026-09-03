@@ -64,6 +64,25 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 endif ()
 
 # ---------------------------------------------------------------------------
+# Metal prefill 引擎（仅 Apple 构建）
+# ---------------------------------------------------------------------------
+# TINYQWEN_HAS_METAL 由顶层 CMakeLists.txt 在 APPLE 时设置（并 enable_language(OBJCXX)）。
+# metal_prefill.mm 是 ObjC++：GEMM 走 MPS，整批 prompt prefill 常驻 GPU，
+# 见 runtime/metal_prefill.h 顶部的「与现有两条 GPU 路径的关系」。
+# 非 Apple 平台编译 stub，保证 main.cpp 无条件引用这几个符号也能链接。
+if (TINYQWEN_HAS_METAL)
+    target_sources(tinyqwen_runtime PRIVATE metal_prefill.mm)
+    # ARC：ObjC 对象引用计数交给编译器管理，避免手写 retain/release 出错
+    set_source_files_properties(metal_prefill.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(tinyqwen_runtime PUBLIC
+            "-framework Metal"
+            "-framework MetalPerformanceShaders"
+            "-framework Foundation")
+else ()
+    target_sources(tinyqwen_runtime PRIVATE metal_prefill_stub.cpp)
+endif ()
+
+# ---------------------------------------------------------------------------
 # CLI 可执行文件：tinyqwen
 # ---------------------------------------------------------------------------
 # main.cpp 提供命令行参数解析 + 推理循环入口

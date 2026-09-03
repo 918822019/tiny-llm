@@ -2349,6 +2349,597 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
 
 ---
 
+### Metal GPU prefill 引擎（`--engine metal`）（2026-09-02）
+
+> ⚠️ **本条不是 decode 优化，是新增的 prefill 通路**。主指标换成 **prefill TTFT（ms）**，
+> 与本表其余行不可直接比较。模型 Qwen3-0.6B（f16），机器 Apple M4。
+
+- **优化栈**：新增独立通路，不与 CPU decode 栈叠加。
+- **是什么**：新增 `runtime/metal_prefill.{h,mm}` + `--engine metal`。整批 prompt 一次
+  前向跑在 Apple GPU：GEMM 走 MPS `MPSMatrixMultiplication`，RMSNorm / per-head QK
+  norm / RoPE / causal attention / SiLU / 残差走自写 Metal compute kernel（shader 源码
+  内嵌在 .mm 里，create 时 `newLibraryWithSource` 编译）。每层一个 command buffer，
+  只 commit + wait 一次。prefill 结束把 post-RoPE 的 K/V 写进 runtime `KvCache` 并
+  `advance(n)`，所以 decode 仍走 CPU 且能正确接续。
+- **假设**：0.6B prefill 在这台机器上是**开销主导而非算力主导**（此前 MPS-PyTorch 实验
+  测出固定开销 ≈29.5 ms、边际 ≈0.485 ms/tok），所以收益主要来自"减少 GPU 同步与
+  对象分配次数"，而不是算得更快。
+- **结果**（`./scripts/bench_metal_prefill.sh`，同场 A/B，中位数 5 样本，预热丢弃；
+  CPU arm 用 f16 满栈 `--matvec-impl neon_mt_kv_nt --ops-impl neon`，**不是 ref**）：
+
+  | seq | CPU ms | Metal ms | speedup | Metal ms/tok |
+  |----:|-------:|---------:|--------:|-------------:|
+  | 16  | 161.76 | 183.56 | 0.88× | 11.47 |
+  | 32  | 307.79 | 188.47 | 1.63× |  5.89 |
+  | 64  | 610.61 | 312.52 | 1.95× |  4.88 |
+  | 128 | 1086.81 | 445.11 | 2.44× |  3.48 |
+  | 256 | 2425.87 | 729.58 | 3.33× |  2.85 |
+  | 512 | 5500.62 | 1531.59 | 3.59× |  2.99 |
+
+- **阶梯（本条内部的归因）**：
+
+  | 阶段 | seq=16 | seq=64 | seq=128 | 说明 |
+  |---|---:|---:|---:|---|
+  | M3：CPU elementwise + 每 GEMM 一个 command buffer | 210.02 | 314.27 | 515.31 | 起点 |
+  | M4a：elementwise 全迁 GPU compute kernel（每层 1 个 cb） | **323.20** | 440.13 | 467.50 | 短序列**变慢** |
+  | M4b：+ MPS 算子对象按 run 建一次、28 层复用 | **183.56** | 312.52 | 445.11 | 单项最大贡献 |
+
+- **意外 / 教训（最值钱的部分）**：
+  1. **单独把 elementwise 搬上 GPU 会让短序列变慢**（seq=16 从 210 → 323 ms）。
+     16 个 token 的 CPU elementwise 本来就是微秒级，换成 GPU dispatch 反而每次都要付
+     kernel 启动成本；`rmsnorm_rows` 在 n=16 时只发 16 个线程，线程组上限却是 1024，
+     绝大多数线程空转。**"搬上 GPU"本身不是优化，必须和"减少启动次数"一起做才成立。**
+  2. **真正的瓶颈是 `MPSMatrixMultiplication` 的构造次数，不是同步次数**。原先每次
+     GEMM 都新建一个算子对象：28 层 × 7 GEMM = **196 次 alloc/forward**。改成按
+     `resultRows/resultColumns/interiorColumns` 在 run 开头建 6 个对象、28 层复用
+     （k/v 同尺寸共用、gate/up 同尺寸共用），seq=16 立刻 323 → 184 ms（1.76×）。
+     这一刀比"每层一个 command buffer"贡献大得多。
+  3. **交叉点在 seq≈32**：32 起 Metal 就赢 CPU，16 仍略输（0.88×）。所以本通路适合
+     中长 prompt；极短 prompt 不值得走 GPU。
+  4. seq=512 的 ms/tok（2.99）比 seq=256（2.85）略差，说明 O(n²) 的 attention 开始
+     显现；当前 attention kernel 是"一个线程一个 (查询位置, q 头)"、分数存全局 scratch，
+     没有做 tiling，长序列要继续压就得改 flash 式分块。
+- **验证**：Qwen3-0.6B、tokens `3,7,11,2`，与 CPU 参考逐位对照 —— prefill 末位 logits
+  `max_abs_err = 3.91e-05`、`global_rel = 2.39e-06`，argmax 15087 一致；后续 3 个
+  decode 位置 logits 误差 2.6–3.6e-05、argmax 全部一致，**生成 token 序列与纯 CPU 跑
+  完全相同**（`15087 271 32313 11`）→ KV 交接正确。
+  误差比 M3（1.14e-05）略升，原因是 GPU RMSNorm 用 fp32 累加平方和而 CPU ref 用 fp64；
+  容差 5e-2 下余量充足。RoPE 的 cos/sin 表刻意留在 CPU 按 fp64 算好再上传，避免 GPU
+  fp32 三角函数引入偏差。
+- **瓶颈转移**：固定开销已从 210 ms 压到 ~184 ms（seq=16）。剩余大头是**每层 4 组 MPS
+  GEMM 调用**（q/k/v/o/gate/up/down = 7 次 encode）。下一刀是把 qkv 三路融合成 1 次、
+  gate/up 融合成 1 次，把每层 7 次降到 4 次；代价是要为拼接权重多留约 1.1 GB 显存
+  （0.6B 量级），或者改走 fp16 GEMM 腾出预算（会动数值口径）。
+- **复现**：
+  ```bash
+  ./scripts/bench_metal_prefill.sh                    # 默认 16 32 64 128 256 512
+  ./scripts/bench_metal_prefill.sh 128 512            # 只测指定长度
+  CPU_IMPL="--matvec-impl neon --ops-impl neon" ./scripts/bench_metal_prefill.sh   # 换 CPU 配方
+  ```
+  数值对照：
+  ```bash
+  ./build/runtime/tinyqwen --model model_qwen3_06b_f16.tqwen --tokens 3,7,11,2 \
+      --max-new-tokens 4 --max-seq-len 32 --engine metal --dump-logits /tmp/metal.bin
+  ./build/runtime/tinyqwen --model model_qwen3_06b_f16.tqwen --tokens 3,7,11,2 \
+      --max-new-tokens 4 --max-seq-len 32 --dump-logits /tmp/cpu.bin
+  ```
+
+---
+
+### Metal prefill attention kernel：float4 + 寄存器累加（2026-09-02）
+
+> 承接上一条「Metal GPU prefill 引擎」。主指标仍是 **prefill TTFT（ms）**。
+> 模型 Qwen3-0.6B（f16），机器 Apple M4。
+
+- **优化栈**：Metal GPU prefill（上一条）+ 本次 attention kernel 重写。
+- **是什么**：`causal_attn` compute kernel 重写 —— Q 一次性载入 `float4[hd/4]` 寄存器、
+  点积改 float4、softmax 加权累加改在寄存器里做后一次性写出。
+- **怎么定位到的**：写了隔离微基准逐个 kernel 计时（真实形状、真实 grid），
+  结果是 `causal_attn` 一家独大：
+
+  | seq | causal_attn/层 | compute kernel 合计/层 | attention 占比 |
+  |----:|---:|---:|---:|
+  | 16 | 0.72 ms | 2.87 ms | 25% |
+  | 64 | 2.77 ms | 5.19 ms | 53% |
+  | 128 | 6.66 ms | 8.77 ms | 76% |
+  | 512 | **36.47 ms** | 39.40 ms | **93%** |
+
+  seq=512 时 attention 占整个 prefill 的 ~69%（1021 / 1480 ms）。
+- **假设**：朴素写法有两个明确的访存缺陷 ——
+  1. `qp[i]` 在每个 s2 迭代里被重读（seq=512 → 每线程多读 512×128 次）；
+     hd=128 装不进寄存器，编译器只能每轮重新从内存取。
+  2. pass 3 直接 `op[i] += a * vp[i]` **写全局内存**，等于每线程 512×128 次全局写。
+  改成 float4 载入 + 寄存器累加后，载 K/V 指令数降到 1/4，全局写从 65536 次降到 32 次。
+- **结果**（`./scripts/bench_metal_prefill.sh`，同场 A/B，中位数 9 样本、预热 3 次）：
+
+  | seq | 优化前 metal_ms | 优化后 metal_ms | 提速 | speedup vs CPU |
+  |----:|---:|---:|---:|---:|
+  | 32  | 188.47 | 168.18 | 1.12× | 1.63× → 1.78× |
+  | 64  | 312.52 | 235.77 | 1.33× | 1.95× → 2.50× |
+  | 128 | 445.11 | 342.79 | 1.30× | 2.44× → 3.23× |
+  | 256 | 729.58 | 568.74 | 1.28× | 3.33× → 4.29× |
+  | 512 | 1531.59 | **1080.73** | **1.42×** | 3.59× → **5.01×** |
+
+- **验证**：Qwen3-0.6B、tokens `3,7,11,2`，prefill 末位 logits `max_abs_err = 3.24e-05`、
+  argmax 15087 与 CPU 一致；后续 3 个 decode 位置误差 2.7–3.0e-05、argmax 全一致，
+  生成序列 `15087 271 32313 11` 与纯 CPU 完全相同。168 单测全过，`verify.sh` 干净。
+  新增守卫：`head_dim % 4 == 0`（float4 对齐）与 `head_dim <= 128`（shader 里
+  `qv[32]`/`acc[32]` 固定容量）在 create 时 fail fast。
+- **证伪归档（同一轮里试过但被否掉的方案）**：**把 elementwise kernel 融合以减少
+  dispatch 次数**。做了三处融合：`rmsnorm_rows` 改线程组归约、per-head norm + RoPE
+  合成一个 kernel、残差 + RMSNorm 合成一个 kernel，每层 dispatch 从 10 次降到 5 次。
+  **结果全线变慢**（seq=512：1531 → 1791 ms，speedup 3.59× → 3.03×），已回退。
+  **教训**：GPU 上**并行度比 dispatch 次数更值钱**。RoPE 原本一个线程一对
+  （`n*NH*half`，seq=512 = 524288 线程），融合成一个线程一个头后只剩
+  `n*(NH+NKV)` = 12288 线程、每个要串行跑 64 轮 —— **并行度掉 43×**，远超过省下的
+  dispatch 开销。线程组归约版 rmsnorm 同理：256 线程/行 + 10 次 `threadgroup_barrier`
+  的同步成本吃掉了收益。**"减少 dispatch"这个直觉在 GPU 上不成立，要按并行度算账。**
+- **测量纪律（本轮踩到的坑，值得单独记）**：这台 M4 的 prefill 计时**跨进程波动极大**
+  —— 同一个配置、同一段代码，seq=128 三次测出 354 / 590 / 512 ms（离散度 2.1×）。
+  原因是 MPS kernel 每个进程都要重新 JIT + 连续测速导致热降频。
+  **后果**：先前几轮的对比有一部分是被噪声污染的。已给 `bench_metal_prefill.sh`
+  加上 `WARMUP=3`、`RUNS=9` 和**离散度列（max/min）**，离散度 >1.5 的行不可用于归因。
+  上表中 seq=256（散 1.12）/ seq=512（散 1.38）可信；seq=16（散 3.73）不可信。
+- **瓶颈转移**：attention 从 93% 降下来后，剩余大头回到 **MPS GEMM**（seq=512 约
+  158 ms/forward，来自微基准）与 **MPS 调用次数**（每层 7 次 encode）。下一刀仍是
+  qkv 三路融合 + gate/up 融合（7 → 4 次），代价是拼接权重要多留约 1.1 GB 显存。
+  理论下限对照：seq=512 算力下限 134 ms，当前 1081 ms，仍有 ~8× 空间。
+- **复现**：
+  ```bash
+  ./scripts/bench_metal_prefill.sh          # 默认 16 32 64 128 256 512，带离散度列
+  RUNS=15 WARMUP=5 ./scripts/bench_metal_prefill.sh 256 512   # 收紧噪声
+  ```
+
+---
+
+### 证伪归档：attention 按 s2 切块分给多线程（2026-09-02）
+
+> 承接上一条 attention float4 优化。**本次尝试失败并已回退**，记录原因。
+
+- **动机**：float4 之后 `causal_attn` 仍是 seq=512 的主要瓶颈（推导 ~570 ms）。
+  残留问题是 **causal masking 造成的负载不均衡**：一个线程一个 `(s1, h)`，
+  它要串行遍历 `s2 = 0..s1` —— `s1=0` 跑 1 轮、`s1=511` 跑 512 轮，**差 512 倍**，
+  GPU 耗时由最长的那些线程决定。float4 只降每轮成本，降不了轮数。
+- **做法**：把 s2 维度切成 8 块分给多线程 ——
+  `attn_partial`（grid = `s1 × nh × tiles`，每块算局部 max/sum/加权和，写进
+  global partial buffer）+ `attn_reduce`（合并各块，即 flash-attention 的
+  online softmax 组合公式）。
+- **结果：全线大幅变慢，已回退**：
+
+  | seq | 回退前（float4） | 切块后 | 变化 |
+  |----:|---:|---:|---:|
+  | 64  | 235.77 | 515.85 | **2.19× 慢** |
+  | 128 | 342.79 | 481.65 | 1.40× 慢 |
+  | 256 | 568.74 | 914.31 | 1.61× 慢 |
+  | 512 | 1080.73 | **2463.27** | **2.28× 慢** |
+
+- **为什么失败（两个叠加的原因）**：
+  1. **占用率崩掉**：线程数涨 8×（`n*NH` → `n*NH*8`），但每个线程仍然要持有
+     `float4 qv[32]` = **128 个寄存器**。线程数 × 寄存器数超出硬件预算 →
+     寄存器溢出到内存 / 并发线程数骤降。这是典型的"提高并行度反而变慢"。
+  2. **凭空多出巨量内存流量**：partial buffer 每层写 `n*NH*tiles*(HD+4)` floats
+     —— seq=512 时 512×16×8×132 = **34 MB/层**，28 层 ≈ **2 GB** 新增全局写 +
+     随后 reduce 还要读回来。原方案完全没有这块流量。
+- **教训**：
+  - **"切块提高并行度"不是无条件成立的**。当每线程的寄存器占用本来就很高时，
+    增加线程数会直接把占用率打崩。要先算 `线程数 × 每线程寄存器` 是否超预算。
+  - **两遍式（partial + reduce）的中间结果若走 global memory，代价可能远超
+    它省下的串行时间**。flash-attention 的正确做法是让 partial 走
+    **threadgroup memory**（片上），不落 global —— 这是本次失败与真正
+    flash-attention 的关键差别。
+  - 结合上一条（融合 kernel 掉并行度）：**GPU 优化必须同时算两笔账 ——
+    并行度和寄存器/内存预算。只顾一头就会反向优化。**
+- **下一步的正确解法**：threadgroup 协作的 flash-attention —— 一个 threadgroup
+  负责一个 `(s1, h)`，组内线程分摊 s2，局部结果走 threadgroup memory 合并，
+  **不落 global**。这样既消除负载不均衡，又不增加内存流量。需要重新设计
+  寄存器用量（每线程只持有一部分 hd）。
+- **验证**：回退后 prefill `max_abs_err = 3.2425e-05`、argmax 15087 与 CPU 一致，
+  生成序列 `15087 271 32313 11` 与纯 CPU 完全相同；168 单测全过。
+
+---
+
+### Metal attention：threadgroup 协作版（2026-09-02）
+
+> 承接前两条。**本次成功**，但同时暴露了一个重要的测量方法论问题。
+
+- **优化栈**：Metal GPU prefill + attention float4（上一条）+ 本次 threadgroup 协作。
+- **是什么**：`causal_attn` 改成**一个线程组一个 `(查询位置, q 头)`**（32 线程/组）。
+  所有中间量留在**片上 threadgroup memory**：q 向量协作载入 `qs[128]`、点积分数写
+  `sc[1024]`、归约用 `red[32]`，合计 ~4.6KB/组（远小于 32KB 上限）。
+  组内按维度分工做加权求和，每线程只负责 `hd/nthr` 个维度。
+- **假设**：上一版（float4）的残留瓶颈是 **causal masking 造成的负载不均衡** ——
+  一个线程一个 `(s1,h)`，`s1=0` 跑 1 轮、`s1=511` 跑 512 轮，差 512 倍，GPU 耗时由
+  最长的那些线程决定。分成 32 线程后每线程工作量有界。
+  同时把 `qv[32]`（128 个寄存器）换成片上 `qs`，解除寄存器预算对占用率的限制。
+- **结果（GPU exec，`TINYQWEN_METAL_TIMING=1`，取 5 次的 min）**：
+
+  | 版本 | exec 各次 | min | vs float4 |
+  |---|---|---:|---:|
+  | float4（上一版） | 1044 / 981 / 1216 / 1020 / 1320 | 981 ms | 1.00× |
+  | threadgroup（第 1 轮） | 832 / 937 / 804 / 931 / 793 | 793 ms | 1.24× |
+  | threadgroup（第 2 轮） | 680 / 466 / 647 / 633 / 759 | **466 ms** | **2.10×** |
+
+  第 2 轮刻意安排在 float4 **之后**测，用来排除"先测的占便宜"这种顺序偏差 ——
+  结果反而更快，说明收益是真的。
+- **端到端（`bench_metal_prefill.sh`，仅供参考）**：
+
+  | seq | float4 | threadgroup | speedup vs CPU |
+  |----:|---:|---:|---:|
+  | 64  | 235.77 | 216.53 | 2.76× |
+  | 128 | 342.79 | 305.67 | 3.75× |
+  | 256 | 568.74 | **412.78** | **5.80×** |
+  | 512 | 1080.73 | **937.49** | **5.77×** |
+
+  短 seq（16/32）反而变慢 —— threadgroup 版有固定成本（8 次 barrier + 协作载 q），
+  n 小的时候组数少、每组工作量也小，barrier 开销占比就高。**长 prompt 才是本版的
+  适用区间**，这与"prefill 关心的是中长 prompt"的需求一致。
+- **⚠️ 测量方法论教训（本条最值钱的部分）**：
+  端到端 benchmark **一度给出了相反结论**（显示 threadgroup 变慢），我据此回退了
+  一次。后来查 `uptime` 才发现根因：**load average 5.67，两个 `opencode` 进程各占
+  125.9% / 78.9% CPU** —— 我自己的 agent 运行时在和 benchmark 抢核。CPU arm 的
+  离散度一度飙到 **37×**，metal arm 也有 1.6–5.5×。
+  **教训**：
+  1. 端到端计时会被同机的其它进程污染，**离散度列必须先看**；>1.5 的行不能用于归因
+     （这条纪律之前就写进 AGENTS.md 坑 #7，但这次我自己先违反了它才去查）。
+  2. 污染是**加性**的，所以**取 min 比取中位数更稳**。改用引擎自带的
+     `TINYQWEN_METAL_TIMING=1`（只量 GPU 侧 exec，不含 CPU 编排）+ 取 min，
+     立刻得到清晰结论。
+  3. **测性能前先 `uptime`**。这次如果一开始就查负载，不会浪费一轮回退。
+- **验证**：prefill 末位 logits `max_abs_err = 2.79e-05`、argmax 15087 与 CPU 一致；
+  后续 3 个 decode 位置误差 2.6–3.1e-05、argmax 全一致，生成序列
+  `15087 271 32313 11` 与纯 CPU 完全相同。168 单测全过，`verify.sh` 干净。
+  新增守卫：`--max-seq-len <= 1024`（片上 `sc[1024]` 容量），注意**不能**用模型
+  header 的 `max_seq_len` 来判断（Qwen3-0.6B header 是 40960，真正约束的是 prompt
+  长度 n，由 CLI 的 `--max-seq-len` 界定）。
+- **瓶颈转移**：attention 从 93% 降到不再是唯一大头。当前 seq=512 端到端 937 ms，
+  GPU exec min 466 ms，**差值 ~470 ms 落在 MPS GEMM 与 lm_head 上**。下一刀：
+  qkv 三路融合 + gate/up 融合（每层 7 次 MPS encode → 4 次），代价是拼接权重多占
+  ~1.1 GB 显存；或走 fp16 GEMM（带宽减半，需重新验收数值）。
+- **复现**：
+  ```bash
+  uptime                                     # 先确认没有别的进程抢 CPU
+  tokens=$(.venv/bin/python -c "import random;random.seed(1234);print(','.join(str(random.randrange(0,151936)) for _ in range(512)))")
+  for i in 1 2 3 4 5; do
+    TINYQWEN_METAL_TIMING=1 ./build/runtime/tinyqwen --model model_qwen3_06b_f16.tqwen \
+      --tokens "$tokens" --max-new-tokens 1 --max-seq-len 1024 --engine metal 2>&1 | grep metal-timing
+  done                                       # 取 exec 的 min，不要用中位数
+  ```
+
+---
+
+### Metal prefill：权重 fp16 零拷贝上传（2026-09-02）
+
+> 承接上一条 threadgroup attention。**省内存有效，提速无效** —— 如实记录。
+
+- **优化栈**：Metal GPU prefill + threadgroup attention + 本次 fp16 权重。
+- **是什么**：f16 模型的投影权重（q/k/v/o/gate/up/down + lm_head）改成**直接把
+  `.tqwen` 里的 f16 字节零拷贝上传**成 `MPSDataTypeFloat16` 矩阵，不再在 CPU 侧
+  转成 fp32。f32 模型仍走原路径，两种 dtype 不混用。
+  归一化权重（ln1/ln2/qn/kn/final_norm）保持 fp32 —— 它们给 compute kernel 用，
+  不走 GEMM。
+- **假设**：权重是 GEMM 的主要内存流量，fp32→fp16 减半后 GEMM 应该快接近 2×。
+- **结果**：
+
+  | 指标 | fp32 权重 | fp16 权重 | 变化 |
+  |---|---:|---:|---:|
+  | GPU exec min（seq=512） | 466.19 ms | 456.75 ms | **1.02×（基本无效）** |
+  | 权重显存 | 2.40 GB | 1.20 GB | **省 1.20 GB** |
+  | 进程 RSS（seq=512） | ~3.66 GB | **2.46 GB** | 省 1.20 GB |
+  | 末位 logits max_abs_err | 2.7895e-05 | **2.7895e-05** | **完全不变** |
+
+- **意外 / 教训（两个都有价值）**：
+  1. **数值完全不变，逐位一致**。原本预期 fp16 会带来精度损失，实测
+     `max_abs_err` 与 fp32 路径**一模一样**（2.7895e-05 / 3.0041e-05 / 3.0935e-05 /
+     2.5719e-05 四项全同）。原因：**MPS 允许 fp16 权重 × fp32 激活，且内部把 fp16
+     上采成 fp32 再做乘加** —— 所以只有存储/带宽减半，算术精度没动。
+     这是本次最好的结果：**省一半显存，零精度代价**。
+  2. **提速假设被证伪**。seq=512 时 GEMM 已经是**算力受限**而非带宽受限
+     （算力下限 134 ms，实测 GEMM ~158 ms，已接近下限），所以砍带宽没有收益。
+     **教训**：weight-only fp16 的提速收益只在"带宽受限"的区间成立 ——
+     也就是短 prompt（decode 同理）。长 prompt prefill 是算力受限，fp16 权重
+     不解决问题。要提速得动算力侧（fp16 **算术**、或减少 GEMM 调用次数）。
+- **适用价值**：虽然不提速，但显存减半让**更大的模型 / 更长的上下文**变得可行
+  （0.6B 从 3.66 GB 降到 2.46 GB RSS），且 `create()` 不再需要遍历全模型做
+  f16→f32 转换。作为内存特性保留。
+- **验证**：生成序列 `15087 271 32313 11` 与纯 CPU 完全相同；168 单测全过，
+  `verify.sh` 干净。
+- **瓶颈转移**：seq=512 端到端仍 ~937 ms，GPU exec min 457 ms。下一刀只剩算力侧：
+  qkv 三路融合 + gate/up 融合（每层 7 次 MPS encode → 4 次，代价是拼接权重多占
+  ~0.55 GB fp16 显存，比原先 fp32 方案的 1.1 GB 便宜一半）。
+- **复现**：
+  ```bash
+  uptime    # 先确认没有别的进程抢 CPU
+  tokens=$(.venv/bin/python -c "import random;random.seed(1234);print(','.join(str(random.randrange(0,151936)) for _ in range(512)))")
+  for i in 1 2 3 4 5; do
+    TINYQWEN_METAL_TIMING=1 ./build/runtime/tinyqwen --model model_qwen3_06b_f16.tqwen \
+      --tokens "$tokens" --max-new-tokens 1 --max-seq-len 1024 --engine metal 2>&1 | grep metal-timing
+  done                        # 取 exec 的 min
+  /usr/bin/time -l ./build/runtime/tinyqwen ... 2>&1 | grep "maximum resident"   # 看 RSS
+  ```
+
+---
+
+### Metal prefill：qkv / gate_up GEMM 融合（2026-09-02）
+
+> 承接 fp16 权重条目。**小幅有效**，但过程中踩到一个值得记的坑。
+
+- **优化栈**：Metal GPU prefill + threadgroup attention + fp16 权重 + 本次 GEMM 融合。
+- **是什么**：把每层的 q/k/v 三个权重拼成一个 `[QD+2*KVD, H]` 大矩阵、gate/up 拼成
+  `[2*I, H]`，GEMM 从**每层 7 次 MPS encode 降到 4 次**。激活侧 `Yq`/`Yk`/`Yv` 合并成
+  `Yqkv`、`Yg`/`Yu` 合并成 `Ygu`，下游 kernel 用 **buffer offset 切片**访问
+  （q 在 0、k 在 `QD*4`、v 在 `(QD+KVD)*4`、up 在 `I*4`），行跨度都用融合矩阵的跨度。
+  down_proj 的输入是 `Ygu` 的前 I 列 —— 同一块 buffer、`columns=I` 的另一个
+  MPSMatrix 视图。
+- **显存中性**：拼接是**替换**分散 buffer 而非复制，总字节数不变。原先担心的
+  "+0.55 GB" 不成立 —— fp16 已经把这件事的成本消掉了。
+- **假设**：微基准显示 seq=512 时单个 MPS GEMM 有 ~720 µs 的非计算开销
+  （q_proj 实测 955 µs vs 算力下限 233 µs），3 合 1 应能省掉 2 份开销。
+- **结果（GPU exec min，seq=512）**：
+
+  | 版本 | exec min | vs fp16 未融合 |
+  |---|---:|---:|
+  | fp16 未融合（上一条） | 456.75 ms | 1.00× |
+  | 融合 + 1D silu | 473.76 ms | **0.96×（变慢）** |
+  | 融合 + 2D silu | **437.25 ms** | **1.045×** |
+
+- **踩到的坑（值得单独记）**：融合后 `silu_mul` 不能再按扁平下标寻址 —— gate 与 up
+  是 `Ygu` 的两个**列切片**，中间隔着行跨度。第一版改成
+  `off = (tid / cols) * stride + (tid % cols)`，**结果反而变慢**（456.75 → 473.76 ms）。
+  原因：`n*I` 达百万级（512×3072 = 1.57M），每个元素一次**整数除法 + 取模**是实打实的
+  开销。改用 **2D grid**（`gid.x = col`、`gid.y = row`，`off = row*stride + col`）
+  消掉除模后，才拿到真正的收益（437.25 ms）。
+  **教训**：把连续内存改成带跨度的切片访问时，别用"扁平下标 + 除模还原坐标"，
+  直接用多维 grid 让坐标免费拿到。
+- **验证**：prefill 末位 logits `max_abs_err = 2.7895e-05`，与融合前**完全一致**
+  （融合只是改变了权重的物理排布，数学等价）；argmax 15087 一致，生成序列
+  `15087 271 32313 11` 与纯 CPU 完全相同。168 单测全过，`verify.sh` 干净。
+- **瓶颈转移**：seq=512 GPU exec min 437 ms，算力下限 134 ms，仍有 ~3.3× 空间。
+  GEMM 已从 7 次降到 4 次，剩下的大头是 **MPS GEMM 本身的效率**（fp16 存储但 fp32
+  算术）。下一刀只剩 **fp16 算术**（真正动用 fp16 算力单元，理论上限翻倍），
+  代价是引入精度损失、需重新验收。
+- **复现**：
+  ```bash
+  uptime    # 先确认没有别的进程抢 CPU
+  tokens=$(.venv/bin/python -c "import random;random.seed(1234);print(','.join(str(random.randrange(0,151936)) for _ in range(512)))")
+  for i in 1 2 3 4 5 6; do
+    TINYQWEN_METAL_TIMING=1 ./build/runtime/tinyqwen --model model_qwen3_06b_f16.tqwen \
+      --tokens "$tokens" --max-new-tokens 1 --max-seq-len 1024 --engine metal 2>&1 | grep metal-timing
+  done      # 取 exec 的 min
+  ```
+
+---
+
+### 证伪归档：fp16 算术（GEMM 操作数/结果全 fp16）（2026-09-03）
+
+> 承接 fp16 权重 + GEMM 融合两条。**本次尝试失败并已回退**，但精度量化值得记。
+
+- **动机**：fp16 **权重**条目里发现 MPS 在 fp16 权重 × fp32 激活时只是把权重上采成
+  fp32 再算，算术仍是 fp32 —— 所以只省了存储和带宽，没省算力。要真正动用 fp16
+  算力单元（M4 理论峰值约为 fp32 的 2×），必须让 **GEMM 的两个操作数与结果都是 fp16**。
+- **做法**：把 GEMM 的操作数/结果 buffer（X/Xa/Yqkv/Yo/Ygu/Yd/Ylm + Ygu_gate 视图）
+  全部改成 `MPSDataTypeFloat16`，所有 compute kernel 改成 `half` I/O + `half4` 向量化
+  载入 + 内部 fp32 计算。**残差流 Hid 刻意保持 fp32** —— 28 层残差累加是精度最
+  敏感的地方，fp16 累加会逐层放大误差。KV 写回与 logits 输出都转回 fp32，
+  所以对 CPU decode 与 `--dump-logits` 契约无影响。
+- **精度量化（决策级口径，不只看 max_abs_err）**：64-token prompt，逐位置对照 CPU
+  参考（`--verbose` 全位置 dump）：
+
+  | 指标 | 值 |
+  |---|---|
+  | argmax 翻转 | **0 / 64 位置（0.00%）** |
+  | top-5 平均重合 | 4.98 / 5 |
+  | max_abs_err（全程） | 4.7279e-02 |
+  | max_abs_err（末位） | 1.8889e-02 |
+  | 对照：fp32 算术路径 vs CPU | **2.7895e-05** |
+
+  **精度本身是可接受的** —— argmax 零翻转、top-5 几乎完全一致，贪心解码输出不会变。
+  但绝对误差放大约 **1700×**（2.79e-05 → 4.73e-02）。
+- **性能：变慢，已回退**：
+
+  | 版本 | GPU exec min（seq=512） |
+  |---|---:|
+  | fp16 权重 + fp32 算术（上一条） | **437.25 ms** |
+  | fp16 权重 + **fp16 算术** | 459.14 ms |
+
+  **1.05× 慢**。两条判据都不成立（更慢 + 误差更大），所以回退。
+- **为什么没拿到 fp16 算力收益（关键教训）**：
+  1. **MPS 在这些形状上没有从 fp16 算力拿到可见收益**。seq=512 的 GEMM 已接近算力
+     下限（fp32 下限 134 ms，实测 GEMM ~158 ms），本以为 fp16 能把下限砍半到 ~67 ms，
+     实测却没有。
+  2. **代价却是实打实的**：所有 compute kernel 的内层循环都多了 `half↔float` 转换。
+     最贵的是 attention 的点积 —— 每个 `half4` 要 4 次 `static_cast<float>`，
+     而原先 `float4` 是直接乘加。rmsnorm/rope/silu/add_rows 同理。
+  3. **净效果为负**：GEMM 没快，kernel 全变慢。
+  **教训**：`fp16 存储` 与 `fp16 算术` 是两件不同的事。前者零精度代价、省一半显存，
+  稳赚；后者要先确认**算力路径真的换了**，否则只会在每个 kernel 里白付转换开销。
+  在 MPS 这种封装层里，你无法控制它内部到底用哪套算力单元 —— 所以这类改动必须
+  用实测兜底，不能靠"理论峰值翻倍"来推断。
+- **保留的成果**：本轮加的 `--verbose` 全位置 logits dump（`main.cpp` 的 metal 分支）
+  **保留**了 —— 它与 fp16 决策无关，是让逐位置对齐成为可能的工具（默认仍只 dump
+  末位一行，与 CPU 批量 prefill 口径一致）。
+- **验证**：回退后 prefill `max_abs_err = 2.7895e-05`、argmax 15087 与 CPU 一致，
+  生成序列 `15087 271 32313 11` 与纯 CPU 完全相同；168 单测全过，`verify.sh` 干净。
+- **结论：Metal prefill 的优化到此收口**。seq=512 GPU exec min 437 ms，算力下限
+  134 ms，剩余 ~3.3× 空间全部落在 MPS GEMM 内部效率上 —— 那是 MPS 封装层的黑盒，
+  在不换后端（自写 GEMM kernel）的前提下无法继续压。
+
+---
+
+### Metal attention：线程组宽度 32 → 128（占用率修复）（2026-09-03）
+
+> 承接 GEMM 融合条目。**一行改动拿到 1.30× 端到端提速** —— 本轮性价比最高的一次。
+
+- **优化栈**：Metal GPU prefill + threadgroup attention + fp16 权重 + GEMM 融合 + 本次。
+- **起因：先测准，再动手**。之前一直以为 attention 占 ~121 ms（用旧的 elementwise 数字
+  反推），写隔离微基准实测后发现是 **216.2 ms**（seq=512），几乎与 MPS GEMM 的
+  233.6 ms 同等量级，且 TFLOPS 仅 **0.139 = 峰值 3%**。
+  **教训**：推导值不能当改造依据。这次如果按 121 ms 的判断去做 flash-attention
+  重写，会为一个被低估的问题投入高复杂度改造。
+- **是什么**：`kAttnThreads` 从 32 改成 128（shader 里 `red[32]` 相应改 `red[128]`）。
+  **一行改动，没有重写算法。**
+- **假设（占用率账）**：threadgroup memory ≈ 4.6KB/组（`qs[128]` + `sc[1024]` + `red`），
+  32KB 上限下每核约并发 6 组 —— **32 线程/组只有 ~192 线程/核**，对 GPU 来说太低，
+  延迟无法被并发掩盖。改 128 线程/组升到 ~768 线程/核。
+  同时 step 5 的串行链长度不变，但每线程只管 `hd/128 = 1` 个维度，ILP 更好。
+- **结果（attention 隔离微基准，取 min）**：
+
+  | seq | ms/层（32 线程） | ms/层（128 线程） | 提速 | TFLOPS |
+  |----:|---:|---:|---:|---:|
+  | 16  | 0.1865 | 0.1952 | 0.96× | 0.006 |
+  | 64  | 0.4304 | 0.3087 | 1.40× | 0.055 |
+  | 128 | 1.0480 | 0.6777 | 1.55× | 0.100 |
+  | 512 | 7.7205 | **4.6924** | **1.65×** | 0.139 → **0.229** |
+
+  attention 总量 216.2 → **131.4 ms**。短 seq（16）略变慢 —— 组数少时 128 线程
+  多数空转，但短 seq 本来就不是本通路的目标区间。
+- **线程数扫描（找最优点）**：
+
+  | 线程/组 | seq=512 ms/层 |
+  |---:|---:|
+  | 32  | 7.7205 |
+  | **128** | **4.6924** |
+  | 256 | 5.0547 |
+
+  **128 是甜蜜点**，256 反而变慢（threadgroup memory 涨到 ~6KB，每组并发数下降，
+  抵消了线程数收益）。
+- **端到端**：GPU exec min（seq=512）**437.25 → 337.65 ms = 1.30×**。
+- **验证**：prefill `max_abs_err = 2.7895e-05`，与改动前**完全一致**（只改线程数，
+  数学不变）；argmax 15087 一致，生成序列 `15087 271 32313 11` 与纯 CPU 完全相同。
+  168 单测全过，`verify.sh` 干净。
+- **教训**：
+  1. **先测准再动手**。216 ms vs 121 ms 的差距直接决定了该不该做高复杂度重写。
+  2. **占用率是 GPU kernel 的一等公民**。这次不是算法问题、不是访存问题，纯粹是
+     每组线程数太少导致延迟无法被掩盖。改一个常数就拿到 1.65×。
+     **在写复杂算法之前，先把占用率账算一遍。**
+  3. threadgroup 宽度不是越大越好 —— 它和 threadgroup memory 用量耦合，
+     超过某个点每组并发数下降，收益反转。必须扫描。
+- **剩余瓶颈与下一步判断**：seq=512 GPU exec 337.65 ms，其中 attention ~131 ms
+  （TFLOPS 0.229，仍只有峰值 5%）。理论上 flash-attention 分块能把 V 的重复读取
+  从 1.076 GB/层 降 ~16×。但**本轮证明真正的限制是占用率而不是带宽** ——
+  改线程数（完全没动访存）就拿到 1.65×。所以分块的流量收益可能远低于预期，
+  而它的实现复杂度与出错风险很高（online softmax + 分块 + causal masking）。
+  **判断：暂不做分块**，除非后续实测证明 attention 确实转为带宽受限。
+- **分块的小规模验证（只改微基准，不动生产代码）—— 判断被证实**：
+  写了 `attn_tiled`（一个线程组处理 B=4 个查询行，128 线程分成 4 行 × 32 lane，
+  V 在组内被 4 行共享 → V 流量降 4×），与当前 `attn_base` 同场对比：
+
+  | seq | base ms/层 | tiled ms/层 | 提速 | ×28 层 |
+  |----:|---:|---:|---:|---:|
+  | 16  | 0.1944 | 0.1927 | 1.009 | +0.05 ms |
+  | 64  | 0.3145 | 0.3379 | **0.931** | −0.66 ms |
+  | 128 | 0.6748 | 0.7910 | **0.853** | −3.25 ms |
+  | 512 | 4.6975 | 5.4873 | **0.856** | **−22.11 ms** |
+
+  **V 流量降了 4×，却全线变慢**（seq=512 会多花 22 ms）。这直接证实了
+  "限制不是带宽"的判断 —— V 本来就被 L2 缓存住了（单个 kv 头的 V 仅 256 KB），
+  减少重复读取没有收益；而分块反而带来三项新开销：
+    1. 每行只有 32 lane（base 版每行 128 线程）→ 单行并行度降 4×；
+    2. 归约从"全组一次"变成"按行做子归约"，barrier 次数增加；
+    3. `sc[4][512]` = 8KB（base 版 4KB）→ 每组并发数下降。
+  **结论：flash-attention 分块不做。** 这个验证只花了微基准的成本，
+  避免了一次高复杂度的生产改造 —— **先在微基准上证伪，再决定要不要投产**，
+  这个流程本身值得复用。
+- **复现**：
+  ```bash
+  uptime    # 先确认没有别的进程抢 CPU
+  # attention 隔离微基准要编进 build/ 树 —— 独立目录的新二进制会被 EDR 反复 SIGKILL
+  clang++ -x objective-c++ -std=c++17 -fobjc-arc -O2 attn_bench.mm \
+      -o build/attn_bench -framework Foundation -framework Metal
+  ./build/attn_bench
+  # 端到端
+  tokens=$(.venv/bin/python -c "import random;random.seed(1234);print(','.join(str(random.randrange(0,151936)) for _ in range(512)))")
+  for i in 1 2 3 4 5 6; do
+    TINYQWEN_METAL_TIMING=1 ./build/runtime/tinyqwen --model model_qwen3_06b_f16.tqwen \
+      --tokens "$tokens" --max-new-tokens 1 --max-seq-len 1024 --engine metal 2>&1 | grep metal-timing
+  done      # 取 exec 的 min
+  ```
+
+---
+
+### Metal prefill：KV 接续 + 投机解码 verify pass（2026-09-03）
+
+> 功能性扩展，不是提速。目的是让 Metal 通路能服务投机解码。
+
+- **动机**：投机解码的 verify pass 形状是 **Q_len = K（小）、KV_len = L+K（大）**，
+  与首次 prompt prefill 的对称形状完全不同。之前的引擎有三个硬阻塞：
+  只支持从位置 0 开始、attention 是 Q=KV 的对称 causal、K/V 布局与 KvCache 不匹配。
+- **做了什么**：
+  1. **GPU 常驻 KV cache**：引擎自己持有 `kv_k`/`kv_v`，布局
+     `[n_layers][n_kv_heads][max_seq_len][head_dim]`，与 runtime KvCache 一致。
+     为什么不复用 CPU 的 KvCache：它是 `std::vector<float>`，不是 MTLBuffer，
+     Metal kernel 无法直接访问（`newBufferWithBytesNoCopy` 要求页对齐，
+     std::vector 的分配不保证）。0.6B @ max_seq_len=1024 约 235MB。
+  2. **`kv_append` kernel**：把 post-RoPE 的 K/V 从 `Yqkv` 追加进 cache 的
+     `[pos0, pos0+n)`。必须排在 attention 之前、且在同一个 command buffer 内 ——
+     encoder 顺序即执行顺序。
+  3. **attention 支持非对称 Q/KV**：K/V 全部从 cache 读 `[0, pos0+qi]`，
+     `cache_stride = max_seq_len * hd`。pos0=0 时退化成原来的对称 causal。
+  4. **API**：去掉 `kv->seq_len() == 0` 守卫，改成引擎内部 `kv_len` 追踪 +
+     `metal_prefill_reset_kv()` / `metal_prefill_kv_len()`。
+- **踩到两个 bug（都是接续路径特有，fresh prefill 测不出来）**：
+  1. **`dispatch_2d` 的 grid 轴搞反了**：`dispatch_2d(enc, ps, cols, rows)` 把 cols
+     放在 `gid.x`，但我在 `kv_append` 里写成 `s = gid.x; e = gid.y`。fresh prefill
+     下 n=4、NKV*HD=1024，错位后结果全错（max_abs_err 2.08e+01）。
+     对照 `silu_mul` 的正确写法（`col = gid.x`）才发现。
+  2. **RoPE 用了错误的绝对位置**：`rope_tables(n, ...)` 按 `[0, n)` 算角度，
+     但接续调用的 token 落在 `[pos0, pos0+n)`。表现为**第一段（pos0=0）完全正确、
+     第二段偏差 2.14** —— 这个"前半对后半错"的模式是定位关键。
+     修法：`rope_tables(n, pos0, ...)`，表里仍按批次内下标存，但角度用绝对位置算。
+- **验证（等价性测试，比单点对齐更强）**：一次喂 8 个 token vs 分两次喂 4+4，
+  末位 logits 必须一致。结果 **max_abs_err = 0.000000e+00（逐位相同）**，
+  第 4 位对比也是 0.0。fresh prefill 仍与 CPU 一致（2.7895e-05）。168 单测全过。
+- **投机解码区间实测（Q_len=K，KV_len=L+K）**：
+
+  | L | K | verify ms | ms/token |
+  |----:|----:|---:|---:|
+  | 128 | 4  | 41.84 | 10.46 |
+  | 128 | 8  | 54.91 | 6.86 |
+  | 128 | 16 | **52.90** | **3.31** |
+  | 512 | 4  | 60.80 | 15.20 |
+  | 512 | 8  | 73.79 | 9.22 |
+  | 512 | 16 | 71.60 | 4.48 |
+  | 896 | 4  | 57.87 | 14.47 |
+  | 896 | 8  | 80.47 | 10.06 |
+  | 896 | 16 | 86.53 | 5.41 |
+
+- **关键结论 1：这个区间是 MPS 逐调用开销受限，不是带宽受限。**
+  权重流量 = 28 层 × 15.73M 参数 × 2B + lm_head 311MB ≈ **1.19 GB**，
+  按 120 GB/s 只要 **~10 ms**。但实测 42–87 ms，**差 4–8×**。
+  原因：每层 4 个 GEMM × 28 层 = 112 次 MPS encode + 1 次 lm_head，
+  微基准显示 seq=16 时"单层 4 GEMM"就要 1.635 ms（算力只占极小部分，
+  其余全是 MPS 固定开销）→ ×28 ≈ 42 ms，与实测吻合。
+  **所以 fp16 权重在这个区间同样不会提速**（与 seq=512 的结论一致，
+  但原因不同：那边是算力受限，这边是 MPS 开销受限）。
+- **关键结论 2：K 越大越划算，因为固定开销被摊薄。**
+  L=128 时 K=4 → 10.46 ms/token，K=16 → **3.31 ms/token**，差 **3.2×**。
+  verify pass 的耗时主要由固定的 112 次 MPS 调用决定，与 K 关系不大
+  （K=4 是 41.84 ms，K=16 是 52.90 ms，只多 26%），所以 K 越大每 token 越便宜。
+  **对投机解码的直接建议：草稿长度 K 要尽量大**（在草稿模型准确率允许的范围内），
+  这是本通路最划算的用法。
+- **测量可靠性说明**：本轮 CPU 侧对照被污染（`uptime` load 4.50、opencode 进程
+  占 164% CPU），CPU decode 测出 22–32 ms/tok 且离散度极大，**不可用于归因**。
+  上表的 Metal 数字在同一 L 内部是自洽的（K 单调），跨 L 的比较也基本合理，
+  但绝对值仍有不确定性。理论对照：0.6B f16 权重 1.19 GB，按 AGENTS.md 的
+  f16 满栈有效带宽 ~81 GB/s 推算，CPU decode 约 **14.7 ms/tok** ——
+  据此 K=8 时 Metal 6.86 ms/tok 约 2.1× 于 CPU，K=16 时约 4.5×。
+- **剩余瓶颈**：要再压 verify pass，唯一的路是**减少 MPS 调用次数或换掉 MPS**。
+  层内已经从 7 个 GEMM 融到 4 个，再融不动（qkv/o/gu/down 之间有数据依赖）。
+  所以要么自写 GEMM（能在一个 kernel 里批量处理多个小矩阵），要么接受现状。
+- **复现**：
+  ```bash
+  # KV 接续等价性（8 token vs 4+4，必须逐位相同）
+  clang++ -std=c++17 -O2 -Iruntime -Ikernels -Iquantization kv_cont_test.cpp \
+      $(find build/runtime/CMakeFiles/tinyqwen_runtime.dir \
+             build/kernels/CMakeFiles/tinyqwen_kernels.dir -name '*.o') \
+      -o build/kv_cont_test -framework Foundation -framework Metal \
+      -framework MetalPerformanceShaders -framework Accelerate
+  ./build/kv_cont_test model_qwen3_06b_f16.tqwen
+  # 投机解码区间矩阵
+  ./build/spec_bench model_qwen3_06b_f16.tqwen
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

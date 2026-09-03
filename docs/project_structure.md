@@ -24,6 +24,11 @@ tinyqwen/
 │   │                       #   反量化 fp32 走 Accelerate/AMX sgemm（权重每层读一遍），
 │   │                       #   GDN 递归/因果 attention 保留逐 token 顺序扫描
 │   ├── profiler.h/.cpp     # ScopedTimer + per-token/per-op 记录 + JSON 输出
+│   ├── metal_prefill.h     # Apple GPU prefill 引擎接口（纯 C++，main.cpp 不必碰 ObjC）
+│   ├── metal_prefill.mm    # 实现（ObjC++）：GEMM 走 MPS、其余算子走自写 Metal compute
+│   │                       #   kernel（shader 源码内嵌）；自持 GPU KV cache，支持接续
+│   │                       #   → 投机解码 verify pass。仅 APPLE 构建时编译
+│   ├── metal_prefill_stub.cpp # 非 Apple 平台占位（运行期报错而非链接失败）
 │   └── main.cpp            # CLI 入口（后端/engine 选择 + prefill + decode 循环）
 │
 ├── kernels/                # kernel 库（OBJECT 库 tinyqwen_kernels）
@@ -59,9 +64,13 @@ tinyqwen/
 │   ├── align_fake_model.py        # C++ vs HF 逐位置 logits 对齐（改 forward 后先跑）
 │   ├── align_fake_qwen35_model.py # Qwen3.5 版对齐（覆盖 GDN 全路径）
 │   ├── verify_i4_accuracy.py      # INT4 精度审计（反量化 vs fp32 逐层 MSE）
-│   ├── bench.py                   # 可复现基准：固定负载 + 稳态统计 + 环境记录
-│   ├── bench_android.py           # Android 端基准（热节流门控 + 同场 A/B）
-│   ├── bench_dataset.py           # 数据集负载 TTFT/TOPT 测试
+ │   ├── bench.py                   # 可复现基准：固定负载 + 稳态统计 + 环境记录
+ │   ├── bench_android.py           # Android 端基准（热节流门控 + 同场 A/B）
+ │   ├── bench_dataset.py           # 数据集负载 TTFT/TOPT 测试
+ │   ├── metal_prefill_qwen3.py     # PyTorch MPS 基线探针：Metal vs CPU prefill 对照
+ │   │                       #   （C++ Metal 引擎的可行性验证起点，保留作对照基线）
+ │   ├── metal_prefill_scaling.py   # MPS prefill 随 seq 的扩展性探针：判断算力受限
+ │   │                       #   还是开销/带宽受限（roofline 归因用）
 │   ├── model_registry.py          # model*.yaml 模型注册表读取
 │   ├── record_optimization.py     # record.sh 的测速 + 写日志主体
 │   ├── visualize.py               # profile/日志 -> 零依赖单文件 HTML
@@ -71,6 +80,7 @@ tinyqwen/
 ├── tests/                  # 单元测试，自带最小测试框架（test_framework.h）
 ├── scripts/                # 优化 pipeline（verify/bench/record/set_baseline/commit_opt）
 │                           #   + Android 全家桶（build/run/pull/doctor/bench/record）
+│                           #   + bench_metal_prefill.sh（Metal prefill vs CPU 同场 A/B，带离散度列）
 ├── benchmarks/             # 测速数据：baseline*.json + history*.jsonl + jobs/ + series/
 ├── experiments/            # 预留：run_decode.cpp / run_layer_bench.cpp
 └── docs/                   # 规范与流程文档（见下表）

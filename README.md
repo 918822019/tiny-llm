@@ -28,8 +28,14 @@
     > （见 `docs/android.md` §6）；
 > - **后端抽象已就位**：`IBackend` 接口 + CPU 后端（包装 kernel dispatch，主线）；
     > CUDABackend（`--backend cuda`，逐算子，供 A/B）与 GPU-resident engine
-    > （`--engine cuda`，整段 forward 常驻显存，A10 实测 4.89 ms/tok）并存，
+    > （`--engine cuda`，整段 **decode** forward 常驻显存，A10 实测 4.89 ms/tok）并存，
     > 见 `docs/architecture.md`。
+> - **Apple GPU prefill（`--engine metal`）**：整批 prompt 跑在 Metal/MPS 上，
+    > 与 `--engine cuda` 互补（cuda 管 decode，metal 管 prefill）。Qwen3-0.6B f16
+    > 实测 vs CPU 满栈：**seq=512 提速 5.01×、seq=256 4.29×、seq=128 3.23×**；
+    > 交叉点在 seq≈32（更短不值得走 GPU）。prefill 后把 K/V 写回 KvCache，
+    > decode 仍走 CPU 且逐 token 一致。测速 `scripts/bench_metal_prefill.sh`，
+    > 归因与证伪记录见 `docs/optimization_log.md`。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
 
@@ -174,7 +180,7 @@ tinyqwen --model <model.tqwen> [options]
 | `--matvec-impl NAME`      | ref    | matvec kernel 实现：任意已注册名；f32/f16/i4 三套独立注册表，按模型 dtype 解析，未知值报错并列出可用          |
 | `--ops-impl NAME`         | ref    | 非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax + GDN 四算子）：`ref` / `neon` |
 | `--backend NAME`          | CPU    | 计算后端（IBackend 实现）：空 = CPU；`cuda` = 逐算子 CUDA 后端（需 CUDA 构建）                   |
-| `--engine NAME`           | 无      | decode engine：`cuda` = GPU-resident 整段 forward（需 CUDA 构建；仅 Qwen2.x + greedy） |
+| `--engine NAME`           | 无      | engine：`cuda` = GPU-resident 整段 **decode**（需 CUDA 构建；仅 Qwen2.x + greedy）；`metal` = Apple GPU 整批 **prefill**（仅 Apple；两者互斥） |
 | `--no-fuse-gate-up`       | 关      | 禁用 FFN gate/up 成对融合（A/B 用）                                                  |
 | `--no-fuse-qkv`           | 关      | 禁用 q/k/v 三路融合（A/B 用）                                                        |
 | `--kv-f16`                | 关      | KV cache 存 fp16（内存减半，长上下文用；解码慢 ~8%，内存特性非提速）                                    |

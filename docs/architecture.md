@@ -137,15 +137,23 @@ TINYQWEN_MATVEC_VARIANT(matvec_f32_neon, "neon");
 - 可以按名字选择实现（`--matvec-impl neon`）
 - 未注册的变体自动兜底到 ref
 
-### 4. Backend ≠ Engine（两条 GPU 路径，易混淆）
+### 4. Backend ≠ Engine（三条 GPU 路径，易混淆）
 
-| | `--backend cuda`（CUDABackend） | `--engine cuda`（gpu_engine） |
-|---|---|---|
-| 形态 | 实现 IBackend，**逐算子**调 CUDA kernel | **整段 forward** 常驻显存、单 stream |
-| 数据流 | 每算子 H2D/D2H + cudaMalloc | 权重/激活/KV 常驻，每步仅 4B argmax 过 PCIe |
-| 定位 | A/B 测试、单算子调试 | GPU 性能路径（A10 实测 4.89 ms/tok） |
-| 覆盖 | INT4/partial RoPE/top_k/GDN 未实现（触发即 abort） | 仅 Qwen2.x + greedy，无 topk/dump-logits |
-| 位置 | `runtime/backend_cuda.*` | `kernels/cuda/gpu_engine.cu`（不走 IBackend） |
+三者管**不同阶段**，不要混为一谈：
+
+| | `--backend cuda`（CUDABackend） | `--engine cuda`（gpu_engine） | `--engine metal`（metal_prefill） |
+|---|---|---|---|
+| 阶段 | 逐算子，prefill+decode 都走 | **decode** | **prefill** |
+| 形态 | 实现 IBackend，逐算子调 CUDA kernel | 整段 forward 常驻显存、单 stream | 整批 prompt 一次前向 |
+| 数据流 | 每算子 H2D/D2H + cudaMalloc | 权重/激活/KV 常驻，每步仅 4B argmax 过 PCIe | 权重常驻 GPU（f16 模型 fp16 / f32 模型 fp32，统一内存 Shared buffer） |
+| 算子实现 | CUDA kernel | CUDA kernel | GEMM 走 MPS，其余走自写 Metal compute kernel |
+| 定位 | A/B 测试、单算子调试 | decode 性能路径（A10 实测 4.89 ms/tok） | prefill 性能路径（M4 实测 seq=512 提速 1.42×） |
+| 覆盖 | INT4/partial RoPE/top_k/GDN 未实现（触发即 abort） | 仅 Qwen2.x + greedy，无 topk/dump-logits | 仅 Apple；全 full attention、f16/f32、全 RoPE、`head_dim%4==0` 且 ≤128 |
+| 位置 | `runtime/backend_cuda.*` | `kernels/cuda/gpu_engine.cu` | `runtime/metal_prefill.{h,mm}`（非 Apple 走 `_stub.cpp`） |
+
+**cuda 与 metal 互补而非重叠**：`--engine cuda` 没有批量 prefill 入口（prefill 只能
+逐 token 喂）；`--engine metal` 只做 prefill，decode 仍走 CPU —— 它把 post-RoPE 的
+K/V 写进 `KvCache` 并 `advance(n)`，CPU decode 才能从位置 n 接续。两者在 CLI 上互斥。
 
 CPU 主线没有这个区分：CPUBackend 就是唯一路径。
 

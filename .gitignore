@@ -9,9 +9,12 @@ models/
 .ms_cache/
 *.tqwen
 *.npz
+*.npy
 *.pt
 *.safetensors
 *.bin
+# 量化训练产物（QAT 检查点等，体积大）
+vq_qat_*/
 
 # 运行生成物
 profile*.json
@@ -23,6 +26,7 @@ benchmarks/.baseline*.json
 # 历史 jsonl、数据集 batch 输入、资源时序曲线、控制台任务日志
 benchmarks/*.jsonl
 benchmarks/*.meta.json
+benchmarks/results/
 benchmarks/series/
 benchmarks/jobs/
 
@@ -35,6 +39,13 @@ __pycache__/
 # 下载的数据集（不入库）
 datasets/
 
-# Python venv
+# Python venv（含为特定实验单独建的，如 .venv-coreml）
 .venv/
+.venv-*/
 .scratch/
+
+# agent 工具链产物（不是本项目依赖：tools/webui 是原生 JS，无 npm 依赖）
+.omo/
+node_modules/
+package.json
+package-lock.json

@@ -1,6 +1,6 @@
 # runtime/ 导读
 
-文件看着多，其实就 **8 个角色**，每个干一件清楚的事。runtime 的本质是一条
+文件看着多，其实就 **9 个角色**，每个干一件清楚的事。runtime 的本质是一条
 流水线："把权重读进来 → 备好内存 → 循环计算 → 输出结果"。
 
 ## 角色地图
@@ -14,6 +14,7 @@
 | ⑤ 后端   | `backend.h` + `backend_cpu.*` + `backend_cuda.*` | 算子抽象层：模型只调 IBackend，不关心 dtype/量化/硬件      |
 | ⑥ 测量   | `profiler.*`                                  | 记录每步耗时（可关，关了零开销）                         |
 | ⑦ 编排   | `main.cpp`                                    | CLI：选后端/engine、prefill + decode 循环       |
+| ⑧ GPU prefill | `metal_prefill.*`（Apple only）          | `--engine metal`：整批 prompt 跑在 Apple GPU，绕过 IBackend |
 | 配置     | `config.*`                                    | key=value 配置解析（供 ⑦ 用）                    |
 
 ## 数据怎么流过它们
@@ -46,13 +47,27 @@
   `qwen_forward_prefill.cpp`（批量 prefill，GEMM 路径）；`qwen_model.cpp` 只剩
   `create()`（权重绑定/校验/workspace 分配）和公共逻辑。
 
-## 两条 GPU 路径的区别（易混淆）
+## 三条 GPU 路径的区别（易混淆）
+
+三者管的是**不同阶段**，不要混为一谈：
 
 - `--backend cuda`（`backend_cuda.*`）：实现 IBackend，**逐算子**调 CUDA kernel，
   每次调用带 H2D/D2H 拷贝。供 A/B 与单算子调试，**不是性能路径**；INT4/partial
   RoPE/top_k/GDN 算子未实现（触发即 abort）。
-- `--engine cuda`（`../kernels/cuda/gpu_engine.cu`）：**整段 forward** 常驻显存、
-  单 stream 跑完，每步仅 4B argmax 过 PCIe。性能路径，但不走 IBackend。
+- `--engine cuda`（`../kernels/cuda/gpu_engine.cu`）：**整段 decode forward**
+  常驻显存、单 stream 跑完，每步仅 4B argmax 过 PCIe。decode 性能路径，
+  但不走 IBackend。**没有批量 prefill 入口**，prefill 只能逐 token 喂。
+- `--engine metal`（`metal_prefill.*`）：**整批 prompt prefill** 跑在 Apple GPU，
+  GEMM 走 MPS、其余算子走自写 Metal compute kernel。与上面两条互斥。
+  prefill 完把 post-RoPE 的 K/V 写进 `KvCache` 并 `advance(n)`，
+  **所以 decode 仍走 CPU 且能正确接续** —— 这正是 cuda engine 缺的那一半。
+
+  适用范围（`metal_prefill_create` fail fast 校验）：全 full attention 层
+  （不支持 Qwen3.5 GDN 混合）、权重 f16/f32、全 RoPE、`head_dim % 4 == 0` 且
+  ≤ 128、起始位置固定 0。仅 Apple 平台；其他平台编译 `metal_prefill_stub.cpp`
+  占位，运行期报"仅在 Apple 平台可用"。
+  数字与归因见 `../docs/optimization_log.md`，测速用
+  `../scripts/bench_metal_prefill.sh`（带离散度列，离散度 >1.5 的行不可用于归因）。
 
 ## 建议阅读顺序（由浅入深）
 

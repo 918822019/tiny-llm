@@ -18,6 +18,12 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
 ```
 
 - CUDA 自动探测；无 nvcc（如 Mac）自动跳过，不影响 CPU 主线。
+- **Apple Metal prefill（`--engine metal`）**：APPLE 构建时自动编译 `runtime/metal_prefill.mm`
+  （ObjC++，需顶层 `enable_language(OBJCXX)`）；非 Apple 走 `metal_prefill_stub.cpp` 占位。
+  GEMM 走 MPS、其余算子走内嵌 shader 的 Metal compute kernel。引擎自持 GPU KV cache，
+  支持接续调用（投机解码 verify pass），新序列前须 `metal_prefill_reset_kv()`。
+  改这个文件后除了 `verify.sh`，还要跑 KV 接续等价性测试（一次喂 N vs 分两段喂，
+  末位 logits 必须逐位相同）—— fresh prefill 测不出接续路径的 bug。
 - 正确性门禁：`./scripts/verify.sh`（编译 + 单测 + golden token 对照；无真模型 `model.tqwen` 时第 3 步跳过）。
 
 ## Python 环境（非显而易见，关键）
@@ -60,6 +66,23 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    否则回退逐 token。短 prompt 测速看不到批量收益，别误判"批量没用"。`--no-batch-prefill` 可关。
 6. **`--kv-f16` 是内存特性不是提速**：KV 存 fp16 + 融合 attention，KV 内存减半、长上下文可用，
    但解码慢 ~8%（寄存器内 fp16→fp32 转换抵消读带宽减半）。短上下文用 fp32，长上下文内存不够才开。
+7. **Metal prefill 测速必须看离散度**：这台 M4 的 prefill 计时跨进程波动可达 **2×**
+   （MPS kernel 每进程重新 JIT + 连续测速热降频）。用 `./scripts/bench_metal_prefill.sh`，
+   输出带离散度列（max/min）——**离散度 >1.5 的行不可用于归因**。短 seq（16/64）噪声尤其大。
+   CPU arm 已内置 f16 满栈配方（坑 #1），别手改成 ref，否则 speedup 会被放大十几倍。
+   **两个补充教训（都是实测踩到的）**：
+   - **测性能前先 `uptime`**。agent 运行时自己会抢 CPU（曾见 load 5.67、两个 opencode
+     进程各占 125%/79%），端到端计时被污染到 CPU arm 离散度 **37×**，一度得出完全相反
+     的优化结论并误回退。
+   - **污染是加性的，所以取 min 比取中位数稳**。比较 Metal 版本时用引擎自带的
+     `TINYQWEN_METAL_TIMING=1`（只量 GPU 侧 exec，不含 CPU 编排）跑 5 次取 min，
+     比端到端中位数可靠得多。
+8. **GPU 上并行度比 dispatch 次数更值钱**：曾试图融合 Metal compute kernel 减少 dispatch
+   （每层 10 次 → 5 次），**结果全线变慢**（seq=512 1531 → 1791 ms），已回退。原因：RoPE 原本
+   一个线程一对（524288 线程），融合后一个线程一个头（12288 线程）、每个串行跑 64 轮，
+   **并行度掉 43×**。"减少 dispatch"这个直觉在 GPU 上不成立，要按并行度算账。
+9. **MSL 里 `half` 是内建类型名**：不能拿它当参数名/变量名，否则整个 kernel 解析失败，
+   报错还很误导（指向别的 kernel 的 `{`）。用 `n_half`。同理注意 `float`/`thread`/`device`。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

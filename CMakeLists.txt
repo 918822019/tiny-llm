@@ -74,6 +74,21 @@ else ()
     set(TINYQWEN_HAS_CUDA OFF)
 endif ()
 
+# ---------------------------------------------------------------------------
+# Apple Metal prefill：metal_prefill.mm 是 ObjC++（Metal / MetalPerformanceShaders
+# 的接口是 ObjC），必须启用 OBJCXX 语言。和 CUDA 一样，这里要在第一个
+# add_subdirectory 之前做 —— 语言检测/启用是全局状态。
+# 非 Apple 平台（Linux / Android NDK）跳过，runtime/ 会改用 stub 占位，
+# --engine metal 运行期报"仅在 Apple 平台可用"而不是链接失败。
+# ---------------------------------------------------------------------------
+if (APPLE)
+    enable_language(OBJCXX)
+    set(TINYQWEN_HAS_METAL ON)
+else ()
+    message(STATUS "tinyqwen: 非 Apple 平台，跳过 Metal prefill 引擎")
+    set(TINYQWEN_HAS_METAL OFF)
+endif ()
+
 # 构建子目录：计算内核（matvec、非 matvec 算子、CUDA kernel）
 add_subdirectory(kernels)
 # 构建子目录：运行时核心（模型加载、推理引擎、配置）

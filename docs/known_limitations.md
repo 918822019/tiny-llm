@@ -32,7 +32,31 @@
   A/B 与单算子验证，不是性能路径；
 - GPU-resident engine（`--engine cuda`）是 GPU 性能路径，但只支持
   Qwen2.x + greedy：不支持 `--topk` / `--dump-logits` / 批量模式；
-- Metal / Vulkan 后端仅 IBackend 接口预留，无实现。
+- **Metal prefill（`--engine metal`）仅覆盖 prefill 阶段**，且限制较多：
+  - 仅 Apple 平台（其他平台编译 `metal_prefill_stub.cpp`，运行期报错而非链接失败）；
+  - 只支持**全 full attention** 模型 —— Qwen3.5 的 GDN 混合架构直接 fail fast；
+  - 权重 dtype 只支持 f16 / f32（i4 / vq2 的亚字节布局需要专门反量化 kernel）；
+  - 只支持全 RoPE（`partial_rotary_factor == 1.0`）与 `head_dim % 4 == 0` 且 ≤ 128
+    （float4 对齐 + shader 内固定容量寄存器数组）；
+  - **支持 KV 接续**（投机解码 verify pass 的前提）：引擎自持一份 GPU 侧 KV cache，
+    每次调用把 n 个 token 追加在已有上下文之后，attention 读 `[0, pos0+n)`。
+    开始新序列前必须调 `metal_prefill_reset_kv()`，否则会读到上一段的历史。
+    若同时传 CPU KvCache，两者长度必须一致，否则报错；
+  - `max_seq_len <= 1024`：attention 的片上分数数组 `sc[1024]` 是固定容量，
+    更长上下文需要改成分块（flash-attention）才能突破；
+  - 额外显存：GPU KV cache 约 235 MB（0.6B @ max_seq_len=1024），与 CPU 的
+    KvCache 是两份独立内存；
+  - 不支持 `--topk`（用 `--dump-logits` 代替）、不支持批量模式；
+  - 权重常驻 GPU：f16 模型以 fp16 存（0.6B ≈ 1.20 GB，RSS 2.46 GB），f32 模型以
+    fp32 存（≈ 2.40 GB）。fp16 **只省内存不提速** —— 长 prompt prefill 的 GEMM
+    是算力受限而非带宽受限；
+  - 短 prompt 不划算：seq=16 仍比 CPU 慢（0.84×），交叉点约在 seq≈32；
+  - **投机解码区间是 MPS 逐调用开销受限**：verify pass 权重流量 ~1.19 GB
+    （带宽下限 ~10 ms），但实测 42–87 ms —— 112 次 MPS encode 的固定开销占大头。
+    所以 K（草稿长度）越大越划算：L=128 时 K=4 是 10.46 ms/tok、K=16 是 3.31 ms/tok；
+  - 数值口径与 CPU 同为 fp32，末位 logits `max_abs_err ≈ 3.2e-05`（CPU ref 的
+    RMSNorm 用 fp64 累加，GPU 用 fp32，故略大于纯 CPU 路径间的差异）；
+- Vulkan 后端仅 IBackend 接口预留，无实现。
 
 ## 格式
 
