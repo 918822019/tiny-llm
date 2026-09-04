@@ -27,8 +27,8 @@ namespace tinyqwen {
 
     void metal_prefill_destroy(MetalPrefillEngine *) {}
 
-    int metal_prefill_run(MetalPrefillEngine *, const int *, int, float *, KvCache *,
-                          std::string *err) {
+    int metal_prefill_run(MetalPrefillEngine *, const int *, int, float *, bool, KvCache *,
+                          GdnState *, std::string *err) {
         if (err) *err = "Metal prefill 仅在 Apple 平台可用";
         return -1;
     }

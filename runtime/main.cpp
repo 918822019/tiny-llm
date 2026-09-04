@@ -703,14 +703,19 @@ int main(int argc, char **argv) {
     } else if (metal_engine) {
         // Apple GPU 批量 prefill：整批一次前向。post-RoPE 的 K/V 写进 kv_cache
         // 并 advance(n)，后面的 decode 仍走 CPU 路径。
-        // dump 口径：默认只写末位一行（与 CPU 批量 prefill 一致）；--verbose 时
-        // 写全部 n 行，供逐位置对齐用 —— 引擎本来就算了全部位置的 logits。
-        metal_logits.assign(tokens.size() * vocab, 0.0f);
+        // dump 口径不变：默认只写末位一行（与 CPU 批量 prefill 一致）；--verbose
+        // 写全部 n 行，供逐位置对齐用。
+        // 区别在于现在按这个口径**按需计算**：只有"verbose 且真的要 dump"才让引擎
+        // 算全部 n 行，否则只算末位一行 —— 省掉 lm_head 的全行投影
+        // （seq=512 时 65.6 ms → ~3 ms），见 docs/optimization_log.md。
+        const bool need_all_rows = args.verbose && logits_out != nullptr;
+        if (logits_out) metal_logits.assign(need_all_rows ? tokens.size() * vocab : vocab, 0.0f);
+        float *lm_buf = logits_out ? metal_logits.data() : nullptr;
         std::string merr;
         profiler.begin_token(0, 0, /*is_prefill=*/true);
         next = tinyqwen::metal_prefill_run(metal_engine, tokens.data(),
-                                           static_cast<int>(tokens.size()), metal_logits.data(),
-                                           &model->kv_cache(), &merr);
+                                           static_cast<int>(tokens.size()), lm_buf, need_all_rows,
+                                           &model->kv_cache(), &model->gdn_state(), &merr);
         profiler.end_token();
         if (next < 0) {
             std::fprintf(stderr, "error: metal prefill failed: %s\n", merr.c_str());
@@ -718,11 +723,14 @@ int main(int argc, char **argv) {
             tinyqwen::metal_prefill_destroy(metal_engine);
             return 1;
         }
-        if (args.verbose) {
-            for (size_t i = 0; i < tokens.size(); ++i)
-                dump(metal_logits.data() + i * vocab);
-        } else {
-            dump(metal_logits.data() + (tokens.size() - 1) * vocab);
+        if (logits_out) {
+            // 末行路径下引擎把末位 logits 写在 lm_buf[0..vocab)
+            if (need_all_rows) {
+                for (size_t i = 0; i < tokens.size(); ++i)
+                    dump(metal_logits.data() + i * vocab);
+            } else {
+                dump(metal_logits.data());
+            }
         }
     } else if (args.verbose) {
         // 逐 token prefill：可打印每步详情

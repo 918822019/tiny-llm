@@ -29,6 +29,7 @@
 #include <string>
 
 #include "kv_cache.h"
+#include "gdn_state.h"
 #include "model_loader.h"
 
 namespace tinyqwen {
@@ -88,12 +89,24 @@ namespace tinyqwen {
     //   engine:     已创建的引擎
     //   tokens:     prompt token ids
     //   n:          token 个数（必须 >= 1 且 <= create 时的 max_seq_len）
-    //   logits_out: 输出 buffer，容量必须 >= n * vocab_size 个 float；
-    //               写入 [n, vocab] 行主序 fp32 logits（每个位置一行）。
-    //               传 nullptr 表示只要 argmax、不要 logits。
+    //   logits_out: 输出 buffer。传 nullptr 表示只要 argmax、不要 logits。
+    //               非 nullptr 时写几行由 all_logits 决定：
+    //                 all_logits=false —— 只写**末位一行**到 logits_out[0..vocab)，
+    //                                     容量 >= vocab 个 float 即可；
+    //                 all_logits=true  —— 写全部 [n, vocab] 行主序 fp32，
+    //                                     容量 >= n * vocab 个 float。
+    //   all_logits: 是否需要全部 n 行的 logits。
+    //               **false 是常态**：引擎只对末位 token 跑 lm_head。这一步是
+    //               prefill 的大头 —— seq=512 时全行 lm_head 要 65.6 ms，只算
+    //               末行降到 ~3 ms（N=1 时 MPS 已是带宽受限，97 GB/s 接近峰值）。
+    //               只有"逐位置对齐 / dump 全部行"才需要传 true。
     //   kv:         可选。非 nullptr 时把 post-RoPE 的 K/V 写进该 cache 的
     //               位置 [0, n)，并 advance(n)，使后续 CPU decode 能从位置 n
     //               正确接续。
+    //   gdn:        可选。非 nullptr 时把 GPU 上算出的 GDN recurrent/conv 状态
+    //               写回该对象，使后续 CPU decode 能接续 GDN 层。
+    //               **混合架构（Qwen3.5）必须传** —— 不传的话 CPU decode 会从
+    //               零状态开始（实测：prefill 首 token 正确但 decode 立刻发散）。
     //   err:        输出参数；失败时写入原因
     //
     // 返回值:
@@ -103,6 +116,8 @@ namespace tinyqwen {
     // 语义对齐:
     //   与 QwenModel::forward_prefill 一致 —— 都是"整批前向 + 写 KV +
     //   advance"。区别只是算子跑在 GPU 上（GEMM 走 MPS，其余走 Metal compute）。
+    //   注意 attention 仍然对全部 n 个位置计算（KV cache 要填 n 行），
+    //   省掉的只是 lm_head 那一次 [n, vocab] 投影。
     //
     // KV 接续（投机解码的前提）:
     //   引擎自己持有一份 GPU 侧 KV cache，每次调用把 n 个 token 追加在已有上下文
@@ -113,7 +128,8 @@ namespace tinyqwen {
     //   若同时传了 CPU 的 KvCache，它必须与引擎长度一致，否则报错。
     // ---------------------------------------------------------------------
     int metal_prefill_run(MetalPrefillEngine *engine, const int *tokens, int n,
-                          float *logits_out, KvCache *kv, std::string *err);
+                          float *logits_out, bool all_logits, KvCache *kv, GdnState *gdn,
+                          std::string *err);
 
     // ---------------------------------------------------------------------
     // metal_prefill_reset_kv: 清空引擎的 GPU KV cache，回到位置 0

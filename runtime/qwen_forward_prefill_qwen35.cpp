@@ -718,7 +718,6 @@ int QwenModel::forward_prefill_qwen35_batch(const int *token_ids, int n,
                         backend_->l2norm_inplace(kh, qk_hd, 1e-6f);
                     }
 
-                    // gated delta rule 递归（状态矩阵逐头更新）
                     float *S = gdn_state_.recurrent(li);
                     for (int h = 0; h < n_v_heads; ++h) {
                         const int qk_h = h / rep;

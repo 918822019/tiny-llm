@@ -234,6 +234,11 @@ namespace tinyqwen {
         // KV cache 引用（用于外部访问 K/V 数据）
         KvCache &kv_cache() { return kv_; }
 
+        // GDN 状态引用（Qwen3.5 专用）。Metal prefill 引擎在 GPU 上算完 GDN 递归后，
+        // 必须把 recurrent/conv 状态写回这里，否则后续 CPU decode 会从零状态开始
+        // （实测：prefill 首 token 正确但 decode 立刻发散）。
+        GdnState &gdn_state() { return gdn_state_; }
+
         // GDN 状态总字节数（Qwen3.5 专用；Qwen2.x 恒为 0）
         size_t gdn_state_bytes() const { return gdn_state_.memory_bytes(); }
 
