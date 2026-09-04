@@ -34,10 +34,12 @@
   Qwen2.x + greedy：不支持 `--topk` / `--dump-logits` / 批量模式；
 - **Metal prefill（`--engine metal`）仅覆盖 prefill 阶段**，且限制较多：
   - 仅 Apple 平台（其他平台编译 `metal_prefill_stub.cpp`，运行期报错而非链接失败）；
-  - 只支持**全 full attention** 模型 —— Qwen3.5 的 GDN 混合架构直接 fail fast；
   - 权重 dtype 只支持 f16 / f32（i4 / vq2 的亚字节布局需要专门反量化 kernel）；
-  - 只支持全 RoPE（`partial_rotary_factor == 1.0`）与 `head_dim % 4 == 0` 且 ≤ 128
-    （float4 对齐 + shader 内固定容量寄存器数组）；
+  - `head_dim % 4 == 0` 且 ≤ 256（float4 对齐 + 片上 qs 数组容量）；
+    rotary_dim 必须为偶数且 ≤ head_dim（支持 partial RoPE，如 Qwen3.5 的 64/256）；
+  - **支持 Qwen3.5 的 GDN + full attention 混合架构**：GDN 四算子有 Metal 实现。
+    跑混合架构时 `metal_prefill_run` 必须传 `GdnState*`，否则 prefill 首 token
+    正确但 decode 发散；
   - **支持 KV 接续**（投机解码 verify pass 的前提）：引擎自持一份 GPU 侧 KV cache，
     每次调用把 n 个 token 追加在已有上下文之后，attention 读 `[0, pos0+n)`。
     开始新序列前必须调 `metal_prefill_reset_kv()`，否则会读到上一段的历史。

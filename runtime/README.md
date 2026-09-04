@@ -62,12 +62,22 @@
   prefill 完把 post-RoPE 的 K/V 写进 `KvCache` 并 `advance(n)`，
   **所以 decode 仍走 CPU 且能正确接续** —— 这正是 cuda engine 缺的那一半。
 
-  适用范围（`metal_prefill_create` fail fast 校验）：全 full attention 层
-  （不支持 Qwen3.5 GDN 混合）、权重 f16/f32、全 RoPE、`head_dim % 4 == 0` 且
-  ≤ 128、起始位置固定 0。仅 Apple 平台；其他平台编译 `metal_prefill_stub.cpp`
+  注意 attention 对全部 n 个位置都算（KV cache 要填 n 行），但 **lm_head 默认只算末位一行**
+  （`metal_prefill_run` 的 `all_logits=false`）—— prefill 只有末位 logits 会被消费，
+  全行纯属浪费：seq=512 时 lm_head 从 65.6 ms 降到 3.05 ms。只有逐位置对齐 /
+  dump 全部行才需要 `all_logits=true`。N=1 时 MPS 已带宽受限（97 GB/s ≈ 峰值 81%），
+  所以这里**不换自写 kernel**（实测自写 GEMV 88 GB/s 反而更慢），只是改 `resultRows`。
+
+  适用范围（`metal_prefill_create` fail fast 校验）：权重 f16/f32、
+  `head_dim % 4 == 0` 且 ≤ 256、rotary_dim 为偶数且 ≤ head_dim、起始位置固定 0。
+  **支持 Qwen3.5 的 GDN + full attention 混合架构**（GDN 四算子有 Metal 实现，
+  每层一个 kernel、token 循环在 kernel 内部）；跑混合架构时 `metal_prefill_run`
+  必须传 `GdnState*`，否则 prefill 首 token 正确但 decode 发散。
+  仅 Apple 平台；其他平台编译 `metal_prefill_stub.cpp`
   占位，运行期报"仅在 Apple 平台可用"。
   数字与归因见 `../docs/optimization_log.md`，测速用
   `../scripts/bench_metal_prefill.sh`（带离散度列，离散度 >1.5 的行不可用于归因）。
+  改 `metal_prefill.mm` 后必须跑接续等价性：`../benchmarks/test_metal_continuation.cpp`。
 
 ## 建议阅读顺序（由浅入深）
 

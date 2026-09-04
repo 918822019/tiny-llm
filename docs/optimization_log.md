@@ -2940,6 +2940,476 @@ f16 带宽瓶颈，随温度漂（凉 17 ↔ 热 21）；i4 算力瓶颈，稳�
 
 ---
 
+### 证伪归档：自写 Metal GEMM / GEMV kernel（2026-09-04，macOS M4，两条都打不过 MPS）
+
+- **优化栈**：Metal prefill 引擎 + attention 线程组宽度 128 + KV 接续（上一条的终点）
+- **是什么**：为突破"MPS 只有峰值 57%"的判断，自写两个 MSL kernel 替换
+  `MPSMatrixMultiplication`：
+  1. `gemm_wt_tiled_f32` / `_f16` —— tiled simdgroup GEMM，tile 取
+     NR0=64 × NR1=32 × NK=32、128 线程（4 simdgroup × 32 lane）、
+     8×8 block swizzle 片上暂存、`simdgroup_float8x8` fp32 累加；
+     结构照搬 ggml `src/ggml-metal/kernels/mul_mm.metal` 的经典实现。
+  2. `gemv_wt` —— N=1 的 GEMV，一线程一输出行、uint4 向量化读 fp16 权重、
+     x 协作载入 threadgroup memory 后广播复用。
+- **假设**：MPS 是黑盒、只到峰值 57%，自写 kernel 按 roofline 调 tile 应该能超过它；
+  lm_head 换成 GEMV 应该能贴着带宽屋顶线跑。
+- **结果**（`benchmarks/bench_metal_gemm.mm`，GPU 侧 `GPUStartTime/GPUEndTime` 取 min，
+  同一进程内同场 A/B）：
+
+  | shape | MPS ms | 自写 f32 ms | 自写/MPS |
+  |---|---|---|---|
+  | qkv (4096×1024×512) | 1.565 | 1.754 | **1.12× 慢** |
+  | o_proj (1024×2048×512) | 0.826 | 0.904 | **1.09× 慢** |
+  | gate_up (6144×1024×512) | 2.314 | 2.705 | **1.17× 慢** |
+  | down (1024×3072×512) | 1.211 | 1.368 | **1.13× 慢** |
+  | lm_head (151936×1024×512) | 66.22 | **52.50** | **0.79× 快** |
+
+  GEMV 对照（lm_head 末行形状，out=151936 in=1024 N=1）：
+
+  | 路径 | GPU ms | 带宽 GB/s |
+  |---|---|---|
+  | MPS N=1 | **3.048** | **97.4** |
+  | 自写 GEMV | 3.364 | 88.2 |
+
+- **vs 上一配置**：**负收益**。四个层投影全部落后 9–17%，只有 lm_head 快 20%。
+- **验证**：自写 f32 变体与 MPS **逐位相同**（`max_abs_err = 0.00e+00`，五个 shape 全部）；
+  单线程组最小形状下与 CPU fp32 参考 `7.45e-08`、2048/2048 格子全对。
+  f16 片上暂存变体误差 ~7e-4（激活 fp32→fp16 丢 13 位尾数），且**更慢**，已弃。
+- **意外 / 教训**（三条，都是本次最值钱的部分）：
+  1. **"MPS 只有 57% 峰值"这个前提是错的。** 重测发现 MPS 在这几个 shape 上
+     实际到 60–73% 峰值（算力屋顶线：qkv 0.93 ms、MPS 实测 1.565 ms）。
+     之前的 57% 是被污染的端到端数字推出来的，不是 MPS 单独测的。
+     **教训：对某个组件下结论前，必须在隔离环境里单独测它**，
+     不能从端到端时间里倒推。
+  2. **Apple GPU 没有 tensor core，`simdgroup_multiply_accumulate` 不给硬件加速。**
+     它只是把 8×8 tile 摊到 32 lane 上的一种寄存器布局约定，底层仍是标量 FMA。
+     所以照搬 ggml 的 simdgroup 结构并不能凭空拿到"矩阵单元"吞吐 ——
+     ggml 那套是为**量化权重的 in-register 反量化**服务的，我的场景没有这个需求，
+     只剩下纯 GEMM，而纯 GEMM MPS 已经做得很好。
+  3. **fp16 片上暂存更慢，不是更快。** 直觉是片上内存减半 → 占用率翻倍 → 更快；
+     实测 f16 变体 1.758 ms vs f32 变体 1.754 ms（基本持平），而误差放大到 7e-4。
+     原因：Apple GPU 的 half FMA 吞吐并不比 fp32 高（同样没有矩阵单元），
+     省下的片上内存换不来速度，却付出了 fp32→fp16 转换指令 + 精度。
+     与上一条"fp16 算术证伪"是同一个根因。
+- **一个真的 bug（顺带发现）**：最初那版 K-loop 里 `xr` 指针把 `iy` baked 在外面、
+  循环内用 `xr[i]` 而**没有加 `loop_k`**，于是每个 K 迭代都重读同一批 8 个元素。
+  症状很误导：误差 5–9（输出量级才 0.64），且 **f32 与 f16 两个变体误差逐位相同**
+  —— 正是"共享索引逻辑出错"而非"dtype 问题"的信号。
+  修法是把 `loop_k` 加进索引。**教训：两个变体给出完全相同的错误数字时，
+  要去查它们共享的那部分代码，不要在各自的差异部分找。**
+- **另一处优化**：权重暂存原本用 16 次 2 字节标量加载，改成 4 个 `half4`
+  向量化加载后，层投影的落后幅度从 26–28% 收窄到 9–13%，lm_head 的优势从
+  12% 扩大到 20%。**说明向量化加载确实有效，只是不足以翻盘。**
+- **瓶颈转移**：lm_head 的真正瓶颈不是"用哪个 kernel"，而是**算了 512 行只要 1 行**
+  —— 见下一条。
+- **结论**：自写 GEMM/GEMV 这条路证伪，**保留 MPS**。微基准留在
+  `benchmarks/bench_metal_gemm.mm`（含 `--debug` 单线程组数值校验、`--gemv` 带宽对照），
+  将来换硬件或换 MPS 版本时可以重新跑一遍确认结论是否还成立。
+- **复现**：
+  ```bash
+  cmake --build build --target bench_metal_gemm -j
+  ./build/benchmarks/bench_metal_gemm --debug          # 单线程组数值校验
+  ./build/benchmarks/bench_metal_gemm --runs 15        # 五个 shape 同场 A/B
+  ./build/benchmarks/bench_metal_gemm --gemv --runs 11 # lm_head 末行：MPS N=1 vs 自写 GEMV
+  ```
+
+---
+
+### Metal prefill：lm_head 只算末行（`all_logits`）（2026-09-04，macOS M4）
+
+- **优化栈**：上一条的终点（Metal 引擎全套 + 保留 MPS）
+- **是什么**：`metal_prefill_run` 新增 `all_logits` 参数。默认 `false` 时 lm_head 的
+  `MPSMatrixMultiplication` 用 `resultRows=1`，并为 `X` / `Ylm` 建第 `n-1` 行的单行
+  `MPSMatrix` 视图（offset = `(n-1)*row_bytes`，已 align16 所以满足对齐要求）。
+  结果仍落在 `Ylm` 的第 `n-1` 行，所以下游 argmax 的寻址一行都不用改。
+  `all_logits=true` 时完全回退旧的全行路径。
+  `main.cpp` 侧按 `args.verbose && logits_out != nullptr` 决定要不要全行 ——
+  这是唯一真正需要全部 n 行的场景（逐位置对齐 / dump 全部行）。
+- **假设**：prefill 只需要末位 token 的 logits 来选下一个 token，其余 n-1 行纯浪费。
+  N=1 时 lm_head 从算力受限变成**带宽受限**：权重 151936×1024 fp16 = 296.8 MB，
+  按 120 GB/s 只要 ~2.5 ms；算力 2×151936×1024 = 3.1e8 FLOP 只占 0.07 ms。
+- **结果**（隔离微基准，GPU 侧计时取 min，离散度 1.04–1.27，可用于归因）：
+
+  | lm_head @ seq=512 | GPU ms | 带宽 GB/s |
+  |---|---|---|
+  | 全行（resultRows=512，旧） | 65.6–66.2 | ~4.5 |
+  | 末行（resultRows=1，新） | **3.048** | **97.4** |
+
+  **省下 ~63 ms**，占原先 337.65 ms GPU exec 的 ~19% → 预期 prefill 降到 ~275 ms（1.23×）。
+  末行版带宽 97.4 GB/s，已是 ~120 GB/s 峰值的 81% —— **贴着屋顶线，没有再压的空间**。
+- **vs 上一配置**：预期 1.23×（端到端待安静机器复测，见下）
+- **验证**：
+  - `verify.sh` 168 单测全过；
+  - 真实 Qwen3-0.6B 36-token prompt：metal 与 CPU 满栈（`neon_mt_kv_nt` + `neon`）
+    生成 token **完全一致** `151667 198 99692 3837`；
+  - 末位 logits vs CPU `max_abs_err = 8.75e-05`，argmax 同为 151667，top-5 逐位一致；
+  - KV 接续等价性（新建 `benchmarks/test_metal_continuation.cpp`）通过。
+- **交互**：与 attention 无关 —— attention 仍对全部 n 个位置计算（KV cache 要填 n 行），
+  省掉的只有 lm_head 那一次 `[n, vocab]` 投影。所以投机解码的 verify pass 也照常吃这个收益。
+- **意外 / 教训**（两条，都很重要）：
+  1. **`TINYQWEN_METAL_TIMING` 的 `exec` 原本漏掉 lm_head。** 它只在 28 层循环里累加
+     `t_exec_ms`，而 lm_head 是循环外的独立 command buffer，没有计时。
+     于是拿 `exec` 做本次优化的归因会得到**完全错误的结论** —— 我一开始就这么干了，
+     测出"省 180 ms"（远超微基准预测的 63 ms），实际那是噪声。
+     已修：lm_head 段也计入 `exec`，日志标签改成 `(28 层 + lm_head)`。
+     **教训：用现成的计时器做归因前，先确认它覆盖了你改的那一段。**
+  2. **MPS 会按矩阵尺寸选不同的内部 kernel，导致同一行数学结果差最后几位。**
+     实测：`resultRows=12` vs `resultRows=1` 的末位 logits 有 144139/151936 个元素
+     逐位不同（`max_abs_err=2.19e-05`）；而 `resultRows=7` vs `1` **逐位完全相同**。
+     说明 MPS 在某个行数阈值上换了 tiling 策略，fp32 累加顺序随之改变。
+     这直接推翻了 AGENTS.md 里"接续等价必须逐位相同"的判据 —— 两条喂法的 n 不同，
+     逐位相同不可达。改用容差 1e-3（比良性舍入 6.6e-05 高 15×、比历史真 bug 的
+     2.14 绝对值低 2000×）。判据更新见 AGENTS.md 坑 #10。
+- **瓶颈转移**：prefill 剩下的部分里，28 层的 4 个 GEMM 仍是 MPS（已证自写打不过），
+  attention 已优化到线程组协作版。**下一步唯一有量级空间的是层内 GEMM 的 MPS 调用
+  次数**（112 次 encode），但那需要自写 kernel 批量处理多个小矩阵 —— 本次已证
+  纯 GEMM 自写打不过 MPS，所以这条路要先解决"批量小矩阵"才有意义。
+- **端到端复测：两次尝试都判定为不可归因（记录在此，免得后人重复踩）**：
+  - 第一次（load 4.36）：`bench_metal_prefill.sh` 三档 metal 离散度 2.16 / 1.73 / 1.46；
+    同场 A/B（末行 vs 全行，交替 8 轮取 `TINYQWEN_METAL_TIMING` 的 exec）离散度
+    2.21 / 1.70 —— 全部 >1.5，不可用于归因。
+  - 第二次（load 2.48）：同场 A/B 改用 profiler 的 `first_token_ms`（确定覆盖 lm_head），
+    末行 min=525.8 / median=809.5（离散 **1.67**）、全行 min=814.7 / median=1035.4（离散 1.43）。
+    配对差值 median=220 ms，但**区间是 -60.9 到 +597.8**（有一轮全行反而更快），跨度 10×。
+    **判为不可信的关键理由**：表观省下的 220–289 ms 是隔离微基准测得的 lm_head 全行代价
+    （~63 ms）的 **3.5–4.6×**。省下比被优化对象本身还大是不可能的 —— 这是噪声不是信号。
+  - 结论：**端到端提速数字在本机（agent 自身持续占 CPU）无法归因**，需在真正安静的
+    机器上用 `bench_metal_prefill.sh` 复测。当前唯一可信的数字来自隔离微基准。
+- **可信数字（隔离微基准，两次复测一致，离散度均 <1.5）**：
+
+  | lm_head @ seq=512 | GPU ms | 带宽 GB/s | 离散度 |
+  |---|---|---|---|
+  | MPS `resultRows=512`（旧，全行） | **65.7933** | ~4.5 | 1.05 |
+  | MPS `resultRows=1`（新，末行） | **2.9747** | **99.8** | 1.19 |
+
+  **省 62.82 ms**。末行版 99.8 GB/s ≈ ~120 GB/s 峰值的 83%，已贴屋顶线。
+  占原 337.65 ms GPU exec 的 18.6% → 预期 prefill ~275 ms（1.23×），但**该预期未经
+  端到端验证**，只由"337.65 − 62.82"推得。
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                        # 168 单测
+  ./build/benchmarks/bench_metal_gemm --gemv --runs 11       # lm_head 末行 vs 全行的带宽对照
+  cmake --build build --target test_metal_continuation -j
+  ./build/benchmarks/test_metal_continuation \
+      --model model_qwen3_06b_f16.tqwen --tokens <csv> --split 5
+  RUNS=9 WARMUP=3 ./scripts/bench_metal_prefill.sh 128 256 512   # 端到端（需安静机器）
+  ```
+
+---
+
+### 证伪归档：INT4 层投影 GEMM（2026-09-04，macOS M4，Apple GPU 没有低精度算力加速）
+
+- **优化栈**：Metal prefill 引擎 + lm_head 只算末行（上一条的终点）
+- **是什么**：写 `gemm_wt_tiled_i4` —— 与 fp16 tiled GEMM 同构（NR0=64×NR1=32×NK=32、
+  128 线程、8×8 block swizzle、`simdgroup_float8x8` 累加），差别在权重暂存前做
+  **in-register 反量化**：读 `[scale_fp16|zero_fp16|packed_uint4]` 36B 组头，
+  2 个 `uint` 读 8 字节 = 16 个 nibble，`(q - zero) × scale`。
+  配套导出了 `model_qwen3_06b_i4.tqwen`（HQQ@64，lm_head 也是 i4）。
+- **假设**：int4 是 0.5625 B/elem vs fp16 的 2 B/elem（**3.56× 流量降低**），
+  拆掉限制 fp16 GEMM 的带宽约束后应该能提速 ~1.4×；且 MPS 没有 int4 路径，
+  自写 kernel 在这里是必需的（与 fp16 那条"可选但打不过 MPS"性质不同）。
+- **结果**（`benchmarks/bench_metal_gemm.mm --i4` / `--i4-sweep`，GPU 侧计时取 min）：
+
+  四个层投影 @ seq=512（同一份 int4 权重，反量化成 f16 喂 MPS，保证两边算同一数学问题）：
+
+  | shape | MPS f16 | int4 | int4/MPS | int4 err |
+  |---|---|---|---|---|
+  | qkv | 1.5649 | 1.8246 | **1.165× 慢** | 6.6e-04 |
+  | o_proj | 1.1054 | 1.2981 | 1.174× 慢 | 8.5e-04 |
+  | gate_up | 3.1471 | 3.5501 | 1.128× 慢 | 6.6e-04 |
+  | down | 1.4610 | 1.7086 | 1.169× 慢 | 1.18e-03 |
+  | **四层合计** | **5.898** | **6.908** | **0.87×** | — |
+
+  × 28 层 = MPS 165.1 ms vs int4 **193.4 ms**。误差量级 6.6e-04~1.18e-03 是
+  "反量化值再舍入到 fp16"的预期差异，不是 bug。
+
+  扫 n 找交叉点（gate_up，out=6144 in=1024；权重 int4 3.38 MB vs f16 12.00 MB）：
+
+  | n | MPS f16 | int4 | int4/MPS | int4 GB/s | 离散度 |
+  |---|---|---|---|---|---|
+  | 8 | 0.5131 | 0.3146 | 0.613 | 10.7 | 1.73 ⚠️ |
+  | 16 | 0.1833 | 0.3136 | 1.710 | 10.8 | 2.47 ⚠️ |
+  | 32 | 0.2914 | 0.3139 | 1.077 | 10.8 | 1.93 ⚠️ |
+  | 64 | 0.5083 | 0.5925 | 1.166 | 5.7 | 1.08 |
+  | 128 | 0.9810 | 1.1268 | 1.149 | 3.0 | 1.30 |
+  | 256 | 1.6240 | 1.8846 | 1.160 | 1.8 | 1.37 |
+  | 512 | 2.6061 | 2.9682 | 1.139 | 1.1 | 1.34 |
+
+- **vs 上一配置**：**负收益**。可靠行（离散度 <1.5，即 n≥64）全部慢 13–17%，
+  **没有任何一个区间 int4 赢**。
+- **意外 / 教训**（这条最值钱，因为它推翻了整个假设链）：
+  1. **int4 的带宽红利在 Apple GPU 上根本兑现不了，因为这些 GEMM 从来不是带宽受限。**
+     三条硬证据：① int4 耗时在 n=8/16/32 上**恒为 ~0.314 ms**，完全不随 n 缩放，
+     是个硬地板；② int4 实测吞吐**最高只有 10.8 GB/s = 120 GB/s 峰值的 9%**，
+     且随 n 单调下降（10.8→5.7→3.0→1.8→1.1）；③ 带宽地板是 0.028 ms，
+     而实测最小 0.314 ms —— **高出 11×**。所以"3.56× 流量降低 → 提速"这个推理
+     的前提就不成立。
+  2. **根因：Apple GPU 没有低精度算力加速。** int4 只省内存带宽，不省算力；
+     而 MSL 里没有整数 dot-product 指令（没有 `simdgroup_integer` 矩阵运算），
+     所以反量化之后仍要走 fp32 FMA —— **算力开销与 fp16 完全一样**。
+     带宽省了、算力没省，而瓶颈是算力，于是净收益为负。
+     这与 fp16 那条"Apple GPU 没有 tensor core"是同一个根因的两种表现。
+  3. **n=8 那行的"int4 赢"是假象，不要信。** 三个理由：① 该行离散度 1.73 ⚠️；
+     ② MPS 在 n=8（0.5131 ms）比 n=16（0.1833 ms）**还慢**，非单调，说明 MPS
+     在极小 n 上走了另一条低效路径 —— 是 MPS 反常，不是 int4 快；
+     ③ int4 的 0.3146 就是它的地板值，不是"变快了"。
+     **凡是被优化对象自己反常导致的"赢"，都不算赢。**
+  4. **int4 地板的来源是 tile 粒度太粗。** n=8 时 grid = `ceil(8/32) × ceil(6144/64)`
+     = `1 × 96` 个线程组，每组算 64×32 的输出 tile 但只有 64×8 有效 ——
+     **75% 的算力白算**。所以小 n 下 int4 也拿不到好处。
+- **一个真 bug（顺带发现）**：nibble 解包最初写成 `wv[2j] = u0 的 nibble j`、
+  `wv[2j+1] = u1 的 nibble j`，把 u0 的元素撒到偶数位、u1 的撒到奇数位，顺序全错
+  （误差 4~7，输出量级才 0.64）。正确写法是 `wv[j] = u0 nibble j`、`wv[j+8] = u1 nibble j`
+  —— 小端序下 `u0` 的 nibble n 就是元素 n。**教训：位打包的解包顺序要单独验证，
+  不能靠"看起来对"。**
+- **对齐账（写 kernel 时必须先算）**：行跨度 `(in/gs)*36`；in=1024,gs=64 → 576（8 的倍数）。
+  某行某组 packed 起点 = `576*r + 36*g + 4 + p/2`，其中 `36*g+4` 在 g 偶/奇时
+  分别 ≡ 4/0 (mod 8) —— **不稳定 8 字节对齐，但恒定 4 字节对齐**。
+  所以只能读 2 个 `uint`（4 字节对齐），**不能读 `uint2`**（要 8 字节对齐），
+  否则偶数组上会崩或读错数据。
+- **结论**：**int4 在 Apple GPU 上是内存特性，不是提速特性**（与 `--kv-f16` 同类）。
+  内存收益是真的（文件 1136.9 MB → 913.5 MB；lm_head 296.8 MB → 83.5 MB，3.56×），
+  但 prefill 提速为负。**所以不把 int4 接进 Metal prefill 引擎** ——
+  接进去只会让 prefill 变慢 15%。int4 继续留在 CPU decode 路径
+  （那边是带宽受限，`sdot4_mt` 的 ~2× 收益是真的）。
+- **复现**：
+  ```bash
+  .venv/bin/python tools/export_qwen_to_tiny_i4.py --model models/Qwen3-0.6B \
+      --out model_qwen3_06b_i4.tqwen --method hqq --group-size 64
+  ./build/benchmarks/bench_metal_gemm --i4 --runs 11              # 四层投影 vs MPS f16
+  ./build/benchmarks/bench_metal_gemm --i4-sweep --runs 21        # 扫 n 找交叉点
+  ./build/benchmarks/bench_metal_gemm --i4-sweep --shape 1024 3072 --runs 21  # 换 down 形状
+  ```
+
+---
+
+### INT4 Metal 算子：层投影 GEMM 证伪，但 lm_head GEMV 赢 2.92×（2026-09-05，macOS M4）
+
+**结论先说**：int4 在 Metal 上**不是全面证伪**。层投影 GEMM（M=1024~6144）确实打不过
+MPS f16，慢 13–17%；但 **lm_head 的 N=1 GEMV（M=151936）快 2.92×**。两者性质完全不同，
+下面分开记。**教训：判定一个 dtype 有没有价值，必须覆盖它真正该赢的形状区间，
+不能只测层投影就下"全面证伪"的结论 —— 我最初就是这么错的。**
+
+- **优化栈**：Metal prefill 引擎 + lm_head 只算末行（上一条的终点）
+- **是什么**：写 `gemm_wt_tiled_i4` —— 在 fp16 tiled GEMM 的基础上，把权重换成
+  INT4 packed 布局（`[scale_fp16|zero_fp16|packed_uint4]` 每组 36B、低 nibble 在前、
+  group_size=64），在**寄存器内**反量化 `(q - zero) × scale` 后写片上，累加仍是
+  `simdgroup_float8x8`。先导出 int4 Qwen3-0.6B（`tools/export_qwen_to_tiny_i4.py
+  --method hqq`）作为数据来源 —— 现有 int4 模型全是 Qwen3.5 GDN，Metal 引擎跑不了。
+- **假设**：MPS 没有 int4 GEMM 路径，所以自写 kernel 在这里是**必需**的（与 fp16 那条
+  "可选但打不过 MPS"性质不同）；且 int4 是 0.5625 B/elem vs fp16 的 2 B/elem，
+  **3.56× 流量降低**，应当拆掉限制 fp16 GEMM 的带宽约束。反量化开销按 tile 摊薄后
+  只有 ~0.03 次/FMA，可忽略。
+- **结果**（`bench_metal_gemm --i4`，同一份 int4 权重反量化成 f16 喂 MPS，保证两边算
+  同一个数学问题；GPU 侧计时取 min，runs=11）：
+
+  | shape | MPS f16 ms | int4 ms | int4/MPS | int4 误差 |
+  |---|---|---|---|---|
+  | qkv (4096×1024×512) | 1.5649 | 1.8246 | **1.165× 慢** | 6.6e-04 |
+  | o_proj (1024×2048×512) | 1.1054 | 1.2981 | **1.174× 慢** | 8.5e-04 |
+  | gate_up (6144×1024×512) | 3.1471 | 3.5501 | **1.128× 慢** | 6.6e-04 |
+  | down (1024×3072×512) | 1.4610 | 1.7086 | **1.169× 慢** | 1.2e-03 |
+
+  四层合计 MPS 7.866 ms → int4 9.064 ms（**0.87×**）；× 28 层 = 220.2 vs 253.8 ms。
+  误差量级 6.6e-04~1.2e-03 是**预期值**不是 bug：MPS 拿到的是反量化后再舍入到 fp16 的
+  权重，自写 kernel 在 fp32 里精确算 `(q-zero)*scale`，差的就是那次 fp16 舍入。
+- **扫 n 找交叉点（`--i4-sweep`，gate_up 形状，runs=21）—— 交叉点不存在**：
+
+  | n | MPS f16 | int4 | int4/MPS | int4 GB/s | 离散 |
+  |---|---|---|---|---|---|
+  | 8 | 0.5131 | 0.3146 | 0.613 | 10.7 | 1.73 ⚠️ |
+  | 16 | 0.1833 | 0.3136 | 1.710 | 10.8 | 2.47 ⚠️ |
+  | 32 | 0.2914 | 0.3139 | 1.077 | 10.8 | 1.93 ⚠️ |
+  | 64 | 0.5083 | 0.5925 | 1.166 | 5.7 | 1.08 |
+  | 128 | 0.9810 | 1.1268 | 1.149 | 3.0 | 1.30 |
+  | 256 | 1.6240 | 1.8846 | 1.160 | 1.8 | 1.37 |
+  | 512 | 2.6061 | 2.9682 | 1.139 | 1.1 | 1.34 |
+
+  三条决定性事实：
+  1. **int4 在 n=8/16/32 恒为 ~0.314 ms** —— 一个不随 n 缩放的硬地板；
+  2. **int4 吞吐峰值只有 10.8 GB/s = 120 GB/s 峰值的 9%**，且随 n 单调下降
+     （10.8→5.7→3.0→1.8→1.1），**离带宽受限差得远**；
+  3. **带宽地板是 0.028 ms，而 int4 最低实测 0.314 ms —— 高出 11×**。
+     3.56× 的带宽红利**根本没机会兑现**，因为任何 n 下都不是带宽受限。
+  n=8 那行的"int4 赢"是**假象**：MPS 在 n=8 反常地慢（0.5131，比 n=16 的 0.1833 还慢，
+  非单调），int4 的 0.3146 只是它的地板，且该行离散度 1.73 ⚠️。**离散度 <1.5 的四行
+  （n=64/128/256/512）全部显示 int4 慢 13–17%。**
+- **vs 上一配置**：**负收益，不接入引擎**。int4 在 Metal prefill 上只有内存价值
+  （权重 3.56× 小：lm_head 296.8→83.5 MB、整模 1136.9→913.5 MB），**没有提速价值**。
+- **根因（不是可修的低效，是结构性的）**：
+  **寄存器内反量化被每个输出 tile 重复执行一遍。** n=512 时 gx = 512/32 = 16，
+  同一份权重 tile 要反量化 **16 次**。MPS 用 fp16 权重时，重复读只是**内存重读**
+  （L2 能吸收）；int4 的重复是**重复计算**，L2 吸收不了。
+  想避免就得把权重反量化成 fp32 常驻显存 —— 那是 2.7 GB，比 fp16 的 1.19 GB 更差，
+  先前已经排除。所以"int4 + tiled GEMM + 寄存器内反量化"这个组合有**固有的重复
+  反量化代价**，这就是它输的原因。
+  次要因素：n 小时 tile 粒度太粗 —— n=8 时 grid 只有 `1 × 96` 个线程组，每组算
+  64×32 但只有 64×8 有效，**75% 算力浪费**。
+- **意外 / 教训**：
+  1. **"int4 省带宽所以更快"这个直觉在这里不成立**。省带宽只在**带宽受限**时有用；
+     层投影 GEMM 在 seq=512 是算力受限（AI=513），短 seq 下又被 MPS 固定开销和
+     tile 粒度主导 —— 两头都不是带宽受限。**先确认瓶颈类型，再决定要不要省那个资源。**
+  2. **量化格式的带宽红利要用"实测吞吐 vs 带宽地板"来验证**，不能只看格式压缩比。
+     int4 压缩比 3.56×，但实测吞吐只到峰值 9%，压缩比完全没转化成速度。
+- **一个真的 bug（顺带发现）**：nibble 解包最初写成 `wv[2j]=u0 的 nibble j、
+  wv[2j+1]=u1 的 nibble j`，把 u0 的元素撒到偶数位、u1 的撒到奇数位，顺序全错
+  （误差 4~7，输出量级才 0.64）。正确是 `wv[j]=u0 nibble j、wv[j+8]=u1 nibble j`
+  —— 小端序下 u0 = 前 4 字节 = 元素 0..7，u1 = 后 4 字节 = 元素 8..15，
+  nibble 序号与元素序号一致。**教训：packed 格式的解包必须先在最小形状上
+  逐元素核对顺序，别靠"误差看起来不大"判断。**
+- **对齐账（写这类 kernel 前必须算）**：行跨度 = `(in/gs)*36` = 576（8 的倍数），
+  但组内 packed 起点 = `576*r + 36*g + 4 + p/2`，其中 `36*g+4` 在 g 偶数时 ≡4 (mod 8)、
+  g 奇数时 ≡0 (mod 8) —— **不稳定 8 字节对齐，但恒定 4 字节对齐**。所以只能读 2 个
+  `uint`，**不能读 `uint2`**（要 8 字节对齐），用 uint2 会在偶数组上读错数据。
+- **层投影结论**：INT4 层投影 GEMM 证伪，不接入引擎。根因是寄存器内反量化被每个
+  输出 tile 重复执行 gx 次，L2 吸收不了重复计算。
+
+---
+
+### INT4 lm_head GEMV：赢 2.92×（2026-09-05，macOS M4）
+
+- **是什么**：`gemv_wt_i4` —— N=1、一线程一输出行、uint 向量化读 packed int4、
+  寄存器内反量化、x 协作载入片上广播复用。跑在 lm_head 形状（out=151936, in=1024）。
+- **为什么这个形状 int4 会赢而层投影不会**（四个条件全部满足，层投影一个都不满足）：
+
+  | 条件 | lm_head N=1 | 层投影 GEMM |
+  |---|---|---|
+  | 带宽受限？ | ✅ N=1，算术强度极低 | ❌ n≥64 是算力受限（AI=513） |
+  | 占用率够？ | ✅ M=151936 → 上千线程组 | ❌ n≤32 时仅 96 组、4.8 波、256 线程/核 |
+  | tile 粒度浪费？ | ✅ 无（一线程一行） | ❌ NR1=32 而 n=8 时 75% 算力白算 |
+  | 重复反量化？ | ✅ 权重只读一遍 | ❌ gx=16 时同一 tile 反量化 16 次 |
+
+- **结果**（GPU 侧计时取 min，runs=15，离散度均 <1.5 可用于归因）：
+
+  | 路径 | 权重量 | GPU ms | 带宽 GB/s | 离散度 |
+  |---|---|---|---|---|
+  | MPS f16 N=1 | 296.8 MB | 3.3334 | 89.0 | 1.22 |
+  | **自写 int4 GEMV** | **83.5 MB** | **1.1433** | 73.0 | 1.13 |
+
+  **提速 2.92×**（跨轮区间 2.64–2.92×，MPS 绝对值有波动）。
+  `max_abs_err = 5.16e-04`（是"反量化后舍入到 fp16 喂 MPS"的差，不是量化误差）；
+  vs CPU fp64 参考 `5.92e-07`。
+- **一次优化尝试与它的证伪**：把 `(q-zero)·scale·x` 代数变形为
+  `scale·(Σq·x - zero·Σx)`，其中 `Σx` per group 对所有输出行相同、可在协作载入 x 时
+  预算一次。预期 per-group ALU 从 ~456 降到 ~196（2.4× 少），带宽应当成为新瓶颈、
+  冲到 ~120 GB/s。**实测只快 3.2%**（1.1809→1.1433 ms，70.7→73.0 GB/s）。
+  **所以 ALU 不是瓶颈**。真正的瓶颈是**缓存行粒度浪费**：每组 36 字节，而缓存行
+  64–128 字节 → 每读 36 字节要拉一整行，浪费 1.6–3.6×；`120/1.6 ≈ 75 GB/s`
+  与实测 73.0 吻合。**这是 36 字节组布局的固有代价，改不动**（除非改格式，
+  但那会破坏与 CPU 路径的兼容性）。int4 实测离自己的屋顶线（0.696 ms）1.6×。
+- **教训**：**"减少 ALU 就能提速"要先验证 ALU 真是瓶颈**。我按 op 数算出 2.4× 削减
+  就预期 40% 提速，实测 3.2% —— 说明瓶颈在别处。判定瓶颈要用"实测吞吐 vs 各类
+  屋顶线"交叉验证：这里 73 GB/s 既不是带宽屋顶线（120）也不是 ALU 屋顶线，
+  而是缓存行粒度这个**第三类约束**，容易漏掉。
+- **接入引擎的评估（未接入，收益太小）**：
+  - 现状 f16 模型 lm_head 末行 = 2.97 ms；换 int4 GEMV ≈ 1.14 ms，**省 1.83 ms**
+    = 275 ms prefill 的 **0.65%**；内存省 296.8→83.5 MB（213 MB）。
+  - 整模 int4 的话：层投影占 165 ms 且慢 13–17%，lm_head 只占 1.14 ms，
+    **净效果是整体慢 ~15%、内存省 3.56×** —— 那是内存特性不是提速特性。
+  - 且当前引擎能跑的 int4 模型只有刚导出的 0.6B（它 f16 本来就装得下），
+    更大的 int4 模型都是 Qwen3.5 GDN、引擎不支持。
+  - **所以暂不接入**。要接的最划算形态是"只把 lm_head 量化成 int4、层投影保持 f16"
+    （仓库已有 `tools/quantize_embed_i4.py`），省 1.83 ms + 213 MB 且无层投影代价。
+- **复现**：
+  ```bash
+  .venv/bin/python tools/export_qwen_to_tiny_i4.py --model models/Qwen3-0.6B \
+      --out model_qwen3_06b_i4.tqwen --method hqq --group-size 64
+  cmake --build build --target bench_metal_gemm -j
+  ./build/benchmarks/bench_metal_gemm --i4 --runs 11                 # 四层 int4 vs MPS f16
+  ./build/benchmarks/bench_metal_gemm --i4-sweep --runs 21           # 扫 n 找交叉点
+  ./build/benchmarks/bench_metal_gemm --i4-sweep --shape 4096 1024 --runs 21
+  ./build/benchmarks/bench_metal_gemm --i4-gemv --shape 151936 1024 --runs 15  # lm_head GEMV
+  ```
+
+---
+
+### Metal prefill 适配 Qwen3.5 混合架构（GDN）（2026-09-04，macOS M4）
+
+- **优化栈**：Metal prefill 引擎（lm_head 末行优化之后）
+- **是什么**：把 `--engine metal` 从"只支持全 full attention 模型"扩展到 Qwen3.5 的
+  GDN + full attention 混合架构。新增四个 Metal compute kernel：
+  `gdn_conv1d_scan`、`gdn_l2norm_qk`、`gdn_scan`（gated delta rule 递归）、
+  `gdn_norm_gated`；并补上 `attn_output_gate`（`deinterleave_qg` + `apply_gate`）、
+  partial RoPE（rot_dim 与 head_dim 分开寻址）、head_dim=256 支持。
+- **关键设计：GDN 每层一个 kernel、token 循环在 kernel 内部**。
+  conv1d 状态与递归状态矩阵 S 必须按 token 顺序更新，若每 token 一次 dispatch，
+  512 token × 18 GDN 层 = **9216 次 launch**，光开销（~0.05 ms/次）就 460 ms，
+  比 CPU 的 575.7 ms 还慢。conv1d 的滑动窗口状态留在寄存器里，整段只在开头读一次、
+  结尾写一次。
+- **假设**：GDN 递归是 Qwen3.5 prefill 的最大单项（CPU 侧 575.7 ms / 37.7%），
+  搬到 GPU 应当显著提速。
+- **结果**（`bench_metal_prefill.sh`，离散度均 <1.5，可归因）：
+
+  | seq | CPU ms | Metal ms | 提速 | CPU散 | Metal散 |
+  |---|---|---|---|---|---|
+  | 32  | 148.33 | 569.16 | **0.261×（更慢）** | 2.33 ⚠️ | 1.58 ⚠️ |
+  | 128 | 348.83 | 666.52 | **0.523×（更慢）** | 1.71 ⚠️ | 1.71 ⚠️ |
+  | 512 | 1340.77 | 973.39 | **1.377×** | 1.49 ✅ | 1.19 ✅ |
+
+  GPU 侧 exec（`TINYQWEN_METAL_TIMING`，6 次取 min）：Qwen3.5 seq=512 = **827.5 ms**，
+  Qwen3-0.6B seq=512 = 697.1 ms（对照，纯 full attention）。
+- **vs 上一配置**：seq=512 提速 1.377×；**seq≤128 反而比 CPU 慢**。
+- **验证**：
+  - `verify.sh` 168 单测全过；
+  - Qwen3.5-0.8B seq=32/128/512 的 generated_ids 与 CPU 满栈路径（`neon_mt_kv_nt`+`neon`）
+    **逐位一致**（32: `198 96091 97962 97962`；128: `19779 22364 19779 19779`；
+    512: `198 71093 198 71093`）；
+  - Qwen3-0.6B 回归不变（`151667 198 99692 3837`），bench 提速 8.024× 无回退；
+  - GDN 逐层残差流对 CPU：层 0/1/2 = 2.68e-06 / 4.89e-06 / 4.29e-06；
+  - delta rule 用闭式独立复算（token 0 时 S=0 → `o = beta·v·(k·q)`）：**4.29e-07**。
+- **瓶颈转移**：GDN 递归扫描仍是最大单项，且**远未达到我预估的带宽地板**。
+  预估 157 ms（18.9 GB / 120 GB/s），实际 GPU exec 827.5 ms 里 GDN 占大头。
+  两个原因：
+  1. **占用率极低** —— 只有 16 个线程组 × 128 线程 = 2048 线程，而 10 核 GPU 能跑
+     上万线程，延迟隐藏很差；
+  2. **S 每 token 两遍读写设备内存** —— 单头 S 是 128×128×4 = 64 KB，**超过 32 KB
+     片上上限**，无法常驻片上；每 token 每层流量 16 头 × 64 KB × 2(读写) × 2(两遍)
+     = 4 MB，× 512 token × 18 层 = 36.9 GB，且低占用率下有效带宽远低于 120 GB/s。
+  **下一步优化方向**：把 v_dim 切分给更多线程组提高并行度，或用 fp16 存 S 压到
+  32 KB 以内以常驻片上（需评估精度）。
+- **意外 / 教训**（五个，都是实测踩到的）：
+  1. **`sigmoid` 与 `silu` 一字之差，输出门写成 silu 会让结果全错**。
+     `apply_gate` 最初写成 `g / (1 + exp(-g))` = `g·sigmoid(g)` = **silu(g)**，
+     而 CPU 用 `sigmoidf32`。定位方法很值得记：token 0 只有 1 个 KV 位置，
+     softmax 权重必为 1，所以输出**必须**等于 `v[0]·sigmoid(gate)`；
+     实测 `Xa/v[0]` 全 256 维都是负的（sigmoid 恒正，数学上不可能），
+     而 `ratio ≈ gate 原值` —— 反推出多乘了一个 `g`，即 silu。
+     **闭式检验 + 比值反推**比逐行读代码快得多。
+  2. **`full_layer_cache_index` 在稠密模型下除零**。
+     `full_attention_interval=0`（v1 格式）时 `(idx+1)/interval` 除零，`fi` 变成 -1，
+     导致所有 full attention 权重取到 nil。`n_full_layers()` 与 `is_linear_layer()`
+     都有 `<=1` 守卫，但 `full_layer_cache_index()` 没有 —— **同一个结构体里三个
+     函数的守卫不一致**，很容易漏。
+  3. **`kv_append` 缺 `gid.x` 边界检查会写坏下一层的 KV cache**。
+     `dispatch_2d` 的 `threadsPerThreadgroup` 取的是 kernel 上限（1024），而 cols
+     可能远小于它。Qwen3-0.6B 的 `NKV*HD` 恰好 = 1024 所以从未暴露；
+     Qwen3.5 是 `2*256 = 512`，于是 `e ∈ [512,1024)` 的线程算出 `kvh = 2,3`
+     （只有 2 个 kv 头），`dst` 越界写到**下一层的 cache 槽**。
+     **凡是 `dispatch_2d(cols < 线程组上限)` 的 kernel，都必须检查 `gid.x`。**
+  4. **读 Shared 存储的 GPU buffer 必须在 `commit + waitUntilCompleted` 之后**。
+     调试 dump 最初放在 commit 之前，读到的是上一层的旧值，制造出"每层都发散"的
+     假象，导致我一度怀疑已经验证正确的 GDN 路径，白绕了一大圈。
+     **插桩位置错了，结论就全错 —— 先确认插桩读的是完成后的状态。**
+  5. **GDN 状态必须写回 CPU 的 `GdnState`**。引擎在 GPU 上算完递归后，状态只存在于
+     自己的 buffer 里；后续 decode 走 CPU 路径读的是 `GdnState`。不写回的症状很迷惑：
+     **prefill 首 token 完全正确，但 decode 立刻发散**。两边布局完全一致
+     （`recurrent[层][v头][qk_hd][v_hd]`、`conv[层][conv_dim][ks-1]`），是整块 memcpy。
+- **顺带修的**：attention 片上内存从固定 `qs[256]` 改为**按实际 hd 动态分配**
+  （host 侧 `setThreadgroupMemoryLength`）。固定按 256 分配会让 hd=128 的模型
+  片上占用 5120→5632 B，每核并发线程组 6→5。
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                  # 168 单测
+  MODEL=model_qwen35_f16.tqwen RUNS=7 WARMUP=3 \
+    ./scripts/bench_metal_prefill.sh 32 128 512        # 看离散度列，>1.5 不可归因
+  TINYQWEN_METAL_TIMING=1 ./build/runtime/tinyqwen \
+    --model model_qwen35_f16.tqwen --tokens-json <json> \
+    --engine metal --max-new-tokens 1 --max-seq-len 1024   # GPU 侧 exec，多次取 min
+  # 逐位一致性：同一 prompt 分别跑 --engine metal 与 CPU 满栈，比对 generated_ids
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）
