@@ -3488,6 +3488,95 @@ MPS f16，慢 13–17%；但 **lm_head 的 N=1 GEMV（M=151936）快 2.92×**。
 
 ---
 
+### GPTQ NEON kernel + cache slots 扫描：MoE decode 14.9×（2026-09-07）
+
+- **优化栈**：… + MoE 动态路由 + ExpertStore + 稀疏加载 + **GPTQ NEON matvec**
+  + **cache slots 归因** + lm_head f32 kernel 路由修正
+- **是什么**：为 GPTQ 变体族写首个优化 kernel（此前只有标量 `matvec_gptq_ref`）。
+  三处独立改动：① 遍历顺序 c8-outer/o-inner（ref 的 o-outer/c8-inner 按
+  `out_dim*4` 字节跨步，cache 极差）② o 方向分块 64（每块 256 B = 4 条完整
+  cache line，累加器留寄存器）③ **反量化因式分解**——同一 u32 字的 8 个 nibble
+  共享 s/z，故 `Σ_k ((nib_k - z)·s·x_k) = s·[Σ_k(nib_k·x_k) - z·Σ_k(x_k)]`，
+  其中 `Σ_k(x_k)` 只依赖 c8、与 o 无关，可预算。每 8 权重省掉 8 次减+乘。
+- **假设**：GPTQ matvec 覆盖 90.6% 运行时，NEON + 因式分解预估 37–374×。
+- **结果**：**decode 9157 → 616 ms/tok（14.9×），TTFT 67.1 → 5.3 s（12.7×）**
+  （M4，Qwen3-30B-A3B-GPTQ-Int4，`--moe-ssd --moe-expert-cache-slots 4`，
+  3 次取 min；load avg ~5，见坑 #7）。
+
+  | impl | decode | TTFT | vs ref |
+  |---|---|---|---|
+  | ref | 9157 ms/tok | 67.1 s | 1× |
+  | **neon** | **616 ms/tok** | **5.3 s** | **14.9×** |
+  | neon_mt | 无收益（见下） | — | — |
+
+- **验证**：generated_ids 在 ref / neon / neon_mt **三者完全一致**
+  （`17 15 17 18 7948 16 15 9754`）；186 单测全过（181 原有 + 5 新增 GPTQ
+  对齐测试，含 act-order 排列 g_idx 慢路径护栏）。
+- **瓶颈转移（本轮最值钱的部分）**：compute 快 14.9× 后，**I/O 从 3.0% 涨到
+  61.5%** ——
+
+  | op | ref | neon |
+  |---|---|---|
+  | `expert_load`（I/O） | 3.0% | **61.5%** ← 新瓶颈 |
+  | `expert_ffn` | 59.7% | 20.1% |
+  | `qkv_proj` | 17.2% | 8.1% |
+  | `lm_head` | 6.0% | 2.5% |
+
+  I/O 绝对耗时不变（它不是计算），占比却涨 20×。**→ Phase B 异步预取从
+  「优先级下调」改回「最高优先级」。** 上一轮的降级结论是**有条件的**
+  （前提是 compute 占 90.6%），条件已被本次优化打破。这正是日志模板里
+  「瓶颈转移」字段存在的意义。
+
+- **意外 / 教训**：
+  1. **测速必须扫 cache slots，不能固定一个大值。** 我全程用 `slots=4096`
+     测速，那是**最差配置**：
+
+     | slots | min decode |
+     |---|---|
+     | **4（仓库默认）** | **616 ms/tok** |
+     | 0 | 633 |
+     | 8 | 631 |
+     | 16 | 655 |
+     | 64 | 689 |
+     | 128 | 755 |
+     | 4096 | **1126（慢 1.8×）** |
+
+     **小 cache 更快，且 slots=16 几乎全 miss（hits=0）依然比全命中的 4096 快。**
+     原因不是命中率，而是**工作集能否常驻 CPU cache**：13.48 GB 顺序读进
+     ~40 MB 热缓冲，胜过读 5.05 GB 进 ~5 GB 缓冲反复 thrash。同一份数学的
+     `expert_ffn` 耗时随 slots 变 **2.5×**（2.16 s vs 5.35 s）就是证据。
+     **仓库默认值 4 本来就最优 —— 我浪费了一整轮测速。**
+  2. **`neon_mt` 对 MoE 无收益，甚至更慢。** 专家矩阵 `[768,2048]` 只有
+     `768/64 = 12` 个 o_block 给 10 线程（负载不均），且每 token 有
+     **3 matvec × 8 专家 × 48 层 = 1152 次 fork-join**，同步开销压过收益。
+     提高粒度阈值到 4M 反而更差（1.242 s/tok）。**MoE 要并行得在专家层
+     并行**（top-8 彼此独立，48 次 fork-join/token），那是 runtime 级改动，
+     不是 kernel 级。
+  3. **同名异义跨注册表陷阱。** `--matvec-impl neon` 被传播到 f32 注册表，
+     而 f32 的 `neon` 是**单线程**版 —— lm_head（fp32、1187 MB、每 token
+     全读）因此落到单线程内核。修法：GPTQ 分支不传播 impl 名，f32 侧一律
+     `neon_mt_kv_nt`。
+  4. **大 slots 会把机器推进重度换页。** `slots=4096` 测速后实测
+     `vm.swapusage used = 11.3 GB / 12 GB`、pageouts 132 万。cache 应按
+     **字节预算**而非槽数限界，并在启动时校验 resident + 预算 vs 物理内存。
+
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                  # 186 单测
+  # 归因阶梯（同 prompt 同 slots，比对 generated_ids 必须一致）
+  for impl in ref neon neon_mt; do
+    ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4.tqwen \
+      --tokens 9707,11,358,1229,9826,105129,12 --max-new-tokens 8 --max-seq-len 32 \
+      --moe-ssd --moe-expert-cache-slots 4 --ops-impl ref \
+      --matvec-impl $impl --profile-out /tmp/prof_$impl.json
+  done
+  # slots 扫描（必做，否则测速结论无效）
+  for s in 0 4 8 16 64 128 4096; do ... ; done   # 每项 3 次取 min
+  sysctl vm.swapusage                             # 确认没把机器推进换页
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

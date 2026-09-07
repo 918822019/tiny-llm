@@ -36,6 +36,13 @@
 #include <string>        // C++ 字符串
 #include <vector>        // 动态数组
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>  // sysctlbyname（查物理内存，内存预算校验用）
+#include <sys/types.h>
+#elif defined(__linux__)
+#include <unistd.h>      // sysconf（查物理内存）
+#endif
+
 #include "backend_cpu.h"
 #include "config.h"
 #include "dispatch.h"
@@ -49,6 +56,28 @@
 #endif
 
 namespace {
+    // 物理内存总量（字节）。查询失败返回 0，调用方据此跳过校验——
+    // 拿不到真实值时宁可放行也不要凭空造一个上限。
+    uint64_t physical_memory_bytes() {
+#if defined(__APPLE__)
+        int64_t mem = 0;
+        size_t len = sizeof(mem);
+        if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 && mem > 0) {
+            return static_cast<uint64_t>(mem);
+        }
+        return 0;
+#elif defined(__linux__)
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page_size > 0) {
+            return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+        }
+        return 0;
+#else
+        return 0;
+#endif
+    }
+
     // 命令行参数结构体：集中存储所有 CLI 选项
     struct Args {
         std::string model;             // 模型文件路径（.tqwen），必选
@@ -69,6 +98,7 @@ namespace {
         bool kv_fp16 = false;           // KV cache 用 fp16 存储（内存/带宽减半，opt-in）
         bool moe_ssd = false;           // MoE：路由专家走 SSD 卸载（ExpertStore pread+LRU）
         int moe_cache_slots = 4;       // MoE 专家 LRU 缓存槽数（0 = 全 miss）
+        int moe_cache_mb = 0;           // MoE 专家缓存字节预算（MB）；>0 时覆盖 slots
         bool ppl = false;               // PPL 模式：teacher-forcing 困惑度（不生成）
         std::string ppl_jsonl;          // PPL 多序列输入 JSONL（每行 {"tokens": [...]}）
         std::string config;             // 配置文件路径（可选）
@@ -106,6 +136,8 @@ namespace {
                      "  --moe-ssd               MoE: route experts via SSD offload (ExpertStore\n"
                      "                          pread + LRU) instead of resident pointers\n"
                      "  --moe-expert-cache-slots N\n"
+                     "  --moe-expert-cache-mb N     专家缓存字节预算（MB），覆盖 slots；\n"
+                     "                              超限 fail-fast 而非静默换页\n"
                      "                          MoE expert LRU slots (0 = every expert re-pread;\n"
                      "                          default 4)\n"
                      "  --engine NAME           engine: '' = CPU forward (default) / cuda (decode) / metal (prefill)\n"
@@ -154,6 +186,7 @@ namespace {
             else if (a == "--kv-f16") out->kv_fp16 = true;
             else if (a == "--moe-ssd") out->moe_ssd = true;
             else if (a == "--moe-expert-cache-slots") out->moe_cache_slots = std::atoi(value("--moe-expert-cache-slots").c_str());
+            else if (a == "--moe-expert-cache-mb") out->moe_cache_mb = std::atoi(value("--moe-expert-cache-mb").c_str());
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
                 usage(argv[0]);
@@ -341,6 +374,7 @@ int main(int argc, char **argv) {
     const bool is_f16 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kF16);
     const bool is_i4 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kI4);
     const bool is_vq2 = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kVQ2);
+    const bool is_gptq = file.header().dtype == static_cast<uint32_t>(tinyqwen::Dtype::kGPTQ4);
     if (is_vq2) {
         if (!tinyqwen::set_matvec_vq2_impl_by_name(impl_name.c_str())) {
             std::fprintf(stderr,
@@ -385,6 +419,28 @@ int main(int argc, char **argv) {
         }
         std::fprintf(stderr, "[init] matvec impl: %s (f16 weights)\n",
                      tinyqwen::matvec_f16_impl_name());
+    } else if (is_gptq) {
+        // GPTQ 有独立注册表（AutoGPTQ 列主序，与 i4 的 HQQ interleaved 不兼容）。
+        // 没有这个分支时 GPTQ 模型会掉进下面的 else，选到 f32 注册表——
+        // 名字能对上但语义完全错，且 CLI 报的可用列表里永远看不到 GPTQ 变体。
+        if (!tinyqwen::set_matvec_gptq_impl_by_name(impl_name.c_str())) {
+            std::fprintf(stderr,
+                         "error: unknown gptq matvec_impl '%s' (available: %s)\n",
+                         impl_name.c_str(), tinyqwen::available_matvec_gptq_impls());
+            return 2;
+        }
+        // router / 非 tied lm_head 是 fp32，走 f32 注册表。**不传播用户的 impl 名**：
+        // GPTQ 的 "neon"/"neon_mt"/"ref" 与 f32 注册表同名但语义完全不同——
+        // f32 的 "neon" 是单线程版。传播会让 lm_head（fp32、1187 MB、每 token
+        // 全读一遍）落到单线程内核，实测占 decode 20.6%。用户选的是 GPTQ kernel，
+        // fp32 侧一律用 f32 族最佳实现。
+        if (!tinyqwen::set_matvec_impl_by_name("neon_mt_kv_nt")) {
+            tinyqwen::set_matvec_impl_by_name("neon_mt");
+        }
+        std::fprintf(stderr,
+                     "[init] matvec impl: %s (gptq4 weights, group=%u; router/lm_head f32: %s)\n",
+                     tinyqwen::matvec_gptq_impl_name(), file.config().quant_group_size,
+                     tinyqwen::matvec_impl_name());
     } else {
         if (!tinyqwen::set_matvec_impl_by_name(impl_name.c_str())) {
             std::fprintf(stderr, "error: unknown matvec_impl '%s' (available: %s)\n",
@@ -449,9 +505,44 @@ int main(int argc, char **argv) {
     }
     if (file.config().is_moe()) {
         model->set_moe_ssd(args.moe_ssd);
-        std::fprintf(stderr, "[init] moe: experts=%d per_tok=%d ssd=%s cache_slots=%d\n",
+
+        // 字节预算必须在 create() 之后设：create() 才把专家 offset/nbytes 注册进
+        // store，per_expert_bytes_ 在那之前是 0，无法把"预算 MB"换算成槽数。
+        // 上面先按 slots 设一次默认值，这里若指定了预算则覆盖。
+        int effective_slots = args.moe_cache_slots;
+        if (args.moe_cache_mb > 0) {
+            const uint64_t budget =
+                static_cast<uint64_t>(args.moe_cache_mb) * 1024ull * 1024ull;
+            if (!expert_store.set_cache_budget(budget, &err)) {
+                std::fprintf(stderr, "error: %s\n", err.c_str());
+                return 1;
+            }
+            effective_slots = static_cast<int>(budget / expert_store.per_expert_bytes());
+        }
+
+        // 内存上限校验：resident + 专家缓存预算 不得超过物理内存，否则必然换页，
+        // 此后所有计时不可信（实测 slots=4096 把 swap 推到 11.3 GB / 12 GB）。
+        // fail-fast 而不是静默跑进换页——静默换页会让测速结论看起来"正常"却全错。
+        const uint64_t cache_bytes =
+            static_cast<uint64_t>(effective_slots) * expert_store.per_expert_bytes();
+        const uint64_t total_bytes = file.resident_bytes() + cache_bytes;
+        const uint64_t phys = physical_memory_bytes();
+        std::fprintf(stderr,
+                     "[init] moe: experts=%d per_tok=%d ssd=%s cache_slots=%d\n"
+                     "[init] mem budget: resident %.0f MB + expert cache %.0f MB "
+                     "= %.0f MB (物理 %.0f MB, 占 %.0f%%)\n",
                      model->config().n_routed_experts, model->config().num_experts_per_tok,
-                     args.moe_ssd ? "on" : "off", args.moe_cache_slots);
+                     args.moe_ssd ? "on" : "off", effective_slots,
+                     file.resident_bytes() / 1048576.0, cache_bytes / 1048576.0,
+                     total_bytes / 1048576.0, phys / 1048576.0,
+                     phys ? total_bytes * 100.0 / phys : 0.0);
+        if (phys && total_bytes > phys) {
+            std::fprintf(stderr,
+                         "error: 内存需求 %.0f MB 超过物理内存 %.0f MB —— 必然换页，"
+                         "计时将不可信。请用 --moe-expert-cache-mb 缩小专家缓存预算。\n",
+                         total_bytes / 1048576.0, phys / 1048576.0);
+            return 1;
+        }
     }
     std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",
                  model->kv_cache().memory_bytes() / (1024.0 * 1024.0), args.max_seq_len);

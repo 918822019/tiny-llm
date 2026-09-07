@@ -126,3 +126,95 @@ TEST(expert_store_zero_slots_all_miss) {
     EXPECT_EQ(store.stats().bytes_read, (size_t)(n_experts * 3 * bb));
     std::remove(path.c_str());
 }
+
+// ============================================================================
+// 字节预算护栏
+// ============================================================================
+// 按槽数限界时，用户填一个大数会让 cache 悄悄吃掉数 GB 并把机器推进重度换页
+// （实测 swap used 11.3 GB / 12 GB），此后所有计时不可信。字节预算让上限显式。
+
+TEST(expert_store_budget_requires_register_first) {
+    // 未 register 就设预算 → fail-fast（per_expert_bytes 未知，无法换算槽数）
+    const std::string path = "test_expert_store_budget0.bin";
+    const int bb = 64;
+    std::vector<uint64_t> offs;
+    make_test_file(path, 2, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    EXPECT_TRUE(!store.set_cache_budget(1024, &err));
+    EXPECT_TRUE(!err.empty());
+    std::remove(path.c_str());
+}
+
+TEST(expert_store_budget_rejects_smaller_than_one_expert) {
+    // 预算装不下单个专家 → fail-fast。静默降级成 slots=0 会让用户误以为预算
+    // 生效，而实际行为完全不同（每次访问都 pread）。
+    const std::string path = "test_expert_store_budget1.bin";
+    const int bb = 256;   // 单专家 = 3 * 256 = 768 B
+    std::vector<uint64_t> offs;
+    make_test_file(path, 2, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    store.register_expert(0, 0, offs[0], bb, offs[1], bb, offs[2], bb, 4, 4, 4);
+    EXPECT_EQ(store.per_expert_bytes(), (uint64_t)(3 * bb));
+    EXPECT_TRUE(!store.set_cache_budget(3 * bb - 1, &err));  // 差 1 字节也不放行
+    EXPECT_TRUE(!err.empty());
+    // 恰好等于单专家字节数 → 放行（slots=1）
+    EXPECT_TRUE(store.set_cache_budget(3 * bb, &err));
+    std::remove(path.c_str());
+}
+
+TEST(expert_store_budget_derives_slots_and_stays_within_budget) {
+    // 预算换算槽数：budget / per_expert_bytes，且实际占用不超预算
+    const std::string path = "test_expert_store_budget2.bin";
+    const int n_experts = 6, bb = 128;   // 单专家 = 384 B
+    std::vector<uint64_t> offs;
+    make_test_file(path, n_experts, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    for (int e = 0; e < n_experts; ++e)
+        store.register_expert(0, e, offs[e*3], bb, offs[e*3+1], bb, offs[e*3+2], bb, 4, 4, 4);
+
+    // 预算 1000 B → 1000/384 = 2 槽
+    EXPECT_TRUE(store.set_cache_budget(1000, &err));
+    EXPECT_EQ(store.cache_budget_bytes(), (uint64_t)1000);
+
+    // 访问全部 6 个专家：只有 2 槽，必然发生淘汰，且占用不超预算
+    for (int e = 0; e < n_experts; ++e) {
+        auto w = store.get(0, e);
+        uint8_t g = static_cast<uint8_t>((e * 10 + 0) & 0xFF);
+        EXPECT_EQ(std::memcmp(w.gate, std::vector<uint8_t>(bb, g).data(), bb), 0);
+    }
+    EXPECT_TRUE(store.stats().evictions > 0);
+    // 重访最早的专家应 miss（已被淘汰）
+    const size_t m_before = store.stats().misses;
+    store.get(0, 0);
+    EXPECT_EQ(store.stats().misses, m_before + 1);
+    std::remove(path.c_str());
+}
+
+TEST(expert_store_budget_data_correctness) {
+    // 预算模式下 pread 数据仍须逐位正确（预算只改容量，不改语义）
+    const std::string path = "test_expert_store_budget3.bin";
+    const int n_experts = 4, bb = 200;
+    std::vector<uint64_t> offs;
+    make_test_file(path, n_experts, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    for (int e = 0; e < n_experts; ++e)
+        store.register_expert(0, e, offs[e*3], bb, offs[e*3+1], bb, offs[e*3+2], bb, 4, 4, 4);
+    EXPECT_TRUE(store.set_cache_budget(3 * bb * 2, &err));  // 2 槽
+    for (int e = 0; e < n_experts; ++e) {
+        auto w = store.get(0, e);
+        for (int which = 0; which < 3; ++which) {
+            const uint8_t *p = which == 0 ? w.gate : (which == 1 ? w.up : w.down);
+            uint8_t fill = static_cast<uint8_t>((e * 10 + which) & 0xFF);
+            EXPECT_EQ(std::memcmp(p, std::vector<uint8_t>(bb, fill).data(), bb), 0);
+        }
+    }
+    std::remove(path.c_str());
+}

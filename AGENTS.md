@@ -194,6 +194,28 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    位模式当整数读 → 全是垃圾（qzeros 本该恒为 7，结果算出 mean=13.88）。
    读 GPTQ 张量必须用 `safe_open(framework='numpy')` 保留 dtype。
    (b) SwiGLU 写成 `sigmoid(gate)*up` 而非 `gate*sigmoid(gate)*up`，就是坑 #15。
+20. **MoE 测速必须扫 cache slots，不能固定一个大值**。反直觉：**小 cache 更快**。
+   Qwen3-30B-A3B-GPTQ 实测（3 次取 min）：`slots=4`（仓库默认）**616 ms/tok** 最优，
+   `slots=4096` **1126 ms/tok 慢 1.8×**——而 4096 是命中最多的配置（hits=3361）。
+   `slots=16` 几乎全 miss（hits=0）依然比全命中的 4096 快。
+   **原因不是命中率，是工作集能否常驻 CPU cache**：13.48 GB 顺序读进 ~40 MB 热
+   缓冲，胜过读 5.05 GB 进 ~5 GB 缓冲反复 thrash。铁证：同一份数学的
+   `expert_ffn` 耗时随 slots 变 **2.5×**（2.16 s vs 5.35 s）——计算时间不该随
+   cache 配置变，变了就说明是局部性问题。
+   **我自己浪费了一整轮测速**：全程用 `slots=4096`，那是最差配置。
+   连带坑：**大 slots 会把机器推进重度换页**（实测 `vm.swapusage used = 11.3 GB
+   / 12 GB`、pageouts 132 万），此后所有计时都不可信。测速前后都查
+   `sysctl vm.swapusage`。cache 应按**字节预算**而非槽数限界。
+21. **`--matvec-impl` 的名字在多个注册表里同名但语义不同**。GPTQ 的
+   `neon`/`neon_mt`/`ref` 与 f32 注册表同名，但 **f32 的 `neon` 是单线程版**。
+   把用户的 impl 名传播到 f32 注册表会让 lm_head（fp32、1187 MB、每 token 全读）
+   落到单线程内核。修法：GPTQ 分支不传播 impl 名，f32 侧一律 `neon_mt_kv_nt`。
+   **教训：跨注册表复用同一个 CLI 参数时，先确认名字在各表的语义是否一致。**
+22. **kernel 级多线程对 MoE 无效**。专家矩阵 `[768,2048]` 只有 `768/64 = 12` 个
+   o_block 给 10 线程（负载不均），且每 token 有 **3 matvec × 8 专家 × 48 层
+   = 1152 次 fork-join**，同步开销压过收益。提高粒度阈值到 4M 反而更差。
+   **MoE 要并行得在专家层并行**（top-8 彼此独立，48 次 fork-join/token），
+   是 runtime 级改动不是 kernel 级。加 MT 变体前先算 fork-join 次数。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

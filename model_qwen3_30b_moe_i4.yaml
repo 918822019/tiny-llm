@@ -1,26 +1,36 @@
 architecture: qwen3_moe
 benchmark:
   macos_m4:
-    commit: f4a57b6
+    commit: HEAD
     device: Mac16,10（Apple M4，4P+6E，16GB）
     note: >-
-      GPTQ matvec 只有标量实现 matvec_gptq_ref，无优化 kernel——9400 ms/tok 是标量
-      吞吐的真实反映，不是配置错误。同场 A/B 证明 I/O 不是瓶颈（见
-      docs/optimization_log.md 与 docs/moe_offload.md「性能现实」）：
-      消除 8.43 GB 读取换来零收益。
-    topt_ms: 9400
+      GPTQ NEON kernel 落地后 decode 14.9×。归因阶梯 ref 9157 → neon 616 ms/tok
+      （3 次取 min，--moe-ssd --moe-expert-cache-slots 4）。generated_ids 在
+      ref/neon/neon_mt 三者完全一致。瓶颈已转移到 I/O（61.5%），下一步是异步
+      预取而非继续优化计算。详见 docs/optimization_log.md。
+    topt_ms: 616
+    topt_ref_baseline_ms: 9157
+    speedup_vs_ref: 14.9x
+    ttft_7tok_ms: 5300
+    ttft_ref_baseline_ms: 67100
     mac_per_token: 2.576e9
-    throughput_gflops: 0.548
-    roofline_utilization_pct: 0.2
-    io_share_pct: 6.8
-    compute_share_pct: 90.6
-    ttft_7tok_ms: 66400
-    expert_ffn_share_pct: 58.5
+    io_share_pct: 61.5
+    compute_share_pct: 38.5
+    expert_ffn_share_pct: 20.1
+    qkv_share_pct: 8.1
+    lm_head_share_pct: 2.5
     resident_mb: 2884
     offloaded_mb: 14688
     offloaded_tensors: 18432
-    estimated_speedup_with_optimized_kernel: 37-374x
-    estimated_decode_with_optimized_kernel_ms: 25-251
+    measured_at_load_avg: ~5
+    cache_slots_sweep_ms_per_tok:
+      slots_0: 633
+      slots_4_default: 616
+      slots_8: 631
+      slots_16: 655
+      slots_64: 689
+      slots_128: 755
+      slots_4096: 1126
 dtype: gptq4
 file: model_qwen3_30b_moe_i4.tqwen
 moe:
@@ -30,6 +40,10 @@ moe:
   shared_experts: 0
   ssd_offload: true
   expert_cache_slots_default: 4
+  expert_cache_slots_note: >-
+    默认 4 已实测最优。反直觉：小 cache 更快（slots=4096 慢 1.8×），因为大
+    cache 让工作集溢出 CPU cache 反复 thrash，而非命中率问题。测速必须扫
+    slots，不能固定大值。见 AGENTS.md 坑 #20。
 name: model_qwen3_30b_moe_i4
 params:
   full_attention_interval: 0
@@ -52,17 +66,22 @@ quantization:
     matvec 必须按张量自身 dtype 路由（mv_typed），否则 router logits 全错、
     选错专家、输出乱码且不报错。见 AGENTS.md 坑 #19。
 recipe:
-  matvec_impl: ref
+  matvec_impl: neon
   ops_impl: ref
   note: >-
-    GPTQ 变体族只有 matvec_gptq_ref（标量）。--matvec-impl 可用列表里没有 GPTQ
-    优化变体；坑 #1 的 sdot4_mt 是 HQQ/i4 interleaved 打包专用，不适用于 GPTQ
-    列主序布局。写 GPTQ NEON+MT kernel 是当前唯一的数量级优化机会（覆盖 90.6%
-    运行时，预估 37–374×）。
+    GPTQ 归因阶梯 ref → neon → neon_mt。**用 neon**：neon_mt 对 MoE 零收益甚至
+    更慢（专家矩阵 [768,2048] 只有 12 个 o_block 给 10 线程，且每 token 1152 次
+    fork-join）。f32 侧（router/lm_head）不传播 impl 名，一律 neon_mt_kv_nt——
+    GPTQ 的 "neon" 与 f32 的 "neon" 同名但 f32 的是单线程版。见 AGENTS.md 坑 #21/#22。
 known_limitations:
-  - decode 9400 ms/tok：标量 GPTQ matvec，非交互式速度
-  - TTFT 66.4 s / 7 tok：MoE 走逐 token prefill，批量 GEMM 的 gather/scatter 未实现
+  - I/O 占 61.5% 是当前最大单项：需异步预取（Phase B）overlap pread 与计算
+  - TTFT 5.3 s / 7 tok：MoE 走逐 token prefill，批量 GEMM 的 gather/scatter 未实现
   - 稀疏加载不开则无法运行：文件 17.16 GB > 物理内存 16 GB
+  - 大 cache slots 会把机器推进重度换页（实测 swap used 11.3 GB / 12 GB），
+    此后所有计时不可信；cache 应按字节预算而非槽数限界
+  - kernel 级多线程对 MoE 无效，需改到 runtime 级专家层并行
+  - Metal prefill 拒绝 GPTQ（亚字节布局需专门反量化 kernel），且只覆盖 prefill，
+    对 decode 无帮助——不是当前杠杆
   - align_fake_qwen35_moe_model.py 只比 resident vs SSD（两边都是 C++），从不与
     独立参考比——同类 dtype bug 仍可能漏网，需补 numpy 参考前向
 size_mb: 17573.1

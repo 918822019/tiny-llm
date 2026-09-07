@@ -65,6 +65,11 @@ add_library(tinyqwen_kernels OBJECT
         # in-band 存（见 tiny_format.h GptqBlockOffsets）。ref=double 累加锚，
         # 供 MoE 专家 SSD 卸载路径与未来 GPTQ 优化变体对齐。
         matvec/matvec_gptq_ref.cpp
+        # GPTQ 归因阶梯：neon（c8-outer + o 分块 + 反量化因式分解）
+        # → neon_mt（+ 常驻线程池动态领取 o_block）。共享内层逻辑见
+        # matvec_gptq_neon_common.h。仅 aarch64；其他平台兜底 ref。
+        matvec/matvec_gptq_neon.cpp
+        matvec/matvec_gptq_neon_mt.cpp
         # neon_mr = neon + 4 行并行（独立 FMA 链隐藏延迟 + 共享 x4 加载），
         # 归因阶梯下一层（对齐 i4 族 sdot2 的 multi-row 路径；仅 aarch64）。
         matvec/matvec_vq2_neon_mr.cpp

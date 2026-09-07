@@ -70,6 +70,22 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
   `sdot4`（修正 FCVT 特性守卫，4B 46.9→36.5 ms/tok）→ `sdot5`（对称量化，
   无 zero 修正，实验性 1.045×）。**推荐 `sdot4_mt`**（非对称模型）/
   `sdot5_mt`（对称模型）。
+- **GPTQ kernel 阶梯**（归因用，只增不删；AutoGPTQ 列主序，与 i4 的 HQQ
+  interleaved 布局不兼容，是**独立注册表**）：
+  `ref`（double 累加锚，纯标量，每 MAC 约 5 op）→ `neon`（c8-outer/o-inner
+  遍历 + o 分块 64 + **反量化因式分解**：同一 u32 字的 8 个 nibble 共享 s/z，
+  故 `Σ_k ((nib_k - z)·s·x_k) = s·[Σ_k(nib_k·x_k) - z·Σ_k(x_k)]`，`Σ_k(x_k)`
+  只依赖 c8、与 o 无关可预算。共享内层逻辑在 `matvec_gptq_neon_common.h`，
+  neon 与 neon_mt 共用避免数值行为分叉）→ `neon_mt`（+常驻线程池动态领取
+  o_block）。Qwen3-30B-A3B-GPTQ 实测 **decode 9157 → 616 ms/tok（14.9×）**，
+  TTFT 67.1 → 5.3 s。act-order（g_idx 非均匀）自动降级到 slow 路径——
+  算错不报错是本仓库最忌讳的失效模式，单测有护栏。
+  **`neon_mt` 对 MoE 零收益甚至更慢**：专家矩阵 `[768,2048]` 只有 12 个
+  o_block 给 10 线程，且每 token 有 3 matvec × 8 专家 × 48 层 = **1152 次
+  fork-join**，同步开销压过收益（提高粒度阈值到 4M 反而更差）。MoE 要并行
+  得在**专家层**并行（top-8 彼此独立，48 次 fork-join/token），是 runtime 级
+  改动。保留 `neon_mt` 供非 MoE 的大 GPTQ 矩阵用。**加 MT 变体前先算
+  fork-join 次数。**
 - **被证伪的尝试**（代码保留供对照，默认不启用）：融合 W4A8 批量 matmul
   （`qwen_forward_prefill_qwen35.cpp` 内，`TINYQWEN_FUSED_MM` 开关）——
   手写 NEON SDOT 干不过 AMX sgemm，0.70×。

@@ -43,6 +43,35 @@ namespace tinyqwen {
         L.down_off = down_off;     L.down_nbytes = down_nbytes;
         L.inter = inter;          L.hidden = hidden;   L.group_size = group_size;
         layout_map_[make_key(layer, expert)] = L;
+        // 首个注册专家决定单专家字节数（同模型所有专家同形状）。字节预算要靠它
+        // 把"预算 MB"换算成"槽数"，所以必须在 register_expert 之后才能设预算。
+        if (per_expert_bytes_ == 0) {
+            per_expert_bytes_ = gate_nbytes + up_nbytes + down_nbytes;
+        }
+    }
+
+    bool ExpertStore::set_cache_budget(uint64_t budget_bytes, std::string *err) {
+        if (per_expert_bytes_ == 0) {
+            if (err) *err = "set_cache_budget 必须在 register_expert() 之后调用"
+                            "（需要单专家字节数才能换算槽数）";
+            return false;
+        }
+        // 单个专家都装不下 → fail-fast。静默降级成 slots=0 会让用户误以为预算生效，
+        // 而实际每次访问都 pread（行为完全不同），这是本仓库最忌讳的失效模式。
+        if (budget_bytes < per_expert_bytes_) {
+            if (err) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "专家缓存预算 %llu B 小于单个专家 %llu B，装不下任何专家",
+                              static_cast<unsigned long long>(budget_bytes),
+                              static_cast<unsigned long long>(per_expert_bytes_));
+                *err = buf;
+            }
+            return false;
+        }
+        cache_budget_bytes_ = budget_bytes;
+        set_cache_slots(static_cast<int>(budget_bytes / per_expert_bytes_));
+        return true;
     }
 
     void ExpertStore::set_cache_slots(int n) {

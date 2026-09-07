@@ -72,6 +72,19 @@ namespace tinyqwen {
         // 设置 LRU 缓存槽数（= 可同时驻留的专家数）。0 = 全 miss（每次都 pread）。
         void set_cache_slots(int n);
 
+        // 按**字节预算**设置缓存容量（而非槽数）。槽数 = budget / 单个专家字节数。
+        // 为什么需要它：按槽数限界时，用户填一个大数（如 4096）会让 cache 悄悄
+        // 吃掉 ~10 GB，把机器推进重度换页（实测 swap used 11.3 GB / 12 GB），
+        // 此后所有计时不可信。字节预算让上限显式、可审计。
+        // 单个专家字节数超过预算时 fail-fast（返回 false）——那种配置永远装不下
+        // 一个专家，静默降级成 slots=0 会让用户以为预算生效了。
+        // 必须在 register_expert() 之后调用（需要知道单专家字节数）。
+        bool set_cache_budget(uint64_t budget_bytes, std::string *err);
+
+        // 归因访问器：当前缓存占用的字节上限与推算出的槽数
+        uint64_t cache_budget_bytes() const { return cache_budget_bytes_; }
+        uint64_t per_expert_bytes() const { return per_expert_bytes_; }
+
         // 取一个专家的三块权重：命中缓存则零拷贝返回；未命中淘汰 LRU + pread。
         // 返回的指针指向缓存槽内部，仅在下次淘汰前有效。
         const ExpertWeights get(int layer, int expert);
@@ -110,6 +123,8 @@ namespace tinyqwen {
         std::unordered_map<int64_t, size_t> slot_index_;  // key → slots_ 下标
         int max_slots_ = 4;
         uint64_t tick_ = 0;
+        uint64_t cache_budget_bytes_ = 0;  // 0 = 未设预算（按槽数限界）
+        uint64_t per_expert_bytes_ = 0;    // gate+up+down 三块之和（首个注册专家）
         ExpertStoreStats stats_;
     };
 

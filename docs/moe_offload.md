@@ -219,31 +219,35 @@ AGENTS.md 坑 #11：**不能从理论倒推组件占比，必须隔离测量**�
 命题成立：只有 attention / router / embed / norm / lm_head 常驻，18432 个
 专家张量的字节一个都没进 RAM。
 
-### I/O 不是瓶颈（关键反直觉结论）
+### 瓶颈定位随优化而转移（两轮实测，结论相反）
 
-同场 A/B，其余参数完全相同，只改 LRU 槽数：
+**第一轮（标量 GPTQ kernel）**：I/O 不是瓶颈。
 
 | 配置 | total | expert_load（I/O） | bytes_read |
 |---|---|---|---|
 | `slots=0`（每次访问都 pread） | 132.2 s | **9.0 s（6.8%）** | 13.48 GB |
 | `slots=4096`（首轮后全命中） | 140.2 s | **4.0 s（2.9%）** | 5.05 GB |
 
-少读 **8.43 GB** 反而**更慢 8 s**。消除全部 I/O 换来的收益是零（甚至负）。
+少读 8.43 GB 反而更慢 8 s。profiler：`expert_ffn` 58.5% + `qkv_proj` 17.8%
++ `o_proj` 14.3% = **计算 90.6%**。→ 砍 GPTQ kernel。
 
-profiler 归因（slots=0）：
+**第二轮（GPTQ NEON kernel 落地后）**：I/O 变成瓶颈。
 
-| op | 耗时 | 占比 | 类别 |
+| op | 标量 ref | NEON | 变化 |
 |---|---|---|---|
-| `expert_ffn` | 77.4 s | **58.5%** | 计算 |
-| `qkv_proj` | 23.6 s | 17.8% | 计算 |
-| `o_proj` | 18.9 s | 14.3% | 计算 |
-| `expert_load` | 9.0 s | **6.8%** | **I/O** |
-| `lm_head` | 3.1 s | 2.3% | 计算 |
-| `moe_router` | 0.2 s | 0.2% | 计算 |
+| `expert_load`（I/O） | 3.0% | **61.5%** | ← **新瓶颈** |
+| `expert_ffn` | 59.7% | 20.1% | ↓ |
+| `qkv_proj` | 17.2% | 8.1% | ↓ |
+| `lm_head` | 6.0% | 2.5% | ↓ |
 
-**计算占 90.6%，I/O 占 6.8%。** 瓶颈是标量 GPTQ matvec，不是磁盘。
+I/O 绝对耗时不变（它不是计算），占比却涨 20×。**→ 下一刀砍 I/O（异步预取），
+不是继续砍计算。**
 
-### Roofline 与瓶颈定位
+> **教训**：组件占比的结论有**时效性**。"I/O 不重要"只在 compute 占 90.6% 时
+> 成立；compute 快 14.9× 后同一个结论就反了。这就是优化日志模板里
+> 「瓶颈转移」字段必须每次重测的原因（AGENTS.md 坑 #11）。
+
+### Roofline 与瓶颈定位（历史，标量时期）
 
 每 token MAC 数（hidden=2048, moe_inter=768, 48 层, top-8, vocab=151936）：
 
@@ -254,38 +258,50 @@ profiler 归因（slots=0）：
 | lm_head | 0.311 | 12.1% |
 | **合计** | **2.576** | |
 
-实测 decode = 9.40 s/tok → **274 MMAC/s = 0.548 GFLOPS**。
+标量时期 decode = 9.40 s/tok → 274 MMAC/s = 0.548 GFLOPS（NEON 上限的 0.20%）。
+根因：GPTQ 变体族当时只有 `matvec_gptq_ref`（标量）。已修，见下。
 
-M4 10 核 NEON fp32 上限 ≈ 270 GFLOPS，即**当前只用 0.20%**。根因：
-`kernels/matvec/` 下 GPTQ 变体族**只有一个实现** `matvec_gptq_ref`（标量参考）。
-AGENTS.md 坑 #1 的 `sdot4_mt` 是给 HQQ/i4 interleaved 打包用的，**不适用于
-GPTQ 列主序布局**——`--matvec-impl` 的可用列表里没有 GPTQ 优化变体。
+### 实测加速（原预估 vs 实际）
 
-标量 GPTQ 每个 MAC 要做：nibble 提取（移位+掩码）→ 减零点 → 乘 scale → FMA，
-约 5 op/MAC 且无 SIMD 无多线程。
+原预估用 Qwen3.5-4B i4 的 102.5 GMAC/s 锚定，给出 37–374× 区间，并判断
+"真实值大概率落在保守～悲观区间（37–112×）"。
 
-### 预估（用仓库已实测 kernel 锚定，非理论上限）
+**实际结果：14.9×** —— 落在预估区间**之外**（比悲观值 37× 还低）。原因正是
+当时列出的两条限制，且比预想更严重：
 
-锚点：Qwen3.5-4B i4 实测 3.74 GMAC/token @ 36.5 ms/tok = **102.5 GMAC/s
-（205 GFLOPS，NEON 上限的 76%）**。
+1. 专家矩阵小（`[768,2048]`=0.8 MB），只有 `768/64 = 12` 个 o_block 给 10 线程
+2. 每 token **3 matvec × 8 专家 × 48 层 = 1152 次 fork-join**，同步开销压过收益
+   —— 所以 `neon_mt` 对 MoE **零收益甚至更慢**（提高粒度阈值到 4M 反而 1.242
+   s/tok）。MoE 要并行得在**专家层**并行（top-8 彼此独立），是 runtime 级改动
+3. 加速后 I/O 立刻顶到 61.5%，把计算侧收益吃掉一大半
 
-| 假设 | 吞吐 | decode | 加速 |
+### cache slots 扫描（必做，否则测速结论无效）
+
+**反直觉：小 cache 更快。** 同场 A/B，3 次取 min：
+
+| slots | min decode | hits | bytes_read |
 |---|---|---|---|
-| 乐观（同 4B 吞吐） | 102.5 GMAC/s | 25.1 ms/tok | 374× |
-| 保守（打 3 折） | 30.7 GMAC/s | 83.8 ms/tok | 112× |
-| 悲观（打 1 折） | 10.2 GMAC/s | 251.4 ms/tok | 37× |
-| **现状** | **0.274 GMAC/s** | **9400 ms/tok** | 1× |
+| **4（仓库默认）** | **616 ms/tok** | ~0 | 13.48 GB |
+| 0 | 633 | 0 | 13.48 GB |
+| 8 | 631 | ~0 | 13.48 GB |
+| 16 | 655 | 0 | 13.48 GB |
+| 64 | 689 | 低 | — |
+| 128 | 755 | 低 | — |
+| 4096 | **1126（慢 1.8×）** | 3361 | 5.05 GB |
 
-MoE 的专家矩阵小（`[768,2048]`=0.8 MB），比 4B 的大矩阵更难喂饱 10 核，且每
-token 384 次独立 dispatch，真实值大概率落在**保守～悲观区间**。
+`slots=16` 几乎全 miss（hits=0）依然比全命中的 4096 快。**原因不是命中率，
+而是工作集能否常驻 CPU cache**：13.48 GB 顺序读进 ~40 MB 热缓冲，胜过读
+5.05 GB 进 ~5 GB 缓冲反复 thrash。同一份数学的 `expert_ffn` 耗时随 slots 变
+**2.5×**（2.16 s vs 5.35 s）就是证据。
 
-**结论：GPTQ NEON+MT kernel 是唯一的数量级优化机会，覆盖 90.6% 的运行时。**
-异步预取（Phase B）在当前瓶颈下收益 <4%，优先级应下调。
+**仓库默认值 4 本来就最优。** 且 `slots=4096` 会把机器推进重度换页
+（实测 `vm.swapusage used = 11.3 GB / 12 GB`、pageouts 132 万）——cache 应按
+**字节预算**而非槽数限界。
 
 ### TTFT
 
-prefill 7 tok = 66.4 s（≈9.4 s/tok）。MoE 走**逐 token** prefill（批量 GEMM
-的 gather/scatter 未实现，Phase C）。长 prompt 会线性放大。
+prefill 7 tok：标量 66.4 s → **NEON 5.3 s（12.7×）**。MoE 走**逐 token**
+prefill（批量 GEMM 的 gather/scatter 未实现）。长 prompt 仍线性放大。
 
 ## 已交付与后续
 
@@ -294,28 +310,42 @@ prefill 7 tok = 66.4 s（≈9.4 s/tok）。MoE 走**逐 token** prefill（批量
 + fake 模型 + 对齐（resident vs SSD 逐位一致）+ **稀疏加载**（专家字节真不进
 RAM，内存归因与单测护栏）。
 
-### ✅ Phase A+：真模型端到端（本轮完成）
+### ✅ Phase A+：真模型端到端
 - `tools/export_qwen_moe_to_tiny.py`：真 MoE GPTQ 导出器，支持 dense-attention
   MoE（无共享专家）+ AutoGPTQ 张量 repack（qzeros int4 解包 + zp+1）。
   48 层全量导出 18867 tensors / 17.16 GB。
 - `kQwen3MoE` 架构支持 + 共享专家可选 + prefill 分支顺序修正 +
   `full_layer_cache_index()` 除零守卫。
-- **matvec 按张量自身 dtype 路由**（见下「dtype 路由」）。
+- **matvec 按张量自身 dtype 路由**（见「dtype 路由」）。
 - 正确性验收：单 token pos=0 logits **CosSim = 1.00000012**（max|diff| 3.81e-06），
   48 层生成连贯文本。
 
-### ⏳ Phase B：I/O 优化 —— **优先级已下调**
-异步预取 overlap、`bench_expert_store`、cache 抖动归因。
+### ✅ Phase C-1：GPTQ NEON kernel（decode 14.9×）
+`kernels/matvec/matvec_gptq_neon{,_mt}.cpp` + 共享内层 `matvec_gptq_neon_common.h`。
+三处改动：① c8-outer/o-inner 遍历（连续内存）② o 分块 64 ③ **反量化因式分解**
+`Σ_k ((nib_k - z)·s·x_k) = s·[Σ_k(nib_k·x_k) - z·Σ_k(x_k)]`，`Σ_k(x_k)` 只依赖
+c8、与 o 无关，可预算。act-order（g_idx 非均匀）自动降级到 slow 路径——算错
+不报错是最危险的失效模式，必须有护栏（单测覆盖）。
 
-**下调理由**：实测 I/O 只占 6.8%，消除 8.43 GB 读取换来零收益（见「性能现实」）。
-异步预取的收益上限 <4%。除非未来专家矩阵变大或改用更快的计算 kernel
-（届时 I/O 占比会相对上升），否则不值得投入。
+`neon_mt` 已实现但对 MoE 无收益（原因见上）。保留供非 MoE 的大 GPTQ 矩阵用。
 
-### ⏳ Phase C：**GPTQ 优化 kernel（当前唯一数量级机会）**
-覆盖 90.6% 运行时，预估 37–374× 加速。具体：
-1. **GPTQ NEON+MT matvec**（最高优先级）：GPTQ 变体族现在只有 `matvec_gptq_ref`
-   标量实现。可参考 HQQ 侧的 `sdot4_mt` 阶梯（work-stealing + 内联组头硬件
-   FCVT + 128 位解包），但须适配 AutoGPTQ 列主序布局。
+### ⏳ Phase B：I/O 优化 —— **最高优先级（已从"下调"改回）**
+**上调理由**：NEON kernel 让 compute 快 14.9× 后，**I/O 从 3.0% 涨到 61.5%**，
+成为最大单项。原"收益上限 <4%"的结论前提是 compute 占 90.6%，该前提已失效。
+
+具体：
+1. **异步预取 overlap**：router 选完 top-k 即入队 pread，CPU 同时算共享专家 /
+   下一层 attention。收益上限 ~61.5%。
+2. **字节预算替代槽数**：cache 按 MB 限界，启动时校验 resident + 预算 vs
+   物理内存，超限 fail-fast 而非静默 swap。
+3. `benchmarks/bench_expert_store`：cache hit/miss + cold-load 延迟 + pread
+   吞吐，带离散度列。
+
+### ⏳ Phase C-2/3：剩余计算优化
+1. **专家层多线程并行**：top-8 专家 FFN 彼此独立。当前 kernel 级 MT 无效
+   （1152 fork-join/token），改到 runtime 级只有 48 次/token。
 2. **MoE 批量 prefill**：同批 token 路由到不同专家的 gather/scatter GEMM，
-   解决 TTFT 66.4 s / 7 tok 的线性放大。
-3. **多线程专家并行**：top-8 专家的 FFN 彼此独立，天然可并行。
+   解决长 prompt 的线性放大。
+3. **Metal prefill**：`metal_prefill_create` 目前 fail-fast 拒绝 GPTQ
+   （亚字节布局需专门反量化 kernel）。且 Metal 只覆盖 prefill，对 decode
+   无帮助——**不是当前杠杆**。

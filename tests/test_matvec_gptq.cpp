@@ -176,6 +176,133 @@ void check_gptq(int out_dim, int in_dim, int group_size, bool has_g_idx) {
     }
 }
 
+// 按实现名对齐 naive（double 累加）。NEON 变体用 fp32 累加，故容差比 ref 的
+// 1e-3 更宽；实测值见文件末尾的 TEST 注释。
+void check_gptq_impl(const char *impl, int out_dim, int in_dim, int group_size,
+                     bool has_g_idx, double tol) {
+    if (!tinyqwen::set_matvec_gptq_impl_by_name(impl)) {
+        TQ_FAIL(std::string("impl not registered: ") + impl);
+        return;
+    }
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 42);
+    const std::vector<float> x = random_vec(in_dim, 7);
+    const std::vector<uint8_t> buf = pack_gptq(w, out_dim, in_dim, group_size, has_g_idx);
+    std::vector<float> y(out_dim, 0.0f);
+    tinyqwen::matvec_gptq(buf.data(), x.data(), y.data(), out_dim, in_dim, group_size);
+    const std::vector<float> ref = naive_matvec_gptq(buf, x, out_dim, in_dim, group_size);
+    double max_err = 0.0;
+    for (int i = 0; i < out_dim; ++i)
+        max_err = std::max(max_err, std::fabs(static_cast<double>(y[i]) - ref[i]));
+    if (max_err >= tol) {
+        TQ_FAIL(std::string(impl) + " max_err=" + std::to_string(max_err) + " tol=" +
+                std::to_string(tol) + " (out=" + std::to_string(out_dim) +
+                " in=" + std::to_string(in_dim) + " gs=" + std::to_string(group_size) +
+                " gidx=" + std::to_string(has_g_idx ? 1 : 0) + ")");
+    }
+    tinyqwen::set_matvec_gptq_impl_by_name("ref");
+}
+
+// act-order（排列 g_idx）打包：g_idx 是置换而非 c/group_size，使同一 u32 字的
+// 8 行跨组 —— 因式分解的前提被打破，kernel 必须自动走 slow 路径。
+// 这是"算错且不报错"最危险的场景，必须有护栏。
+std::vector<uint8_t> pack_gptq_perm(const std::vector<float> &w, int out_dim,
+                                    int in_dim, int group_size) {
+    const int n_groups = in_dim / group_size;
+    const size_t sq = static_cast<size_t>(n_groups) * out_dim * 2;
+    const size_t gidx_bytes = static_cast<size_t>(in_dim) * 4;
+    const size_t qw_bytes = static_cast<size_t>(in_dim / kPack) * out_dim * 4;
+    std::vector<uint8_t> buf(kHdr + sq + sq + gidx_bytes + qw_bytes, 0);
+
+    std::memcpy(buf.data(), &kGptqMagic, 4);
+    const uint32_t flags = 1u;  // has_g_idx
+    std::memcpy(buf.data() + 4, &flags, 4);
+
+    uint8_t *scales = buf.data() + kHdr;
+    uint8_t *qzeros = scales + sq;
+    uint8_t *g_idx = qzeros + sq;
+    uint8_t *qweight = g_idx + gidx_bytes;
+
+    // 组内行顺序打乱：把每组 group_size 行做固定旋转，使连续 8 行跨组
+    std::vector<int> perm(static_cast<size_t>(in_dim));
+    for (int g = 0; g < n_groups; ++g) {
+        for (int i = 0; i < group_size; ++i) {
+            perm[static_cast<size_t>(g * group_size + i)] =
+                g * group_size + ((i + group_size / 2) % group_size);
+        }
+    }
+    // g_idx[c] = perm[c] 所属组号；刻意让 perm[c]/group_size 不等于 c/group_size
+    std::vector<int> col_group(static_cast<size_t>(in_dim));
+    for (int c = 0; c < in_dim; ++c) {
+        col_group[static_cast<size_t>(c)] = perm[static_cast<size_t>(c)] / group_size;
+        const uint32_t gv = static_cast<uint32_t>(col_group[static_cast<size_t>(c)]);
+        std::memcpy(g_idx + static_cast<size_t>(c) * 4, &gv, 4);
+    }
+
+    // scale/zero 按 (g, o) 存，量化时按 col_group 取组
+    std::vector<int> q(static_cast<size_t>(out_dim) * in_dim, 0);
+    for (int o = 0; o < out_dim; ++o) {
+        for (int g = 0; g < n_groups; ++g) {
+            float vmin = 1e30f, vmax = -1e30f;
+            for (int c = 0; c < in_dim; ++c) {
+                if (col_group[static_cast<size_t>(c)] != g) continue;
+                const float v = w[static_cast<size_t>(o) * in_dim + c];
+                vmin = std::min(vmin, v);
+                vmax = std::max(vmax, v);
+            }
+            const float scale = (vmax > vmin) ? (vmax - vmin) / 15.0f : 0.0f;
+            const float zero = (scale > 0) ? -vmin / scale : 0.0f;
+            const uint16_t sh = float_to_half(scale);
+            const uint16_t zh = float_to_half(zero);
+            std::memcpy(scales + (static_cast<size_t>(g) * out_dim + o) * 2, &sh, 2);
+            std::memcpy(qzeros + (static_cast<size_t>(g) * out_dim + o) * 2, &zh, 2);
+            const float s = half_to_float(sh);
+            const float z = half_to_float(zh);
+            for (int c = 0; c < in_dim; ++c) {
+                if (col_group[static_cast<size_t>(c)] != g) continue;
+                int qq = (s > 0) ? static_cast<int>(std::lround(
+                            w[static_cast<size_t>(o) * in_dim + c] / s + z)) : 0;
+                qq = std::max(0, std::min(15, qq));
+                q[static_cast<size_t>(o) * in_dim + c] = qq;
+            }
+        }
+    }
+
+    for (int c8 = 0; c8 < in_dim / kPack; ++c8) {
+        for (int o = 0; o < out_dim; ++o) {
+            uint32_t word = 0;
+            for (int k = 0; k < kPack; ++k) {
+                const int c = c8 * kPack + k;
+                word |= (static_cast<uint32_t>(q[static_cast<size_t>(o) * in_dim + c]) &
+                         0xFu) << (k * 4);
+            }
+            std::memcpy(qweight + (static_cast<size_t>(c8) * out_dim + o) * 4, &word, 4);
+        }
+    }
+    return buf;
+}
+
+void check_gptq_perm(const char *impl, int out_dim, int in_dim, int group_size,
+                     double tol) {
+    if (!tinyqwen::set_matvec_gptq_impl_by_name(impl)) {
+        TQ_FAIL(std::string("impl not registered: ") + impl);
+        return;
+    }
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 123);
+    const std::vector<float> x = random_vec(in_dim, 11);
+    const std::vector<uint8_t> buf = pack_gptq_perm(w, out_dim, in_dim, group_size);
+    std::vector<float> y(out_dim, 0.0f);
+    tinyqwen::matvec_gptq(buf.data(), x.data(), y.data(), out_dim, in_dim, group_size);
+    const std::vector<float> ref = naive_matvec_gptq(buf, x, out_dim, in_dim, group_size);
+    double max_err = 0.0;
+    for (int i = 0; i < out_dim; ++i)
+        max_err = std::max(max_err, std::fabs(static_cast<double>(y[i]) - ref[i]));
+    if (max_err >= tol) {
+        TQ_FAIL(std::string(impl) + " perm-g_idx max_err=" + std::to_string(max_err) +
+                " tol=" + std::to_string(tol));
+    }
+    tinyqwen::set_matvec_gptq_impl_by_name("ref");
+}
+
 } // namespace
 
 TEST(matvec_gptq_ref_no_gidx) {
@@ -203,4 +330,54 @@ TEST(matvec_gptq_gidx_equivalence) {
     tinyqwen::matvec_gptq(b_gi.data(), x.data(), y_gi.data(), out_dim, in_dim, gs);
     for (int i = 0; i < out_dim; ++i)
         EXPECT_NEAR(y_no[i], y_gi[i], 1e-5);
+}
+
+// ============================================================================
+// NEON / NEON+MT 变体对齐
+// ============================================================================
+// 容差 1e-2 的依据：NEON 变体用 fp32 累加，ref 用 double。in_dim=2048 时
+// 累加 2048 项，fp32 相对误差量级 ~1e-7/项，累积到 ~1e-4；再叠加因式分解
+// 改变了结合顺序（先 Σ nib·x 再乘 s，而非逐项 (nib-z)·s·x）。实测最大偏差
+// 见下方 stdout 打印。1e-2 留出足够余量又能抓住真正的算法错误
+// （历史上同类 bug 的偏差量级是 1e+0，两边差 3 个数量级）。
+TEST(matvec_gptq_neon_no_gidx) {
+    check_gptq_impl("neon", 16, 32, 16, false, 1e-2);
+    check_gptq_impl("neon", 32, 64, 32, false, 1e-2);
+    check_gptq_impl("neon", 48, 128, 32, false, 1e-2);
+    // out_dim 不是 64 的倍数 → 走 o_block 尾块；in_dim=2048 覆盖真模型尺寸
+    check_gptq_impl("neon", 768, 2048, 128, false, 1e-2);
+    check_gptq_impl("neon", 2048, 2048, 128, false, 1e-2);
+    // out_dim 不是 4 的倍数 → 走标量尾部
+    check_gptq_impl("neon", 66, 128, 32, false, 1e-2);
+}
+
+TEST(matvec_gptq_neon_with_gidx) {
+    check_gptq_impl("neon", 16, 32, 16, true, 1e-2);
+    check_gptq_impl("neon", 48, 128, 32, true, 1e-2);
+    check_gptq_impl("neon", 768, 2048, 128, true, 1e-2);
+}
+
+TEST(matvec_gptq_neon_mt_no_gidx) {
+    check_gptq_impl("neon_mt", 16, 32, 16, false, 1e-2);
+    check_gptq_impl("neon_mt", 48, 128, 32, false, 1e-2);
+    // 2048×2048 = 4M 元素 > 262144 阈值 → 真正走线程池路径
+    check_gptq_impl("neon_mt", 768, 2048, 128, false, 1e-2);
+    check_gptq_impl("neon_mt", 2048, 2048, 128, false, 1e-2);
+    // 低于粒度阈值 → 走内联单线程路径
+    check_gptq_impl("neon_mt", 64, 512, 32, false, 1e-2);
+}
+
+TEST(matvec_gptq_neon_mt_with_gidx) {
+    check_gptq_impl("neon_mt", 48, 128, 32, true, 1e-2);
+    check_gptq_impl("neon_mt", 768, 2048, 128, true, 1e-2);
+}
+
+// act-order：连续 8 行跨组，因式分解前提被打破，kernel 必须自动降级到 slow 路径。
+// 这条护栏防的是"算错且不报错"——AGENTS.md 坑 #19 记录的正是同类失效模式。
+TEST(matvec_gptq_neon_perm_gidx) {
+    check_gptq_perm("ref", 24, 64, 16, 1e-3);
+    check_gptq_perm("neon", 24, 64, 16, 1e-2);
+    check_gptq_perm("neon", 48, 128, 32, 1e-2);
+    check_gptq_perm("neon_mt", 48, 128, 32, 1e-2);
+    check_gptq_perm("neon_mt", 768, 2048, 128, 1e-2);
 }
