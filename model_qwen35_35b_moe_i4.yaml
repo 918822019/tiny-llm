@@ -1,0 +1,81 @@
+architecture: qwen3_5_moe
+benchmark:
+  macos_m4:
+    commit: HEAD
+    device: Mac16,10（Apple M4，4P+6E，16GB）
+    note: >-
+      测速时可用内存只有 2280 MB 而模型需 3703 MB，测速过程换页，数字仅供参考
+      （真实值应更快）。归因显示 GDN 投影占 35.6%（30/40 层是 Gated DeltaNet），
+      专家 I/O 24.0%（比 Qwen3-30B-A3B 的 37.4% 低，因专家更小：512 vs 768
+      intermediate）。要拿到准确数字需先释放内存（关掉其他大进程）。
+    topt_ms: 356
+    ttft_ms: 2782
+    bytes_read_per_tok_gb: 1.64
+    resident_mb: 3703
+    offloaded_mb: 17290
+    offloaded_tensors: 30721
+    file_mb: 20995
+    measured_with_swap: true
+    gdn_proj_share_pct: 27.7
+    expert_load_share_pct: 24.0
+    expert_ffn_share_pct: 19.7
+    gdn_out_proj_share_pct: 7.9
+    qkv_proj_share_pct: 6.8
+    prefetch_hit_rate_pct: 7
+    prefetch_fallback_rate_pct: 73
+dtype: gptq4
+file: model_qwen35_35b_moe_i4.tqwen
+moe:
+  num_experts: 256
+  num_experts_per_tok: 8
+  moe_intermediate_size: 512
+  shared_experts: 1
+  shared_expert_intermediate_size: 512
+  ssd_offload: true
+  expert_cache_slots_default: 4
+name: model_qwen35_35b_moe_i4
+params:
+  full_attention_interval: 4
+  head_dim: 256
+  hidden_size: 2048
+  intermediate_size: 512
+  model_type: qwen3_5_moe
+  n_heads: 16
+  n_kv_heads: 2
+  n_layers: 40
+  tied_embeddings: false
+  vocab_size: 248320
+  attn_output_gate: true
+  linear_num_qk_heads: 16
+  linear_num_v_heads: 32
+  linear_qk_head_dim: 128
+  linear_v_head_dim: 128
+  linear_conv_kernel_dim: 4
+quantization:
+  group_size: 128
+  method: gptq
+  sym: true
+  note: >-
+    AutoGPTQ Int4（qweight/qzeros/scales/g_idx 列主序），导出时 repack 成 in-band
+    块。源 checkpoint 是 bf16，导出时 bf16→fp16（都是 2 字节，对权重安全）。
+    router（mlp.gate.weight）与 lm_head 保留源 dtype，matvec 必须按张量自身
+    dtype 路由（AGENTS.md 坑 #19/#24）。
+recipe:
+  matvec_impl: neon
+  ops_impl: ref
+  note: >-
+    GPTQ 归因阶梯 ref → neon → neon_mt。neon_mt 对 MoE 无收益（每 token 1152 次
+    fork-join）。f32/f16 侧（router/lm_head）不传播 impl 名，一律用各自族最佳实现
+    （AGENTS.md 坑 #21）。
+known_limitations:
+  - resident 3703 MB 超过当前可用内存（其他进程占用大部分 RAM），需释放内存才能
+    不换页运行；内存校验会 fail-fast，--force-over-memory-budget 可强制但会换页
+  - GDN 投影占 35.6%（gdn_proj 27.7% + gdn_out_proj 7.9%），是新的最大单项，
+    取代了 dense attention 的 qkv+o_proj
+  - 生成文本有重复模式，需进一步排查（输入 token 本身无意义，可能是输入导致，
+    也可能是 GDN 或共享专家的数值问题）
+  - 专家 I/O 24.0%，仍是 SSD 瓶颈的一部分
+  - MTP（Multi-Token Prediction）模块未导出（checkpoint 有 mtp.* 张量），
+    这是模型原生的投机解码机制，未来可考虑支持
+size_mb: 20995.2
+source: Qwen/Qwen3.5-35B-A3B-GPTQ-Int4

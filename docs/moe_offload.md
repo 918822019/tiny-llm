@@ -619,3 +619,51 @@ i4 权重 0.5 字节/权重 → 2 MAC/字节。带宽上限决定的吞吐 = 6.5
 3. **Metal prefill**：`metal_prefill_create` 目前 fail-fast 拒绝 GPTQ
    （亚字节布局需专门反量化 kernel）。且 Metal 只覆盖 prefill，对 decode
    无帮助——**不是当前杠杆**。
+
+## Qwen3.5-35B-A3B 实测（第二个 MoE 模型）
+
+`Qwen/Qwen3.5-35B-A3B-GPTQ-Int4`（ModelScope，23 GB 下载）与 Qwen3-30B-A3B
+有七处结构差异，exporter 逐一处理（详见 commit `4f9437b`）：分片 safetensors、
+bf16 源 dtype、嵌套 text_config、`model.language_model.` 前缀、shared_expert
+单复数、GDN 层、conv1d 3D→2D、config 键名归一化。
+
+导出 22.02 GB / 31293 张量；resident 3703 MB；offloaded 17290 MB / 30721 张量。
+
+### 与 Qwen3-30B-A3B 对比
+
+| 指标 | 30B-A3B | 35B-A3B | 变化 |
+|---|---|---|---|
+| decode | 319 ms/tok | 356 ms/tok | +12% |
+| TTFT | 3562 ms | 2782 ms | **-22%** |
+| 每 token 读 | 1.68 GB | 1.64 GB | -3% |
+| resident | 1079 MB | 3703 MB | **+243%** |
+
+**注**：35B-A3B 测速时可用内存只有 2280 MB 而模型需 3703 MB，测速过程换页，
+数字仅供参考（真实值应更快）。
+
+### 归因差异：GDN 取代了 dense attention
+
+| | 30B-A3B | 35B-A3B |
+|---|---|---|
+| 最大单项 | expert_load 37.4% | **gdn_proj 27.7%** |
+| 次大 | expert_ffn 32.1% | expert_load 24.0% |
+| 第三 | qkv_proj 13.6% | expert_ffn 19.7% |
+| attention 合计 | qkv+o_proj 26.0% | **gdn_proj+gdn_out_proj 35.6%** |
+
+35B-A3B 有 GDN 层（30/40 层是 Gated DeltaNet），GDN 投影合计 35.6%，取代了
+30B-A3B 的 qkv+o_proj（26.0%）。专家 I/O 从 37.4% 降到 24.0% —— 符合预期
+（专家更小：512 vs 768 intermediate）。
+
+**新的优化方向**：GDN 投影成为最大单项（35.6%），且它是 resident（不读盘），
+所以优化它是纯计算优化，不受带宽限制。这比优化专家 I/O 更有希望。
+
+### 已知问题
+
+- **生成文本有重复模式**（`fare fare fare`）。输入 token 本身无意义
+  （`[9707,11,358,1229]` 解码为 `'.Q,ow bet'`），可能是输入导致，也可能是
+  GDN 或共享专家的数值问题，需进一步排查。
+- **resident 3703 MB 超过当前可用内存**（其他进程占用大部分 RAM），需释放内存
+  才能不换页运行。内存校验会 fail-fast。
+- **MTP（Multi-Token Prediction）模块未导出**（checkpoint 有 `mtp.*` 张量）。
+  这是模型原生的投机解码机制 —— 与之前分析的"外部草稿模型投机解码对 SSD-MoE
+  无效"不同，MTP 是模型内部的轻量预测头，未来可考虑支持。
