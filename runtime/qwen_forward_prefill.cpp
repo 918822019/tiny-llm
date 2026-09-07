@@ -432,6 +432,19 @@ namespace tinyqwen {
         if (!cfg_.is_moe() || n <= 0) return -2;
         // 专家权重必须是 GPTQ（matmul_gptq 只支持该布局）
         if (expert_dtype_ != Dtype::kGPTQ4) return -2;
+        // 混合架构（GDN + full attention）这条路没有 GDN 算子实现——层循环只算
+        // full attention。Qwen3.5-MoE 是 GDN:full = 3:1 混合，走这里会把线性层
+        // 当 full attention 算，架构就错了（不报错但结果全错）。回退逐 token
+        // 路径（那条有完整 GDN 实现）。必须在写 KV 之前判断，否则回退会踩脏 KV。
+        if (cfg_.full_attention_interval > 1) return -2;
+        // attention / o_proj / 共享专家也必须是 GPTQ 布局：真 checkpoint 里它们
+        // 常是 bf16/fp16，matmul_gptq 会把 fp16 当 GPTQ in-band 块解析 →
+        // 段错误或垃圾（AGENTS.md 坑 #19 同类）。
+        {
+            const LayerWeights &w0 = layers_[0];
+            if (w0.attn_dtype != Dtype::kGPTQ4) return -2;
+            if (cfg_.has_shared_expert() && w0.shared_dtype != Dtype::kGPTQ4) return -2;
+        }
         // 小 n 时批处理的固定开销（缓冲分配、每列重算 sx8）超过专家复用收益：
         // 实测 n=8 批处理 0.97×（略慢），n=32 才 1.21×，n=128 达 1.44×。
         // 复用收益随 n 增长（每层 n×8 次选择从 128 个专家里挑，重叠率随 n 升）。

@@ -163,6 +163,15 @@ namespace tinyqwen {
             }
         }
 
+        // 调试插桩（env 门控，未设置时零开销）：TINYQWEN_DUMP_HIDDEN=<path> 把
+        // embed 后的 hidden 与每层残差后的 hidden 顺序追加写盘，用来定位
+        // "输入相关性在哪一层丢失"——两组不同输入逐层比对，首个趋同处即元凶。
+        static FILE *hdump = []() {
+            const char *p = std::getenv("TINYQWEN_DUMP_HIDDEN");
+            return p ? std::fopen(p, "ab") : nullptr;
+        }();
+        if (hdump) std::fwrite(hidden_.data(), sizeof(float), hidden, hdump);
+
         // attention 的缩放系数 1/sqrt(head_dim)。注意是 head_dim，不是 hidden——常见易错点
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
@@ -315,8 +324,8 @@ namespace tinyqwen {
                     // K 和 V 投影（可选融合）
                     if (fuse_qkv_) {
                         // 融合版本：K 和 V 一次投影完成
-                        mv_pair(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
-                                kv_dim_, hidden);
+                        mv_pair_typed(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
+                                      kv_dim_, hidden, ad, ags);
                     } else {
                         mv_typed(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden, ad, ags);
                         mv_typed(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden, ad, ags);
@@ -487,13 +496,17 @@ namespace tinyqwen {
                 // Qwen3-MoE 没有共享专家，此时 ffn_acc 从 0 起算，只累加路由专家。
                 if (cfg_.has_shared_expert()) {
                     ScopedTimer t(prof, scope("layer_%d.shared_ffn", i));
-                    mv_pair(w.moe_shared_gate, w.moe_shared_up, normed_.data(),
-                            moe_expert_gate_.data(), moe_expert_up_.data(),
-                            shared_inter_, hidden);
+                    // 共享专家按自身 dtype 路由（真 checkpoint 是 bf16/fp16，不是 GPTQ）。
+                    // 用 mv()/mv_pair()（模型级 dtype kGPTQ4）会把 fp16 当 GPTQ 解析 → 乱码。
+                    const Dtype sd = w.shared_dtype;
+                    const int sgs = (sd == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
+                    mv_pair_typed(w.moe_shared_gate, w.moe_shared_up, normed_.data(),
+                                  moe_expert_gate_.data(), moe_expert_up_.data(),
+                                  shared_inter_, hidden, sd, sgs);
                     backend_->swiglu(moe_expert_gate_.data(), moe_expert_up_.data(),
                                      shared_inter_);
-                    mv(w.moe_shared_down, moe_expert_gate_.data(),
-                       moe_shared_out_.data(), hidden, shared_inter_);
+                    mv_typed(w.moe_shared_down, moe_expert_gate_.data(),
+                             moe_shared_out_.data(), hidden, shared_inter_, sd, sgs);
                     for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = moe_shared_out_[j];
                 } else {
                     for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = 0.0f;
@@ -541,6 +554,20 @@ namespace tinyqwen {
                     for (int j = 0; j < hidden; ++j)
                         moe_ffn_acc_[j] += wt * moe_expert_out_[j];
                 }
+                // 调试插桩（env 门控）：TINYQWEN_DUMP_MOE=<path> 每层追加写
+                // normed_ / moe_ffn_acc_ / router logits / topk idx+w，供 Python
+                // 侧用 HF 权重做同层参考前向并逐项比对（router/topk/共享/路由）。
+                static FILE *mdump = []() {
+                    const char *p = std::getenv("TINYQWEN_DUMP_MOE");
+                    return p ? std::fopen(p, "ab") : nullptr;
+                }();
+                if (mdump) {
+                    std::fwrite(normed_.data(), sizeof(float), hidden, mdump);
+                    std::fwrite(moe_ffn_acc_.data(), sizeof(float), hidden, mdump);
+                    std::fwrite(moe_gate_logits_.data(), sizeof(float), n_experts_, mdump);
+                    std::fwrite(moe_topk_idx_.data(), sizeof(int), experts_per_tok_, mdump);
+                    std::fwrite(moe_topk_w_.data(), sizeof(float), experts_per_tok_, mdump);
+                }
                 // 残差：x = x + moe_ffn
                 {
                     ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
@@ -581,6 +608,23 @@ namespace tinyqwen {
                     ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
                     for (int j = 0; j < hidden; ++j) hidden_[j] += ffn_[j];
                 }
+            }
+            if (hdump) std::fwrite(hidden_.data(), sizeof(float), hidden, hdump);
+            static bool dnorms = std::getenv("TINYQWEN_DUMP_NORMS") != nullptr;
+            if (dnorms) {
+                auto nrm = [&](const std::vector<float> &v) {
+                    double s = 0.0;
+                    for (float x : v) s += static_cast<double>(x) * x;
+                    return std::sqrt(s);
+                };
+                if (cfg_.is_moe())
+                    std::fprintf(stderr,
+                                 "[norm] L%d o=%.4g shared=%.4g ffn=%.4g hid=%.4g nrm=%.4g\n",
+                                 i, nrm(o_), nrm(moe_shared_out_), nrm(moe_ffn_acc_),
+                                 nrm(hidden_), nrm(normed_));
+                else
+                    std::fprintf(stderr, "[norm] L%d o=%.4g ffn=%.4g hid=%.4g\n",
+                                 i, nrm(o_), nrm(ffn_), nrm(hidden_));
             }
         }
 

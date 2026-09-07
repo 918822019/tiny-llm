@@ -349,6 +349,10 @@ namespace tinyqwen {
             const void *moe_shared_gate = nullptr;  // 共享专家 gate [shared_inter, hidden]
             const void *moe_shared_up = nullptr;    // 共享专家 up   [shared_inter, hidden]
             const void *moe_shared_down = nullptr;  // 共享专家 down [hidden, shared_inter]
+            // 共享专家的真实 dtype。真 checkpoint 的共享专家是 bf16/fp16（不是
+            // GPTQ），而模型级 dtype_ 是 kGPTQ4。若用 mv()/mv_pair()（按模型级
+            // dtype）会把 fp16 当 GPTQ 解析 → 垃圾 → 乱码（坑 #19 同类）。
+            Dtype shared_dtype = Dtype::kF16;
             // 路由专家三块权重（resident 模式用；SSD 模式 moe_experts 为空，走 ExpertStore）
             struct ExpertPtrs { const void *gate; const void *up; const void *down; };
             std::vector<ExpertPtrs> moe_experts;
@@ -464,6 +468,10 @@ namespace tinyqwen {
         // 成对 matvec: y1 = W1 @ x, y2 = W2 @ x
         void mv_pair(const void *w1, const void *w2, const float *x, float *y1, float *y2,
                      int out_dim, int in_dim) const;
+
+        // 成对 matvec，按张量自身 dtype 路由（同 mv_typed 的理由）
+        void mv_pair_typed(const void *w1, const void *w2, const float *x, float *y1,
+                           float *y2, int out_dim, int in_dim, Dtype d, int group_size) const;
 
         // QKV 三路融合: yq = Wq @ x, yk = Wk @ x, yv = Wv @ x
         void mv_qkv(const void *wq, const void *wk, const void *wv, const float *x,

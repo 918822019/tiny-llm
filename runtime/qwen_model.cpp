@@ -273,6 +273,14 @@ namespace tinyqwen {
         backend_->matvec_pair(wt1, wt2, x, y1, y2, out_dim, in_dim);
     }
 
+    void QwenModel::mv_pair_typed(const void *w1, const void *w2, const float *x, float *y1,
+                                  float *y2, int out_dim, int in_dim, Dtype d,
+                                  int group_size) const {
+        WeightTensor wt1{w1, quant_type_of(d), out_dim, in_dim, group_size};
+        WeightTensor wt2{w2, quant_type_of(d), out_dim, in_dim, group_size};
+        backend_->matvec_pair(wt1, wt2, x, y1, y2, out_dim, in_dim);
+    }
+
     // =========================================================================
     // QwenModel::mv_qkv() — 三输出矩阵-向量乘法（QKV 融合）
     // =========================================================================
@@ -491,6 +499,8 @@ namespace tinyqwen {
                 if (cfg.has_shared_expert()) {
                     if (!bind_mat((p + "mlp.shared_experts.gate_proj.weight").c_str(),
                                   {shared_inter, hidden}, &w.moe_shared_gate)) return false;
+                    // 共享专家常是 bf16/fp16 而 master dtype 可能是 kGPTQ4，须记自身 dtype
+                    w.shared_dtype = file.get((p + "mlp.shared_experts.gate_proj.weight").c_str())->dtype;
                     if (!bind_mat((p + "mlp.shared_experts.up_proj.weight").c_str(),
                                   {shared_inter, hidden}, &w.moe_shared_up)) return false;
                     if (!bind_mat((p + "mlp.shared_experts.down_proj.weight").c_str(),
@@ -590,6 +600,9 @@ namespace tinyqwen {
                 // ---- Qwen2.x 层：q/k/v 带 bias ----
                 if (!bind_mat((p + "self_attn.q_proj.weight").c_str(), {qd, hidden}, &w.q_proj))
                     return false;
+                // 所有分支都要记录 attn_dtype：缺省会停在 kF16，而这条分支的权重
+                // 常是 GPTQ。批量 prefill 用它判断能否走 matmul_gptq，不记会误判。
+                w.attn_dtype = file.get((p + "self_attn.q_proj.weight").c_str())->dtype;
                 if (!bind_mat((p + "self_attn.k_proj.weight").c_str(), {kvd, hidden}, &w.k_proj))
                     return false;
                 if (!bind_mat((p + "self_attn.v_proj.weight").c_str(), {kvd, hidden}, &w.v_proj))
