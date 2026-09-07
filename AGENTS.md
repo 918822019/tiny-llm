@@ -240,6 +240,25 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    总量校验会宽松 **7×**，放行后照样把机器推进换页（实测 swap used 11.3 GB /
    12 GB、pageouts 132 万）。**swap 是写操作、消耗 SSD 寿命**，所以宁可
    fail-fast。macOS 用 `host_statistics64` 取 free+inactive+purgeable，留 10% 余量。
+27. **并发代码两条铁律（都是实测踩到的死锁）**。定位手段：后台跑 + `sample <pid> 1`
+   抓调用栈，两个线程都停在 `__psynch_cvwait` 就是互等。
+   **(a) 不同等待条件必须用不同 CV。** 主线程等"某 key 就绪"、worker 等"队列有活"，
+   共用一个 CV 时 `notify_one` 可能唤醒**错误的等待者**（主线程），它重查条件
+   不满足又睡回去，worker 永不被唤醒 → 双方永久互等。拆成 `pf_work_cv_` /
+   `pf_ready_cv_` 才修好。
+   **(b) 等待条件必须把"等待对象消失"也算作满足。** 预取槽被复用给别的 key 后，
+   主线程重查自己的 key 得到 nullptr；若条件写成 `(p != nullptr && p->ready)`
+   就会永远为假 → 永等。必须写成 `p == nullptr || p->ready`，让"对象没了"走
+   回退路径。同理：**槽/缓冲选择绝不能覆盖"在飞"（未就绪）的对象**。
+28. **估算 overlap 收益要在实际重叠的粒度上比较，不能在上层粒度算**。B-2 预估
+   1.83× 是按"整 token 级" `max(I/O, 计算)` 算的，实测只有 **1.17×**。根因：
+   重叠发生在**单专家级**，而单专家 I/O 0.50 ms（2.5 MB ÷ 5 GB/s）**大于**单专家
+   计算 0.34 ms —— 与预估假设相反，预取只能把 I/O 提前、不能消除它。
+   实测预取命中率 hits 7% / waits 24% / **fallbacks 70%** 就是证据。
+29. **decode 已达 NVMe 带宽下限，CPU/IO 侧优化到顶**。每 token 读 1.682 GB，
+   有效带宽 5.46 GB/s（M4 NVMe 峰值 **84%**），理论下限 259 ms/tok，距当前
+   308 ms/tok 仅 **49 ms** 空间。要再快只能**读更少数据**（更激进量化、按热度
+   常驻高频专家），不是继续优化计算或调度。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

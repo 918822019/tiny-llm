@@ -218,3 +218,92 @@ TEST(expert_store_budget_data_correctness) {
     }
     std::remove(path.c_str());
 }
+
+// ============================================================================
+// B-2 异步预取护栏（防死锁回归）
+// ============================================================================
+// 这两个测试锁的是实测踩到的两个死锁（AGENTS.md 坑 #27）：
+//   ① 单 CV + notify_one 唤醒错误等待者 → 双方永久互等
+//   ② 槽选择覆盖在飞槽 → 主线程重查自己的 key 得 nullptr → 永等
+// 死锁的表现是测试挂死而非失败，所以用"多次循环 + 专家数 > 槽数"制造槽复用压力。
+
+TEST(expert_store_prefetch_correctness) {
+    const std::string path = "test_expert_store_pf1.bin";
+    const int n_experts = 12, bb = 512;   // 专家数 > 预取槽数，强制槽复用
+    std::vector<uint64_t> offs;
+    make_test_file(path, n_experts, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    for (int e = 0; e < n_experts; ++e)
+        store.register_expert(0, e, offs[e*3], bb, offs[e*3+1], bb, offs[e*3+2], bb, 4, 4, 4);
+    store.set_cache_slots(2);
+    EXPECT_TRUE(store.prefetch_enable(4, &err));   // 4 槽 < 12 专家
+
+    // 多轮循环：每轮先入队全部专家再逐个 get，制造"槽被复用给别的 key"的压力
+    for (int round = 0; round < 5; ++round) {
+        for (int e = 0; e < n_experts; ++e) store.prefetch_enqueue(0, e);
+        for (int e = 0; e < n_experts; ++e) {
+            auto w = store.get(0, e);
+            for (int which = 0; which < 3; ++which) {
+                const uint8_t *p = which == 0 ? w.gate : (which == 1 ? w.up : w.down);
+                uint8_t fill = static_cast<uint8_t>((e * 10 + which) & 0xFF);
+                EXPECT_EQ(std::memcmp(p, std::vector<uint8_t>(bb, fill).data(), bb), 0);
+            }
+        }
+    }
+    store.prefetch_disable();
+    std::remove(path.c_str());
+}
+
+TEST(expert_store_prefetch_slots_lt_experts_no_hang) {
+    // 极端压力：预取槽数远小于专家数，且反复入队同一批专家。
+    // 若槽选择会覆盖在飞槽、或等待条件不容忍"槽消失"，这里会挂死。
+    const std::string path = "test_expert_store_pf2.bin";
+    const int n_experts = 16, bb = 256;
+    std::vector<uint64_t> offs;
+    make_test_file(path, n_experts, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    for (int e = 0; e < n_experts; ++e)
+        store.register_expert(0, e, offs[e*3], bb, offs[e*3+1], bb, offs[e*3+2], bb, 4, 4, 4);
+    store.set_cache_slots(0);                  // 全 miss，逼预取路径承担全部加载
+    EXPECT_TRUE(store.prefetch_enable(2, &err));   // 只有 2 槽，16 个专家
+
+    for (int round = 0; round < 10; ++round) {
+        for (int e = 0; e < n_experts; ++e) store.prefetch_enqueue(0, e);
+        for (int e = 0; e < n_experts; ++e) {
+            auto w = store.get(0, e);
+            uint8_t fill = static_cast<uint8_t>((e * 10 + 0) & 0xFF);
+            EXPECT_EQ(std::memcmp(w.gate, std::vector<uint8_t>(bb, fill).data(), bb), 0);
+        }
+    }
+    // 析构会自动 prefetch_disable；这里显式调一次验证可重复调用不崩
+    store.prefetch_disable();
+    store.prefetch_disable();
+    std::remove(path.c_str());
+}
+
+TEST(expert_store_prefetch_fallback_without_enqueue) {
+    // 完全不入队：get() 必须回退同步 LRU 路径且数据正确（不能因预取启用就挂死）
+    const std::string path = "test_expert_store_pf3.bin";
+    const int n_experts = 4, bb = 128;
+    std::vector<uint64_t> offs;
+    make_test_file(path, n_experts, bb, offs);
+    tinyqwen::ExpertStore store;
+    std::string err;
+    EXPECT_TRUE(store.open(path, &err));
+    for (int e = 0; e < n_experts; ++e)
+        store.register_expert(0, e, offs[e*3], bb, offs[e*3+1], bb, offs[e*3+2], bb, 4, 4, 4);
+    store.set_cache_slots(2);
+    EXPECT_TRUE(store.prefetch_enable(4, &err));
+    for (int e = 0; e < n_experts; ++e) {
+        auto w = store.get(0, e);   // 从未 enqueue → 必走回退
+        uint8_t fill = static_cast<uint8_t>((e * 10 + 0) & 0xFF);
+        EXPECT_EQ(std::memcmp(w.gate, std::vector<uint8_t>(bb, fill).data(), bb), 0);
+    }
+    EXPECT_TRUE(store.stats().pf_fallbacks > 0);
+    store.prefetch_disable();
+    std::remove(path.c_str());
+}
