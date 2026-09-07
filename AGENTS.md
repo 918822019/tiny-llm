@@ -275,8 +275,27 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
 32. **批量路径的每个张量都要按自身 dtype 读**。MoE 批量 prefill 的 router 初版
    按 fp32 读，但真 checkpoint 的 router 是 **fp16** → 把 fp16 字节当 fp32 解析
    → 垃圾 → NaN → 输出全 0。坑 #24 同类。
-   **定位手段：逐层插 NaN 检查**（`std::isfinite` 扫描各中间缓冲），首个 NaN
-   出现在 `gate_logits` 就直接锁定 router。比逐行读代码快得多。
+    **定位手段：逐层插 NaN 检查**（`std::isfinite` 扫描各中间缓冲），首个 NaN
+    出现在 `gate_logits` 就直接锁定 router。比逐行读代码快得多。
+33. **GPTQ 零点的打包约定因实现而异，不能无条件 `zp+1`**。AutoGPTQ 的 `qzeros`
+    存的是 `zero-1`（sym 量化下 packed=7 → 零点 8），而 **GPTQModel 直接存 zero**
+    （packed=8 → 零点 8）。`repack_gptq_from_hf` 曾无条件 +1，对 Qwen3.5-35B-A3B
+    （GPTQModel 量化）就多加了 1，零点变成 9。
+    **症状极隐蔽且不是"算错"而是"结构性偏置"**：零点错 1 使
+    `W[o,k] = 正确值 + Δzero·scale[g,o]`，该项在同一 group 内沿 in_dim 恒定，
+    是 rank-1 型贡献 → 奇异值谱尖锐化。实测 gate_proj 顶/第二奇异值从 1.10×
+    变 **4.65×**。rank-1 主导让专家输出集中在单一方向，该方向又成为下一层输入
+    并对齐下一层的主导方向 → **逐层正反馈**：残差 hid 从 0.98 涨到 5.0×10⁵
+    （正常的 0.8B 收敛于 12），换任意 prompt 输出都是同一个 token。
+    **修法**：数据驱动归一 —— packed 恒为 7 则补 +1（AutoGPTQ），否则原样
+    （GPTQModel）。两个模型的正确零点都是 8，差别只在打包约定。
+    **最重要的教训：验证用的参考实现必须与被测代码独立**。本次逐组件对照
+    （router / MoE FFN / GDN / embed / lm_head 全部"逐位一致"）之所以全部通过，
+    是因为 Python 参考前向**也用了 zp+1**，共同复现了同一个 bug。直到改用
+    **奇异值谱**这个与参考实现无关的判据才暴露。凡是"参考实现照着被测代码写"
+    的验证，只能证明自洽、不能证明正确。
+    **可用的独立判据**：解量化权重的奇异值谱（顶/第二比值，健康模型 ≈1，
+    病态 ≈5）、残差流范数随层的变化（应与已验证模型同量级）。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 
