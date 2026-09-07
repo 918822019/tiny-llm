@@ -167,6 +167,24 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    **(c) `full_layer_cache_index()` 除零**（坑 #16）：dense-attention MoE 每层都是
    full attention，`full_attention_interval` 为 0/1 时该函数每层都会被调用。已补守卫。
    **教训：只在 fake 模型上验证过的架构假设，遇到真模型基本都会破。**
+19. **matvec 必须按张量自身 dtype 路由，不能用模型级 dtype**。`QwenModel::mv()`
+   原先用 `quant_type_of(dtype_)`（文件级 master dtype）。GPTQ MoE 模型里
+   **router（`mlp.gate.weight`）与非 tied 的 `lm_head` 是 fp32，而 master 是
+   kGPTQ4** —— fp32 数据被当 GPTQ in-band 块解析，router logits 全错 →
+   选错专家 → 输出完全乱码，**且不报任何错**。修法：新增 `mv_typed(w,x,y,out,in,dtype,gs)`，
+   绑定时记录张量自身 dtype。
+   **为什么 fake 模型测不出**：fake 生成器把 router 也做成了 GPTQ
+   （`add_quant(p + "mlp.gate.weight", ...)`），恰好掩盖了这个 bug。
+   而 `align_fake_qwen35_moe_model.py` 只比 **resident vs SSD（都是 C++）**，
+   从不与独立参考比 —— 所以 MoE FFN 的数值正确性此前从未被验证过。
+   **定位方法**：单 token + pos=0 做参考前向（此时 RoPE 是恒等、attention 只有
+   一个位置故 softmax 权重必为 1、输出=v，参考实现极简），再 `--dump-logits`
+   逐位比。CosSim 从 -0.0016 修到 1.00000012。
+   **两个自己踩的坑**：(a) 用 `safetensors.torch.load_file` 后 `.float()` 会把
+   int32 的 `qweight/qzeros/g_idx` 转成 float32，再 `.view(np.uint32)` 就是把浮点
+   位模式当整数读 → 全是垃圾（qzeros 本该恒为 7，结果算出 mean=13.88）。
+   读 GPTQ 张量必须用 `safe_open(framework='numpy')` 保留 dtype。
+   (b) SwiGLU 写成 `sigmoid(gate)*up` 而非 `gate*sigmoid(gate)*up`，就是坑 #15。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 
