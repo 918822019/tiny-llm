@@ -4,24 +4,26 @@ benchmark:
     commit: HEAD
     device: Mac16,10（Apple M4，4P+6E，16GB）
     note: >-
-      GPTQ NEON kernel 落地后 decode 14.9×。归因阶梯 ref 9157 → neon 616 ms/tok
-      （3 次取 min，--moe-ssd --moe-expert-cache-slots 4）。generated_ids 在
-      ref/neon/neon_mt 三者完全一致。瓶颈已转移到 I/O（61.5%），下一步是异步
-      预取而非继续优化计算。详见 docs/optimization_log.md。
-    topt_ms: 616
+      GPTQ NEON kernel + embed 卸载 + 保留源 fp16 dtype。decode 17.0×、resident
+      -62.6%。logits 与 fp32 版逐位一致（CosSim 1.00000000, max|Δ| 0）。瓶颈已转
+      移到 I/O（60.5%），下一步是异步预取（Phase B，上限 1.25×——I/O 是带宽受限
+      而非延迟受限，实测 4.45 GB/s = M4 NVMe 峰值 74%）。详见 docs/optimization_log.md。
+    topt_ms: 538
     topt_ref_baseline_ms: 9157
-    speedup_vs_ref: 14.9x
-    ttft_7tok_ms: 5300
+    speedup_vs_ref: 17.0x
+    ttft_7tok_ms: 4687
     ttft_ref_baseline_ms: 67100
     mac_per_token: 2.576e9
-    io_share_pct: 61.5
-    compute_share_pct: 38.5
-    expert_ffn_share_pct: 20.1
-    qkv_share_pct: 8.1
-    lm_head_share_pct: 2.5
-    resident_mb: 2884
-    offloaded_mb: 14688
-    offloaded_tensors: 18432
+    io_share_pct: 60.5
+    compute_share_pct: 39.5
+    expert_ffn_share_pct: 22.9
+    qkv_share_pct: 7.7
+    lm_head_share_pct: 0.9
+    resident_mb: 1079
+    resident_baseline_mb: 2884
+    offloaded_mb: 15282
+    offloaded_tensors: 18433
+    file_mb: 16362
     measured_at_load_avg: ~5
     cache_slots_sweep_ms_per_tok:
       slots_0: 633
@@ -74,15 +76,16 @@ recipe:
     fork-join）。f32 侧（router/lm_head）不传播 impl 名，一律 neon_mt_kv_nt——
     GPTQ 的 "neon" 与 f32 的 "neon" 同名但 f32 的是单线程版。见 AGENTS.md 坑 #21/#22。
 known_limitations:
-  - I/O 占 61.5% 是当前最大单项：需异步预取（Phase B）overlap pread 与计算
-  - TTFT 5.3 s / 7 tok：MoE 走逐 token prefill，批量 GEMM 的 gather/scatter 未实现
-  - 稀疏加载不开则无法运行：文件 17.16 GB > 物理内存 16 GB
-  - 大 cache slots 会把机器推进重度换页（实测 swap used 11.3 GB / 12 GB），
-    此后所有计时不可信；cache 应按字节预算而非槽数限界
-  - kernel 级多线程对 MoE 无效，需改到 runtime 级专家层并行
+  - I/O 占 60.5% 是当前最大单项：需异步预取（Phase B）overlap pread 与计算，
+    上限 1.25×（I/O 是带宽受限 4.45 GB/s = NVMe 峰值 74%，不是延迟受限）
+  - TTFT 4687 ms / 7 tok：MoE 走逐 token prefill，批量 GEMM 的 gather/scatter 未实现
+  - 稀疏加载不开则无法运行：文件 16.36 GB > 物理内存 16 GB
+  - lm_head i4 量化不安全：top-1 argmax 一致率仅 75%（greedy 每 4 token 分叉 1 次），
+    故默认保留 fp16；--quant-lm-head 仅 opt-in
+  - kernel 级多线程对 MoE 无效（1152 fork-join/token），需改到 runtime 级专家层并行
   - Metal prefill 拒绝 GPTQ（亚字节布局需专门反量化 kernel），且只覆盖 prefill，
     对 decode 无帮助——不是当前杠杆
   - align_fake_qwen35_moe_model.py 只比 resident vs SSD（两边都是 C++），从不与
     独立参考比——同类 dtype bug 仍可能漏网，需补 numpy 参考前向
-size_mb: 17573.1
+size_mb: 16362.0
 source: Qwen/Qwen3-30B-A3B-GPTQ-Int4

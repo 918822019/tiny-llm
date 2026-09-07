@@ -216,6 +216,30 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    = 1152 次 fork-join**，同步开销压过收益。提高粒度阈值到 4M 反而更差。
    **MoE 要并行得在专家层并行**（top-8 彼此独立，48 次 fork-join/token），
    是 runtime 级改动不是 kernel 级。加 MT 变体前先算 fork-join 次数。
+23. **导出器不要硬编码 dtype——保留源 dtype**。源 checkpoint 的 lm_head /
+   embed_tokens / layernorm **本来就是 fp16**，`export_qwen_moe_to_tiny.py` 曾
+   硬编码 `DTYPE_F32` 把它们升 fp32，**白白翻倍且零收益**（lm_head 594→1187 MB）。
+   实测 fp16 相对 RMS 误差 0.0000%、argmax 一致率 100%、CosSim 1.0（就是原值）。
+   连带要改三处，漏一处就报错或静默变慢：loader 的 dtype 白名单、
+   `qwen_model.cpp` 的 `mixed_ok` 校验、`main.cpp` 对应 dtype 注册表的 impl 选择
+   （漏设 f16 表会让 fp16 lm_head 落到标量 ref，坑 #21 同类陷阱）。
+24. **卸载张量的行步长必须按 dtype 算，不能硬编码 `sizeof(float)`**。embed 卸载
+   的 pread 曾写 `token_id * hidden * sizeof(float)`，而 fp16 embed 的行步长是
+   `hidden*2` —— 读到错误偏移的数据。实测症状：**CosSim 掉到 0.871、
+   max|Δ| 10.47、argmax 全错**，且不报任何错。与坑 #17(b)（卸载 tensor 的
+   `data` 是 nullptr）同源：卸载路径的每一处尺寸/偏移计算都要按真实 dtype 走。
+25. **量化收益必须用 argmax 一致率衡量，不能只看 CosSim**。i4 RTN 量化 lm_head
+   的 CosSim 是 0.995（看起来"很好"），但 **top-1 argmax 一致率只有 75%** ——
+   greedy decode 每 4 个 token 就有 1 个分叉，长序列累积偏离。权重相对 RMS 误差
+   9.989% 不是 bug，是 RTN i4 的理论值（step/√12 ÷ 权重 RMS ≈ 11.5%），但对
+   **直接产生 logits 的 lm_head** 偏高。实测 200 个随机 hidden 向量：
+   fp16 → 100% 一致（无损），i4 → 75%。所以 lm_head 默认保留 fp16，
+   量化（`--quant-lm-head`）仅作 opt-in。
+26. **内存校验要用"可用内存"而非物理总量**。wired（内核与不可换出部分）+ 其他
+   进程已占掉大半：实测 16 GB 机器 wired 就有 8 GB、可用只剩 1.5 GB。按物理
+   总量校验会宽松 **7×**，放行后照样把机器推进换页（实测 swap used 11.3 GB /
+   12 GB、pageouts 132 万）。**swap 是写操作、消耗 SSD 寿命**，所以宁可
+   fail-fast。macOS 用 `host_statistics64` 取 free+inactive+purgeable，留 10% 余量。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

@@ -205,19 +205,86 @@ AGENTS.md 坑 #11：**不能从理论倒推组件占比，必须隔离测量**�
 ### 内存边界（命题成立）
 
 ```
-[init] weights: resident 2883.98 MB, offloaded 18432 tensors / 14688.14 MB on disk
-                (file 17573.10 MB)
+[init] weights: resident 1079.07 MB, offloaded 18433 tensors / 15281.64 MB on disk
+                (file 16361.70 MB)
 ```
 
 | | |
 |---|---|
-| 文件大小 | 17573 MB |
-| **resident（真进 RAM）** | **2884 MB（16.4%）** |
-| offloaded（永留 SSD） | 14688 MB（83.6%）/ 18432 tensors |
-| 物理内存 | 16 GB → **17.16 GB 文件装不下，不开稀疏加载无法运行** |
+| 文件大小 | 16362 MB |
+| **resident（真进 RAM）** | **1079 MB（6.6%）** |
+| offloaded（永留 SSD） | 15282 MB（93.4%）/ 18433 tensors |
+| 物理内存 | 16 GB → **16.36 GB 文件装不下，不开稀疏加载无法运行** |
 
-命题成立：只有 attention / router / embed / norm / lm_head 常驻，18432 个
-专家张量的字节一个都没进 RAM。
+命题成立：只有 attention / router / norm / lm_head 常驻，18433 个卸载张量
+（专家 + embed_tokens）的字节一个都没进 RAM。
+
+#### resident 构成与两个降内存杠杆
+
+resident 曾高达 2884 MB，构成分析（估算与实测吻合 2881.8 vs 2884 MB）：
+
+| 张量 | 大小 | 占比 | 降内存杠杆 |
+|---|---|---|---|
+| **lm_head** | 1187 MB (fp32) | **41.2%** | 保留源 fp16 → 594 MB |
+| **embed_tokens** | 1187 MB (fp32) | **41.2%** | **卸载到 SSD**（查表只读 1 行） |
+| q_proj ×48 | 204 MB | 7.1% | — |
+| o_proj ×48 | 204 MB | 7.1% | — |
+| router ×48 | 48 MB | 1.7% | — |
+| k/v_proj ×48 | 51 MB | 1.8% | — |
+
+**lm_head + embed 两个张量占 resident 的 82%。**
+
+**杠杆 ①：embed_tokens 卸载（纯内存优化，零数值代价）**
+embed 是**查表**：每 token 只读 1 行（`hidden*2` = 4 KB），却占 1187 MB。留盘按需
+pread 单行，实测开销 **0.03%**。`is_offloadable()` 判据扩展 + **tied 模型守卫**
+（tied 时 lm_head = embed，卸载会让指针悬空 → 段错误）。
+
+**杠杆 ②：保留源 dtype，不升 fp32（exporter 的纯浪费 bug）**
+源 checkpoint 的 lm_head / embed_tokens / layernorm **本来就是 fp16**，exporter
+硬编码 `DTYPE_F32` 把它们升 fp32 —— **白白翻倍且零收益**。实测 fp16 相对 RMS
+误差 **0.0000%**、argmax 一致率 **100%**、CosSim **1.0**（就是原值）。
+
+两个杠杆合计：**resident 2884 → 1079 MB（-62.6%）**，decode 616 → 538 ms/tok
+（lm_head 占 decode 从 20.6% 降到 0.9%，fp16 省一半读取）。
+**logits 与 fp32 版逐位一致**（CosSim 1.00000000, max|Δ| 0.0000e+00），
+generated_ids 完全一致。
+
+#### i4 lm_head 量化为何不安全（实测，非假设）
+
+`--quant-lm-head`（RTN → GPTQ in-band，复用专家同一格式与 NEON kernel）可把
+lm_head 压到 158 MB，但实测代价：
+
+| | fp32 | **fp16** | i4 RTN |
+|---|---|---|---|
+| lm_head 大小 | 1187 MB | **594 MB** | 158 MB |
+| 权重相对 RMS 误差 | — | **0.0000%** | 9.989% |
+| **top-1 argmax 一致率** | — | **100%** | **75%** |
+| CosSim | — | **1.00000000** | 0.994987 |
+
+**top-1 argmax 一致率只有 75%** —— greedy decode 每 4 个 token 就有 1 个分叉，
+长序列累积偏离。10% 相对误差不是 bug，是 RTN i4 的理论值（step/√12 ÷ 权重 RMS
+≈ 11.5%），但对**直接产生 logits 的 lm_head** 来说偏高。故默认走 fp16 保留，
+量化仅作 opt-in。
+
+> **教训**：量化收益必须用 argmax 一致率衡量，不能只看 CosSim。CosSim 0.995
+> 看起来"很好"，但 top-1 一致率 75% 意味着生成会分叉。
+
+#### 内存上限校验（swap 是写操作，伤 SSD）
+
+启动时校验 `resident + 专家缓存预算` vs **当前可用内存**（不是物理总量）：
+
+```
+[init] mem budget: resident 1079 MB + expert cache 10 MB = 1089 MB
+[init] mem available: 3524 MB (物理 16384 MB), 留 10% 余量后 上限 3172 MB
+```
+
+**为什么不用物理总量**：wired（内核与不可换出部分）+ 其他进程已占掉大半，实测
+16 GB 机器 wired 就有 8 GB、可用只剩 1.5 GB。按物理总量校验会宽松 **7×**，
+放行后照样把机器推进换页（实测 swap used 11.3 GB / 12 GB、pageouts 132 万）。
+
+超限 **fail-fast** 而非静默换页；`--force-over-memory-budget` 可强制继续（会警告）。
+`--moe-expert-cache-mb N` 按字节预算限界专家缓存（单专家装不下时也 fail-fast，
+不静默降级成 slots=0——那会让用户误以为预算生效）。
 
 ### 瓶颈定位随优化而转移（两轮实测，结论相反）
 

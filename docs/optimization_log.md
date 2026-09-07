@@ -3577,6 +3577,61 @@ MPS f16，慢 13–17%；但 **lm_head 的 N=1 GEMV（M=151936）快 2.92×**。
 
 ---
 
+### embed 卸载 + 保留源 fp16 dtype：resident -62.6%，decode 17.0×（2026-09-07）
+
+- **优化栈**：… + GPTQ NEON matvec + cache slots 归因 + **embed SSD 卸载**
+  + **保留源 dtype（不升 fp32）**
+- **是什么**：内存构成分析发现 resident 2884 MB 里 **lm_head + embed_tokens 两个
+  fp32 张量占 82%**（各 1187 MB / 41.2%）。两个降内存杠杆：
+  ① embed 卸载到 SSD（查表每 token 只读 1 行 4 KB，却占 1187 MB）
+  ② 保留源 dtype —— exporter 硬编码 `DTYPE_F32` 把源 fp16 升 fp32，白白翻倍零收益
+- **假设**：① 无数值代价（只是把常驻查表改成按需 pread）；② 无损（源本来就是
+  fp16，升 fp32 再降回来是恒等变换）
+- **结果**：
+
+  | | fp32 原版 | **fp16 + embed 卸载** | vs ref 基线 |
+  |---|---|---|---|
+  | resident | 2884 MB | **1079 MB** | **-62.6%** |
+  | decode | 616 ms/tok | **538 ms/tok** | **17.0×**（ref 9157） |
+  | TTFT | 5300 ms | **4687 ms** | **14.3×**（ref 67100） |
+  | lm_head 占 decode | 20.6% | **0.9%** | fp16 省一半读取 |
+  | 内存预算 | 超限被拦 | 1089 MB ≪ 3172 MB | 不再换页 |
+
+- **验证**：**logits 与 fp32 版逐位一致**（CosSim 1.00000000, max|Δ| 0.0000e+00），
+  generated_ids 完全一致（`13 358 2776 4460 311 11625 419 3491 25 362 220 16 15 15
+  15 20972`）。190 单测全过。
+- **意外 / 教训**：
+  1. **修了一个静默损坏 bug**：embed 卸载的 pread 硬编码 `sizeof(float)`，而 fp16
+     embed 行步长是 `hidden*2` → 读到错误偏移的数据。实测症状 **CosSim 0.871、
+     max|Δ| 10.47、argmax 全错**，且不报错。**卸载路径的每一处尺寸/偏移计算都要
+     按真实 dtype 走**（与坑 #17(b) 同源）。
+  2. **i4 lm_head 量化不安全，实测而非假设**：RTN i4 把 lm_head 压到 158 MB，但
+     **top-1 argmax 一致率只有 75%**（200 个随机 hidden 向量），greedy decode 每
+     4 token 分叉 1 次。CosSim 0.995 看起来"很好"却掩盖了这一点 —— **量化收益
+     必须用 argmax 一致率衡量，不能只看 CosSim**。权重相对 RMS 误差 9.989% 是
+     RTN i4 理论值（step/√12 ÷ 权重 RMS ≈ 11.5%），非 bug，但对直接产生 logits
+     的 lm_head 偏高。故默认 fp16 保留，`--quant-lm-head` 仅 opt-in。
+  3. **fp16 是无损的，因为源本来就是 fp16**：相对 RMS 误差 0.0000%、argmax 一致率
+     100%、CosSim 1.0。升 fp32 纯属浪费。连带要改三处（loader dtype 白名单、
+     `mixed_ok` 校验、`main.cpp` f16 注册表 impl 选择），漏一处就报错或静默变慢
+     —— fp16 lm_head 落到标量 ref 是坑 #21 同类跨注册表陷阱。
+  4. **内存校验必须用可用内存而非物理总量**：实测 16 GB 机器 wired 就有 8 GB、
+     可用只剩 1.5 GB。按物理总量校验宽松 7×，放行后照样换页（swap used 11.3 GB
+     / 12 GB）。**swap 是写操作、消耗 SSD 寿命**，所以宁可 fail-fast。
+
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                   # 190 单测
+  .venv/bin/python tools/export_qwen_moe_to_tiny.py \
+    --model models/Qwen3-30B-A3B-GPTQ-Int4 --out model_qwen3_30b_moe_i4_fp16.tqwen
+  ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4_fp16.tqwen \
+    --tokens 9707,11,358,1229,9826,105129,12 --max-new-tokens 8 --max-seq-len 32 \
+    --moe-ssd --moe-expert-cache-slots 4 --matvec-impl neon --profile-out /tmp/p.json
+  # 逐位一致性：与 fp32 版同 prompt 各 dump-logits 后比对
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）
