@@ -96,14 +96,15 @@ namespace tinyqwen {
         // MoE 是否有共享专家（Qwen3-MoE 没有，Qwen3.5-MoE 有）
         bool has_shared_expert() const { return n_shared_experts > 0; }
 
-        // attention 是否走 Qwen3.5 风格（partial RoPE + 可选 QK-norm + 可能的 GDN
-        // 混合）。权重绑定与前向计算**必须用同一个判据**：kQwen3MoE 虽是 dense
-        // attention，但同样有 QK-norm，若绑定按 qwen35 而计算按 Qwen2，会绑了
-        // q_norm 却按全 RoPE 算，结果错。历史上四处各写各的定义，就是这个坑。
+        // attention 是否走 Qwen3.5 风格（q_proj 携带输出门故形状为 [2*q_dim, hidden]、
+        // partial RoPE、GDN 混合）。权重绑定与前向计算**必须用同一个判据**，否则
+        // 绑定的形状与计算不符。历史上 create() 用 (kQwen35 || is_moe()) 而
+        // forward 用 (kQwen35 || kQwen35MoE)，对 kQwen3MoE 取值不同——它虽是 MoE
+        // 但 attention 是普通 Qwen3 dense 风格（q_proj [q_dim, hidden] + 可选
+        // QK-norm），必须走非 qwen35 分支，故这里不含 kQwen3MoE。
         bool uses_qwen35_attention() const {
             return model_type == ModelType::kQwen35 ||
-                   model_type == ModelType::kQwen35MoE ||
-                   model_type == ModelType::kQwen3MoE;
+                   model_type == ModelType::kQwen35MoE;
         }
 
         // ---------------------------------------------------------------------
