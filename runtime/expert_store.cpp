@@ -11,6 +11,8 @@
 
 #include "expert_store.h"
 
+#include <algorithm>  // std::find_if（预取槽查找）
+#include <chrono>     // steady_clock（预取等待计时）
 #include <limits>     // std::numeric_limits
 #include <cstdio>    // fprintf
 #include <cstdlib>   // abort
@@ -20,6 +22,9 @@
 namespace tinyqwen {
 
     ExpertStore::~ExpertStore() {
+        // 必须先停预取线程再关 fd：预取线程正在用 fd_ 做 pread，
+        // 先关 fd 会让线程读到无效描述符。
+        prefetch_disable();
         if (fd_ >= 0) ::close(fd_);
     }
 
@@ -134,6 +139,140 @@ namespace tinyqwen {
         return done == nbytes;
     }
 
+    // =========================================================================
+    // B-2 异步预取
+    // =========================================================================
+
+    bool ExpertStore::prefetch_enable(int n, std::string *err) {
+        if (per_expert_bytes_ == 0) {
+            if (err) *err = "prefetch_enable 必须在 register_expert() 之后调用"
+                            "（需要单专家字节数才能分配缓冲）";
+            return false;
+        }
+        if (n <= 0) {
+            if (err) *err = "prefetch slots 必须 > 0";
+            return false;
+        }
+        prefetch_disable();
+        pf_slots_.resize(static_cast<size_t>(n));
+        pf_pool_bytes_ = static_cast<uint64_t>(n) * per_expert_bytes_;
+        for (auto &s : pf_slots_) {
+            s.key = -1;
+            s.ready = false;
+            s.buf.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(pf_mutex_);
+            pf_queue_.clear();
+            pf_running_ = true;
+        }
+        pf_thread_ = std::thread([this] { prefetch_worker(); });
+        return true;
+    }
+
+    void ExpertStore::prefetch_disable() {
+        {
+            std::lock_guard<std::mutex> lk(pf_mutex_);
+            if (!pf_running_) return;
+            pf_running_ = false;
+        }
+        pf_work_cv_.notify_all();   // 唤醒预取线程让它看到 pf_running_=false 并退出
+        if (pf_thread_.joinable()) pf_thread_.join();
+        pf_slots_.clear();
+        pf_pool_bytes_ = 0;
+    }
+
+    void ExpertStore::prefetch_enqueue(int layer, int expert) {
+        if (!pf_running_) return;
+        const int64_t key = make_key(layer, expert);
+        {
+            std::lock_guard<std::mutex> lk(pf_mutex_);
+            // 已在槽里（就绪或在飞）就不重复入队，避免同一专家读两遍
+            if (pf_find_locked(key) != nullptr) return;
+            pf_queue_.push_back(key);
+        }
+        pf_work_cv_.notify_one();
+    }
+
+    ExpertStore::PrefetchSlot *ExpertStore::pf_find_locked(int64_t key) {
+        for (auto &s : pf_slots_) {
+            if (s.key == key) return &s;
+        }
+        return nullptr;
+    }
+
+    size_t ExpertStore::pf_pick_slot_locked(bool *ok) {
+        // 优先级：① 空闲槽（key<0）② 已就绪槽（已被主线程消费完，可安全复用）
+        // **绝不选在飞槽（ready=false）**：覆盖它会让正在等该 key 的主线程
+        // 永远查不到自己的 key → 死锁（实测踩到）。
+        for (size_t i = 0; i < pf_slots_.size(); ++i) {
+            if (pf_slots_[i].key < 0) { *ok = true; return i; }
+        }
+        for (size_t i = 0; i < pf_slots_.size(); ++i) {
+            if (pf_slots_[i].ready) { *ok = true; return i; }
+        }
+        *ok = false;   // 全在飞 → 放弃这次预取，让主线程走同步路径
+        return 0;
+    }
+
+    void ExpertStore::prefetch_worker() {
+        for (;;) {
+            int64_t key = -1;
+            {
+                std::unique_lock<std::mutex> lk(pf_mutex_);
+                pf_work_cv_.wait(lk, [this] { return !pf_running_ || !pf_queue_.empty(); });
+                if (!pf_running_ && pf_queue_.empty()) return;
+                if (pf_queue_.empty()) continue;
+                key = pf_queue_.front();
+                pf_queue_.pop_front();
+                // 挑槽并占位（ready=false 表示在飞），锁外做 pread 以免长时间持锁。
+                // 全槽在飞时放弃本次预取——否则覆盖在飞槽会让等它的主线程死锁。
+                bool have_slot = false;
+                const size_t idx = pf_pick_slot_locked(&have_slot);
+                if (!have_slot) continue;
+                PrefetchSlot &s = pf_slots_[idx];
+                s.key = key;
+                s.ready = false;
+            }
+            auto lit = layout_map_.find(key);
+            if (lit == layout_map_.end()) continue;   // 未注册的专家，跳过
+            const ExpertLayout &L = lit->second;
+            const uint64_t nbytes = L.contiguous
+                ? L.span_nbytes
+                : (L.gate_nbytes + L.up_nbytes + L.down_nbytes);
+
+            std::vector<uint8_t> buf(nbytes);
+            bool ok;
+            if (L.contiguous) {
+                ok = read_bytes(L.gate_off, nbytes, buf.data());
+            } else {
+                // 不连续时三块分别读进同一缓冲的不同区段
+                ok = read_bytes(L.gate_off, L.gate_nbytes, buf.data()) &&
+                     read_bytes(L.up_off, L.up_nbytes, buf.data() + L.gate_nbytes) &&
+                     read_bytes(L.down_off, L.down_nbytes,
+                                buf.data() + L.gate_nbytes + L.up_nbytes);
+            }
+            {
+                std::lock_guard<std::mutex> lk(pf_mutex_);
+                auto it = std::find_if(pf_slots_.begin(), pf_slots_.end(),
+                                       [key](const PrefetchSlot &s) { return s.key == key; });
+                if (it != pf_slots_.end()) {
+                    it->buf.swap(buf);
+                    const uint8_t *base = it->buf.data();
+                    if (L.contiguous) {
+                        it->w = ExpertWeights{base, base + L.up_rel, base + L.down_rel};
+                    } else {
+                        it->w = ExpertWeights{base, base + L.gate_nbytes,
+                                              base + L.gate_nbytes + L.up_nbytes};
+                    }
+                    it->ready = ok;
+                    stats_.bytes_read += nbytes;
+                }
+            }
+            pf_ready_cv_.notify_all();   // 唤醒等待该专家的主线程
+        }
+    }
+
     const ExpertWeights ExpertStore::get(int layer, int expert) {
         const int64_t key = make_key(layer, expert);
         auto lit = layout_map_.find(key);
@@ -143,6 +282,38 @@ namespace tinyqwen {
             std::abort();
         }
         const ExpertLayout &L = lit->second;
+
+        // ---- B-2：优先取预取结果 ----
+        // 三分支：① 已就绪 → 零等待；② 在飞 → 等 cv（部分重叠仍省时间）；
+        // ③ 未预取 → 回退下面的同步 LRU 路径。
+        // 预取槽是专用缓冲、不进 LRU，返回的指针不会被淘汰（规避 B-1 后
+        // 三指针同指一个 span、淘汰即全部失效的风险）。
+        if (pf_running_) {
+            std::unique_lock<std::mutex> lk(pf_mutex_);
+            PrefetchSlot *ps = pf_find_locked(key);
+            if (ps != nullptr) {
+                if (!ps->ready) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    // 条件必须把"槽消失"也算作满足：若预取线程把该槽复用给了别的
+                    // key，主线程继续等就永远查不到自己的 key → 死锁。此时返回
+                    // 让下面走同步回退路径。
+                    pf_ready_cv_.wait(lk, [this, key] {
+                        PrefetchSlot *p = pf_find_locked(key);
+                        return !pf_running_ || p == nullptr || p->ready;
+                    });
+                    const auto t1 = std::chrono::steady_clock::now();
+                    stats_.pf_waits++;
+                    stats_.pf_wait_ms +=
+                        std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    ps = pf_find_locked(key);   // wait 期间槽可能被复用，重新查找
+                } else {
+                    stats_.pf_hits++;
+                }
+                if (ps != nullptr && ps->ready) return ps->w;
+                // 预取失败或槽被复用 → 落到下面的同步路径
+            }
+            stats_.pf_fallbacks++;
+        }
 
         // ---- 命中缓存 ----
         auto sit = slot_index_.find(key);

@@ -129,6 +129,8 @@ namespace {
         bool moe_ssd = false;           // MoE：路由专家走 SSD 卸载（ExpertStore pread+LRU）
         int moe_cache_slots = 4;       // MoE 专家 LRU 缓存槽数（0 = 全 miss）
         int moe_cache_mb = 0;           // MoE 专家缓存字节预算（MB）；>0 时覆盖 slots
+        bool moe_prefetch = false;      // MoE 异步预取（B-2：pread 与计算重叠）
+        int moe_prefetch_slots = 8;     // 预取缓冲槽数；应 ≥ experts_per_tok
         bool force_over_mem_budget = false;  // 强制跳过内存预算校验（会换页，不推荐）
         bool ppl = false;               // PPL 模式：teacher-forcing 困惑度（不生成）
         std::string ppl_jsonl;          // PPL 多序列输入 JSONL（每行 {"tokens": [...]}）
@@ -169,6 +171,8 @@ namespace {
                      "  --moe-expert-cache-slots N\n"
                      "  --moe-expert-cache-mb N     专家缓存字节预算（MB），覆盖 slots；\n"
                      "                              超限 fail-fast 而非静默换页\n"
+                     "  --moe-prefetch              异步预取专家（B-2：pread 与计算重叠）\n"
+                     "  --moe-prefetch-slots N      预取缓冲槽数（默认 8，应 ≥ top-k）\n"
                      "  --force-over-memory-budget  强制跳过内存预算校验（会换页、伤 SSD）\n"
                      "                          MoE expert LRU slots (0 = every expert re-pread;\n"
                      "                          default 4)\n"
@@ -219,6 +223,8 @@ namespace {
             else if (a == "--moe-ssd") out->moe_ssd = true;
             else if (a == "--moe-expert-cache-slots") out->moe_cache_slots = std::atoi(value("--moe-expert-cache-slots").c_str());
             else if (a == "--moe-expert-cache-mb") out->moe_cache_mb = std::atoi(value("--moe-expert-cache-mb").c_str());
+            else if (a == "--moe-prefetch") out->moe_prefetch = true;
+            else if (a == "--moe-prefetch-slots") out->moe_prefetch_slots = std::atoi(value("--moe-prefetch-slots").c_str());
             else if (a == "--force-over-memory-budget") out->force_over_mem_budget = true;
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
@@ -557,27 +563,48 @@ int main(int argc, char **argv) {
             effective_slots = static_cast<int>(budget / expert_store.per_expert_bytes());
         }
 
-        // 内存上限校验：resident + 专家缓存预算 不得超过**当前可用**内存。
-        // 为什么不用物理总量：wired + 其他进程已占掉大半，实测 16 GB 机器 wired
-        // 就有 8 GB、可用只剩 1.5 GB。按物理总量校验会宽松 7×，放行后照样换页。
-        // swap 是**写**操作、消耗 SSD 寿命，所以宁可 fail-fast 也不要静默换页。
+        // B-2 异步预取：必须在 create() 之后启用（需要单专家字节数分配缓冲）。
+        // 槽数须 ≥ experts_per_tok，否则本层内槽复用会让先预取的被覆盖。
+        if (args.moe_ssd && args.moe_prefetch) {
+            const int want = args.moe_prefetch_slots;
+            const int need = model->config().num_experts_per_tok;
+            if (want < need) {
+                std::fprintf(stderr,
+                             "error: --moe-prefetch-slots %d < experts_per_tok %d —— "
+                             "本层内槽会复用、先预取的被覆盖。请设 ≥ %d。\n",
+                             want, need, need);
+                return 1;
+            }
+            if (!expert_store.prefetch_enable(want, &err)) {
+                std::fprintf(stderr, "error: %s\n", err.c_str());
+                return 1;
+            }
+        }
+
+        // 内存上限校验：resident + 专家缓存预算 + 预取缓冲池 不得超过**当前可用**
+        // 内存。为什么不用物理总量：wired + 其他进程已占掉大半，实测 16 GB 机器
+        // wired 就有 8 GB、可用只剩 1.5 GB。按物理总量校验会宽松 7×，放行后照样
+        // 换页。swap 是**写**操作、消耗 SSD 寿命，所以宁可 fail-fast 也不要静默换页。
         // 留 10% 余量：进程自身还有 KV cache / workspace / 栈等未计入的开销。
         const uint64_t cache_bytes =
             static_cast<uint64_t>(effective_slots) * expert_store.per_expert_bytes();
-        const uint64_t total_bytes = file.resident_bytes() + cache_bytes;
+        const uint64_t pf_bytes = expert_store.prefetch_pool_bytes();
+        const uint64_t total_bytes = file.resident_bytes() + cache_bytes + pf_bytes;
         const uint64_t phys = physical_memory_bytes();
         const uint64_t avail = available_memory_bytes();
         const uint64_t budget = avail ? avail - avail / 10 : 0;  // 可用 × 90%
         std::fprintf(stderr,
-                     "[init] moe: experts=%d per_tok=%d ssd=%s cache_slots=%d\n"
+                     "[init] moe: experts=%d per_tok=%d ssd=%s cache_slots=%d "
+                     "prefetch=%s\n"
                      "[init] mem budget: resident %.0f MB + expert cache %.0f MB "
-                     "= %.0f MB\n"
+                     "+ prefetch pool %.0f MB = %.0f MB\n"
                      "[init] mem available: %.0f MB (物理 %.0f MB), 留 10%% 余量后 "
                      "上限 %.0f MB\n",
                      model->config().n_routed_experts, model->config().num_experts_per_tok,
                      args.moe_ssd ? "on" : "off", effective_slots,
+                     args.moe_prefetch ? "on" : "off",
                      file.resident_bytes() / 1048576.0, cache_bytes / 1048576.0,
-                     total_bytes / 1048576.0,
+                     pf_bytes / 1048576.0, total_bytes / 1048576.0,
                      avail / 1048576.0, phys / 1048576.0, budget / 1048576.0);
         if (budget && total_bytes > budget) {
             std::fprintf(stderr,
@@ -973,6 +1000,16 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
                      "[moe] expert cache: hits=%zu misses=%zu evictions=%zu bytes_read=%zu\n",
                      s.hits, s.misses, s.evictions, s.bytes_read);
+        if (s.pf_hits + s.pf_waits + s.pf_fallbacks > 0) {
+            const size_t tot = s.pf_hits + s.pf_waits + s.pf_fallbacks;
+            std::fprintf(stderr,
+                         "[moe] prefetch: hits=%zu (%.0f%%) waits=%zu (%.0f%%) "
+                         "fallbacks=%zu (%.0f%%) wait_ms=%.0f\n",
+                         s.pf_hits, s.pf_hits * 100.0 / tot,
+                         s.pf_waits, s.pf_waits * 100.0 / tot,
+                         s.pf_fallbacks, s.pf_fallbacks * 100.0 / tot,
+                         s.pf_wait_ms);
+        }
     }
     return 0;
 }

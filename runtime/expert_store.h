@@ -27,9 +27,13 @@
 // ============================================================================
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +51,11 @@ namespace tinyqwen {
         size_t misses = 0;
         size_t evictions = 0;
         size_t bytes_read = 0;  // 累计 pread 字节（不含命中的零拷贝）
+        // B-2 异步预取归因（与 hits/misses 分开记，避免归因失真）
+        size_t pf_hits = 0;     // get() 命中已就绪的预取槽（零等待）
+        size_t pf_waits = 0;    // get() 等待在飞的预取（部分重叠）
+        size_t pf_fallbacks = 0;// 未预取，回退同步 LRU pread
+        double pf_wait_ms = 0.0;// 累计等待预取的墙钟时间
     };
 
     class ExpertStore {
@@ -97,6 +106,30 @@ namespace tinyqwen {
         // 复用本 store 已持有的 fd，不必再开一个。
         bool read_bytes(uint64_t offset, size_t nbytes, void *out);
 
+        // ---- B-2：异步预取 ----
+        // 设计要点：预取用**独立缓冲池**，不复用 LRU 槽。这同时规避两个风险：
+        //   ① 线程安全——预取线程只碰 pf_slots_/pf_queue_（mutex 保护），
+        //      slots_/slot_index_ 仍只有主线程碰，无需给 LRU 加锁。
+        //   ② 指针生命周期——预取槽是专用缓冲、不进 LRU，不会被淘汰。
+        //      B-1 后三个指针指向同一 span 缓冲，若复用 LRU 槽则淘汰即全部失效。
+        // 内存代价：pf_slots 个 × 单专家字节数（默认 8 × 2.5 MB = 20 MB），
+        // 须计入启动内存预算校验。
+
+        // 启用预取：分配 n 个专用缓冲槽并启动后台线程。必须在 register_expert
+        // 之后调用（需要单专家字节数）。n 应 ≥ experts_per_tok，否则本层内会
+        // 发生槽复用、先预取的被覆盖。
+        bool prefetch_enable(int n, std::string *err);
+
+        // 入队一个专家的预取请求（非阻塞）。通常在 topk_softmax 之后一次性
+        // 入队本层全部 k 个专家，使 pread 与后续 expert_ffn 计算重叠。
+        void prefetch_enqueue(int layer, int expert);
+
+        // 预取缓冲池占用的字节数（供内存预算归因）
+        uint64_t prefetch_pool_bytes() const { return pf_pool_bytes_; }
+
+        // 关闭预取线程（析构也会调用）
+        void prefetch_disable();
+
         // 丢弃 page cache（benchmark 测 cold-load 用：pread 后 posix_fadvise DONTNEED）
         void drop_page_cache();
 
@@ -143,6 +176,33 @@ namespace tinyqwen {
         uint64_t cache_budget_bytes_ = 0;  // 0 = 未设预算（按槽数限界）
         uint64_t per_expert_bytes_ = 0;    // gate+up+down 三块之和（首个注册专家）
         ExpertStoreStats stats_;
+
+        // ---- B-2 预取状态（仅预取线程与主线程经 mutex 访问）----
+        struct PrefetchSlot {
+            int64_t key = -1;            // -1 = 空闲
+            std::vector<uint8_t> buf;    // 专用缓冲（不进 LRU，不会被淘汰）
+            bool ready = false;          // pread 完成
+            ExpertWeights w;
+        };
+        std::vector<PrefetchSlot> pf_slots_;
+        std::deque<int64_t> pf_queue_;         // 待预取的 key（FIFO）
+        std::mutex pf_mutex_;
+        // **两个 CV 而非一个**：等待条件不同（预取线程等"队列有活"，主线程等
+        // "某 key 就绪"）。共用一个 CV + notify_one 会死锁——notify_one 可能唤醒
+        // 错误的等待者（主线程），它重查条件不满足又睡回去，预取线程永远得不到
+        // 唤醒、永不处理队列，双方永久互等。这是实测踩到的坑。
+        std::condition_variable pf_work_cv_;   // 通知预取线程：队列有新任务
+        std::condition_variable pf_ready_cv_;  // 通知主线程：某专家 pread 完成
+        std::thread pf_thread_;
+        bool pf_running_ = false;
+        uint64_t pf_pool_bytes_ = 0;
+
+        void prefetch_worker();                // 预取线程主循环
+        // 在 pf_slots_ 里找 key 的槽；找不到返回 nullptr。调用方须持锁。
+        PrefetchSlot *pf_find_locked(int64_t key);
+        // 挑一个可复用的预取槽：空闲 → 已就绪，**绝不选在飞槽**。
+        // 全在飞时 *ok=false，调用方应放弃本次预取。调用方须持锁。
+        size_t pf_pick_slot_locked(bool *ok);
     };
 
 } // namespace tinyqwen

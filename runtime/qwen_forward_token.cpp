@@ -487,6 +487,18 @@ namespace tinyqwen {
                     for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = 0.0f;
                 }
 
+                // B-2：topk_softmax 之后本层全部 k 个专家 id 已知，一次性入队预取，
+                // 使后台 pread 与下面的 expert_ffn 计算重叠。入队是非阻塞的。
+                // 注意硬约束：层 i+1 的 router 依赖层 i 的 FFN 输出，所以**跨层
+                // 无法预取**——不知道下一层选哪些专家。收益上限只能是
+                // max(I/O, 计算)，不可能藏住全部 I/O。
+                if (moe_ssd_) {
+                    for (int t = 0; t < experts_per_tok_; ++t) {
+                        expert_store_->prefetch_enqueue(static_cast<int>(i),
+                                                        moe_topk_idx_[t]);
+                    }
+                }
+
                 // 路由专家：按 top-k 权重加权累加。权重走 resident 指针或
                 // ExpertStore SSD 卸载（pread + LRU）——两者须逐位一致。
                 for (int t = 0; t < experts_per_tok_; ++t) {
