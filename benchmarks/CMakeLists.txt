@@ -22,6 +22,13 @@ add_executable(test_metal_continuation test_metal_continuation.cpp)
 target_link_libraries(test_metal_continuation PRIVATE tinyqwen_runtime tinyqwen_kernels)
 
 # ============================================================================
+# check_gptq_dequant：用真 AutoGPTQ 权重校验 matvec_gptq 数值正确性。
+# 输入块由 tools/validate_gptq_numeric.py 从真 checkpoint 转出；只依赖 kernels。
+# ============================================================================
+add_executable(check_gptq_dequant check_gptq_dequant.cpp)
+target_link_libraries(check_gptq_dequant PRIVATE tinyqwen_kernels)
+
+# ============================================================================
 # bench_metal_gemm（仅 Apple）：MPS vs 自写 tiled GEMM 微基准。
 # 与 runtime/metal_prefill.mm 同样的门控理由 —— .mm 是 ObjC++，需要 OBJCXX
 # （顶层 CMakeLists.txt 已在第一个 add_subdirectory 前 enable_language(OBJCXX)）。

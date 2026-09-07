@@ -113,18 +113,23 @@ namespace tinyqwen {
     //   [ GptqBlockHeader   ]  8 字节：{u32 magic=0x47505451("GPTQ"), u32 flags}
     //                            flags bit0 = has_g_idx（g_idx 段是否存在）
     //   [ scales            ]  n_groups * out_dim 个 fp16（行主序 [n_groups, out_dim]）
-    //   [ qzeros            ]  n_groups * out_dim 个 fp16（同形；存 fp16 简化解包，
-    //                            与 i4 的 zero 用 fp16 一致；真模型若要 int4-packed
-    //                            qzero 再加 unpack，记为后续优化）
+    //   [ qzeros            ]  n_groups * out_dim 个 fp16（同形）。**存的是真
+    //                            zero point，不是 checkpoint 里的原始值**：
+    //                            AutoGPTQ 的 qzeros 是 int4-packed（int32
+    //                            [n_groups, out_dim/8]）且存 zp-1（sym/bits=4 时
+    //                            实测 nibble 恒为 7，真 zp=8），导出器必须解包并 +1。
+    //                            少这一步 dequant 整体偏一个量化步长，MSE 恶化
+    //                            8-10×（见 tools/validate_gptq_numeric.py）。
     //   [ g_idx (可选)       ]  in_dim 个 u32：每列→所属组；contiguous-group 时
     //                            全为 col/group_size，可省略（flags bit0=0）
-    //   [ qweight           ]  (in_dim/8) * out_dim 个 u32：AutoGPTQ 列主序，
+    //   [ qweight           ]  (in_dim/8) * out_dim 个 u32：AutoGPTQ 打包，
     //                            每个 int32 装 8 个 4-bit，对应同一列(out_dim)的
-    //                            8 个连续 in_dim 行；低 nibble = 行 0。
-    // 反量化语义（与 AutoGPTQ/HF 一致）：
+    //                            8 个连续 in_dim 行；低 nibble = 最小 in_dim 下标。
+    // 反量化语义（与 AutoGPTQ/HF 一致，已对真 GPTQ checkpoint 验证）：
+    //   下标约定：row = out_dim 下标，col = in_dim 下标
     //   g = has_g_idx ? g_idx[col] : (col / group_size)
-    //   nibble(row,col) = (qweight[col * (in_dim/8) + row/8] >> ((row % 8) * 4)) & 0xF
-    //   val(row,col) = (float(nibble) - qzero[g*out_dim+col]) * scale[g*out_dim+col]
+    //   nibble(row,col) = (qweight[(col/8)*out_dim + row] >> ((col%8)*4)) & 0xF
+    //   val(row,col) = (float(nibble) - qzero[g*out_dim+row]) * scale[g*out_dim+row]
     // 要求 in_dim % group_size == 0 且 in_dim % 8 == 0（GPTQ 打包硬约束）。
     // =========================================================================
     inline constexpr uint32_t kGptqMagic = 0x47505451u; // 'G','P','T','Q'（小端）
