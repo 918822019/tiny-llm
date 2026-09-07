@@ -411,6 +411,11 @@ namespace tinyqwen {
         // 可选小向量：文件里没有就留 nullptr，存在则照常校验形状。
         // Qwen2.5 有 attention bias 无 QK norm，Qwen3 稠密反之——两者共用
         // MODEL_QWEN2 族分支，靠权重存在性区分（与 bind_rot 同一惯例）。
+        const auto opt_mat = [&](const char *name, std::vector<uint64_t> shape,
+                                 const void **out) -> bool {
+            if (!file.get(name)) return true;
+            return bind_mat(name, std::move(shape), out);
+        };
         const auto opt_vec = [&](const char *name, std::vector<uint64_t> shape,
                                  const float **out) -> bool {
             if (!file.get(name)) return true;
@@ -505,6 +510,11 @@ namespace tinyqwen {
                                   {shared_inter, hidden}, &w.moe_shared_up)) return false;
                     if (!bind_mat((p + "mlp.shared_experts.down_proj.weight").c_str(),
                                   {hidden, shared_inter}, &w.moe_shared_down)) return false;
+                    if (!opt_mat((p + "mlp.shared_expert_gate.weight").c_str(),
+                                 {1, hidden}, &w.moe_shared_gate_w)) return false;
+                    if (w.moe_shared_gate_w)
+                        w.shared_gate_dtype =
+                            file.get((p + "mlp.shared_expert_gate.weight").c_str())->dtype;
                 }
                 // 路由专家：resident 模式绑定内存指针；稀疏加载下 data==nullptr，
                 // 只注册文件 offset 给 ExpertStore 按需 pread。

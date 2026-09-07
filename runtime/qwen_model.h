@@ -349,6 +349,13 @@ namespace tinyqwen {
             const void *moe_shared_gate = nullptr;  // 共享专家 gate [shared_inter, hidden]
             const void *moe_shared_up = nullptr;    // 共享专家 up   [shared_inter, hidden]
             const void *moe_shared_down = nullptr;  // 共享专家 down [hidden, shared_inter]
+            // 共享专家门控 [1, hidden]：HF 的输出是 sigmoid(gate·x) * shared(x)。
+            // 与 moe_shared_gate（FFN 的 gate_proj）是**两个不同的张量**。
+            const void *moe_shared_gate_w = nullptr;
+            // 门控张量自己的 dtype。不能复用 shared_dtype —— 两者可以不同
+            // （fake 模型里共享专家是 GPTQ 而门控是 f32），复用会把 f32 当
+            // GPTQ 解析直接崩（SIGBUS）。
+            Dtype shared_gate_dtype = Dtype::kF16;
             // 共享专家的真实 dtype。真 checkpoint 的共享专家是 bf16/fp16（不是
             // GPTQ），而模型级 dtype_ 是 kGPTQ4。若用 mv()/mv_pair()（按模型级
             // dtype）会把 fp16 当 GPTQ 解析 → 垃圾 → 乱码（坑 #19 同类）。

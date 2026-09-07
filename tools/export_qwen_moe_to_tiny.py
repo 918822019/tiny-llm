@@ -93,6 +93,11 @@ def plan_names(cfg: dict, max_layers: int = 0) -> list[str]:
             # runtime 用复数 shared_experts，checkpoint 是单数 shared_expert
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 names.append(p + f"mlp.shared_experts.{proj}.weight")
+            # 共享专家的门控标量 [1, hidden]：HF 的输出是
+            # sigmoid(shared_expert_gate(x)) * shared_expert(x)。漏了它共享专家
+            # 输出就不被缩放（实测 sigmoid≈0.44 → 输出偏大 ~2.3×）。
+            # 注意它与 shared_experts.gate_proj 是**两个不同的张量**，别混。
+            names.append(p + "mlp.shared_expert_gate.weight")
         for e in range(n_exp):
             pe = p + f"mlp.experts.{e}."
             for proj in ("gate_proj", "up_proj", "down_proj"):

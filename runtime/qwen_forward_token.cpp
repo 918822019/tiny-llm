@@ -507,7 +507,19 @@ namespace tinyqwen {
                                      shared_inter_);
                     mv_typed(w.moe_shared_down, moe_expert_gate_.data(),
                              moe_shared_out_.data(), hidden, shared_inter_, sd, sgs);
-                    for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = moe_shared_out_[j];
+                    // HF: sigmoid(shared_expert_gate(x)) * shared_expert(x)。
+                    // gate_w 是 [1, hidden]，matvec 出来就是一个标量。
+                    // 张量可选：旧导出文件没有它时退回不缩放（gate=1）。
+                    float gate = 1.0f;
+                    if (w.moe_shared_gate_w) {
+                        float gate_scalar = 0.0f;
+                        const Dtype gd2 = w.shared_gate_dtype;
+                        const int ggs2 = (gd2 == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
+                        mv_typed(w.moe_shared_gate_w, normed_.data(), &gate_scalar, 1, hidden,
+                                 gd2, ggs2);
+                        gate = sigmoidf32(gate_scalar);
+                    }
+                    for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = moe_shared_out_[j] * gate;
                 } else {
                     for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = 0.0f;
                 }

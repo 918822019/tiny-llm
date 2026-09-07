@@ -206,6 +206,7 @@ def build(seed=42, shared_expert=True):
             add_quant(p + "mlp.shared_experts.gate_proj.weight", W(shared_inter, H))
             add_quant(p + "mlp.shared_experts.up_proj.weight", W(shared_inter, H))
             add_quant(p + "mlp.shared_experts.down_proj.weight", W(H, shared_inter))
+            add_f32(p + "mlp.shared_expert_gate.weight", W(1, H))
         for e in range(n_exp):
             pe = p + f"mlp.experts.{e}."
             add_quant(pe + "gate_proj.weight", W(moe_inter, H))
