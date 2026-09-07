@@ -47,12 +47,19 @@ namespace tinyqwen {
         // =====================================================================
         // is_offloadable() — 该 tensor 是否可留盘不读
         // =====================================================================
-        // 只有路由专家权重可以卸载。判据是 HF 命名约定里的 ".mlp.experts."
-        // 子串：路由专家叫 model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight，
-        // 而路由门是 mlp.gate.weight、共享专家是 mlp.shared_experts.*，都不含
-        // 这个子串，因此天然区分开。attention / norm / embed / lm_head 同理。
+        // 两类可卸载：
+        //   ① 路由专家权重。判据是 HF 命名约定里的 ".mlp.experts." 子串：路由专家
+        //      叫 model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight，而路由门
+        //      是 mlp.gate.weight、共享专家是 mlp.shared_experts.*，都不含这个子串，
+        //      因此天然区分开。
+        //   ② embed_tokens。它是**查表**：每 token 只读 1 行（hidden*4 = 8 KB），
+        //      却占 1187 MB fp32（本模型 resident 的 41%）。留盘按需 pread 单行，
+        //      性能影响可忽略。
+        //      **tied 模型不能卸载 embed**：tied 时 lm_head = embed，而 lm_head 每
+        //      token 要全读 1187 MB，卸载会让 lm_head 指针悬空。由调用方守卫。
         bool is_offloadable(const std::string &name) {
-            return name.find(".mlp.experts.") != std::string::npos;
+            return name.find(".mlp.experts.") != std::string::npos ||
+                   name == "model.embed_tokens.weight";
         }
 
         // =====================================================================
@@ -337,9 +344,11 @@ namespace tinyqwen {
                     return false;
                 }
             } else if (static_cast<Dtype>(header_.dtype) == Dtype::kGPTQ4) {
-                // GPTQ 文件允许混合（大矩阵 kGPTQ4、小向量/embed kF32）
+                // GPTQ 文件允许混合：大矩阵 kGPTQ4、小向量 kF32/kF16、embed/lm_head
+                // 保留源 dtype（真 checkpoint 里它们是 fp16，升 fp32 只是白白翻倍）。
                 if (e.dtype != static_cast<uint32_t>(Dtype::kGPTQ4) &&
-                    e.dtype != static_cast<uint32_t>(Dtype::kF32)) {
+                    e.dtype != static_cast<uint32_t>(Dtype::kF32) &&
+                    e.dtype != static_cast<uint32_t>(Dtype::kF16)) {
                     fail(err, "tensor #" + std::to_string(i) + ": gptq file allows only "
                               "gptq4/f32 tensors, got dtype " + std::to_string(e.dtype));
                     return false;
@@ -420,7 +429,10 @@ namespace tinyqwen {
             view.file_offset = e.offset;
             if (!offload_experts) {
                 view.data = data_.data() + e.offset;
-            } else if (is_offloadable(name)) {
+            } else if (is_offloadable(name) &&
+                       // tied 模型的 embed 不能卸载：lm_head = embed，而 lm_head 每
+                       // token 要全读整张表。卸载会让 lm_head 指针悬空 → 段错误。
+                       !(name == "model.embed_tokens.weight" && h.tied_embeddings != 0)) {
                 view.data = nullptr;
                 offloaded_bytes_ += e.nbytes;
                 ++offloaded_count_;

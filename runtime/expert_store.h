@@ -91,6 +91,12 @@ namespace tinyqwen {
 
         ExpertStoreStats stats() const { return stats_; }
 
+        // 从 .tqwen 在 offset 处读 nbytes 字节到 out（调用方分配）。
+        // 供 embed_tokens 卸载后按需读单行用：embed 是查表，每 token 只读 1 行
+        // （hidden*4 = 8 KB），却占 1187 MB fp32（本模型 resident 的 41%）。
+        // 复用本 store 已持有的 fd，不必再开一个。
+        bool read_bytes(uint64_t offset, size_t nbytes, void *out);
+
         // 丢弃 page cache（benchmark 测 cold-load 用：pread 后 posix_fadvise DONTNEED）
         void drop_page_cache();
 

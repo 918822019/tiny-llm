@@ -493,6 +493,11 @@ namespace tinyqwen {
         // ==================== 全局权重 ====================
 
         const void *embed_ = nullptr;       // 词嵌入表 [vocab, hidden]（dtype 随模型）
+        // embed 卸载时 embed_ 为 nullptr，改用 file_offset 按需 pread 单行。
+        // embed 是查表（每 token 只读 1 行 = hidden*4 = 8 KB），却占 1187 MB fp32
+        // （本模型 resident 的 41%）—— 留盘换内存，性能影响可忽略。
+        uint64_t embed_file_offset_ = 0;    // 0 = 未卸载（走 embed_ 指针）
+        std::vector<float> embed_row_;      // pread 单行的落点缓冲
         const float *final_norm_ = nullptr; // 最后的 RMSNorm（恒 fp32，见 bind_f32_vector）
         const void *lm_head_ = nullptr;     // 输出投影到词表；tied 时 == embed_
 

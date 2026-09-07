@@ -37,7 +37,8 @@
 #include <vector>        // 动态数组
 
 #if defined(__APPLE__)
-#include <sys/sysctl.h>  // sysctlbyname（查物理内存，内存预算校验用）
+#include <mach/mach.h>   // host_statistics64（查可用内存，内存预算校验用）
+#include <sys/sysctl.h>  // sysctlbyname（查物理内存）
 #include <sys/types.h>
 #elif defined(__linux__)
 #include <unistd.h>      // sysconf（查物理内存）
@@ -78,6 +79,35 @@ namespace {
 #endif
     }
 
+    // 当前**可用**内存（字节）= free + inactive + purgeable。
+    // 为什么不能拿物理总量当上限：wired（内核与不可换出部分）+ 其他进程已占掉
+    // 大半，实测 16 GB 机器上 wired 就有 8 GB、可用只剩 1.5 GB。按物理总量校验
+    // 会宽松 7×，放行后照样把机器推进换页——而 swap 是**写**操作，消耗 SSD 寿命。
+    uint64_t available_memory_bytes() {
+#if defined(__APPLE__)
+        mach_port_t host = mach_host_self();
+        vm_statistics64_data_t vm;
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(host, HOST_VM_INFO64,
+                              reinterpret_cast<host_info64_t>(&vm), &count) != KERN_SUCCESS) {
+            return 0;
+        }
+        const uint64_t page = static_cast<uint64_t>(vm_page_size);
+        return (static_cast<uint64_t>(vm.free_count) +
+                static_cast<uint64_t>(vm.inactive_count) +
+                static_cast<uint64_t>(vm.purgeable_count)) * page;
+#elif defined(__linux__)
+        const long avail = sysconf(_SC_AVPHYS_PAGES);
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (avail > 0 && page_size > 0) {
+            return static_cast<uint64_t>(avail) * static_cast<uint64_t>(page_size);
+        }
+        return 0;
+#else
+        return 0;
+#endif
+    }
+
     // 命令行参数结构体：集中存储所有 CLI 选项
     struct Args {
         std::string model;             // 模型文件路径（.tqwen），必选
@@ -99,6 +129,7 @@ namespace {
         bool moe_ssd = false;           // MoE：路由专家走 SSD 卸载（ExpertStore pread+LRU）
         int moe_cache_slots = 4;       // MoE 专家 LRU 缓存槽数（0 = 全 miss）
         int moe_cache_mb = 0;           // MoE 专家缓存字节预算（MB）；>0 时覆盖 slots
+        bool force_over_mem_budget = false;  // 强制跳过内存预算校验（会换页，不推荐）
         bool ppl = false;               // PPL 模式：teacher-forcing 困惑度（不生成）
         std::string ppl_jsonl;          // PPL 多序列输入 JSONL（每行 {"tokens": [...]}）
         std::string config;             // 配置文件路径（可选）
@@ -138,6 +169,7 @@ namespace {
                      "  --moe-expert-cache-slots N\n"
                      "  --moe-expert-cache-mb N     专家缓存字节预算（MB），覆盖 slots；\n"
                      "                              超限 fail-fast 而非静默换页\n"
+                     "  --force-over-memory-budget  强制跳过内存预算校验（会换页、伤 SSD）\n"
                      "                          MoE expert LRU slots (0 = every expert re-pread;\n"
                      "                          default 4)\n"
                      "  --engine NAME           engine: '' = CPU forward (default) / cuda (decode) / metal (prefill)\n"
@@ -187,6 +219,7 @@ namespace {
             else if (a == "--moe-ssd") out->moe_ssd = true;
             else if (a == "--moe-expert-cache-slots") out->moe_cache_slots = std::atoi(value("--moe-expert-cache-slots").c_str());
             else if (a == "--moe-expert-cache-mb") out->moe_cache_mb = std::atoi(value("--moe-expert-cache-mb").c_str());
+            else if (a == "--force-over-memory-budget") out->force_over_mem_budget = true;
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
                 usage(argv[0]);
@@ -429,13 +462,17 @@ int main(int argc, char **argv) {
                          impl_name.c_str(), tinyqwen::available_matvec_gptq_impls());
             return 2;
         }
-        // router / 非 tied lm_head 是 fp32，走 f32 注册表。**不传播用户的 impl 名**：
-        // GPTQ 的 "neon"/"neon_mt"/"ref" 与 f32 注册表同名但语义完全不同——
-        // f32 的 "neon" 是单线程版。传播会让 lm_head（fp32、1187 MB、每 token
-        // 全读一遍）落到单线程内核，实测占 decode 20.6%。用户选的是 GPTQ kernel，
-        // fp32 侧一律用 f32 族最佳实现。
+        // router 是 fp32、lm_head/embed 保留源 dtype（真 checkpoint 里是 fp16），
+        // 所以三个注册表都要设优化内核。**不传播用户的 impl 名**：GPTQ 的
+        // "neon"/"neon_mt"/"ref" 与 f32/f16 注册表同名但语义完全不同——f32 的
+        // "neon" 是单线程版。传播会让 lm_head（每 token 全读一遍）落到单线程内核。
+        // 用户选的是 GPTQ kernel，其余 dtype 一律用各自族的最佳实现。
+        // 漏设 f16 表会让 fp16 lm_head 落到标量 ref（坑 #21 同类陷阱）。
         if (!tinyqwen::set_matvec_impl_by_name("neon_mt_kv_nt")) {
             tinyqwen::set_matvec_impl_by_name("neon_mt");
+        }
+        if (!tinyqwen::set_matvec_f16_impl_by_name("neon_mt_kv_nt")) {
+            tinyqwen::set_matvec_f16_impl_by_name("ref");
         }
         std::fprintf(stderr,
                      "[init] matvec impl: %s (gptq4 weights, group=%u; router/lm_head f32: %s)\n",
@@ -520,28 +557,39 @@ int main(int argc, char **argv) {
             effective_slots = static_cast<int>(budget / expert_store.per_expert_bytes());
         }
 
-        // 内存上限校验：resident + 专家缓存预算 不得超过物理内存，否则必然换页，
-        // 此后所有计时不可信（实测 slots=4096 把 swap 推到 11.3 GB / 12 GB）。
-        // fail-fast 而不是静默跑进换页——静默换页会让测速结论看起来"正常"却全错。
+        // 内存上限校验：resident + 专家缓存预算 不得超过**当前可用**内存。
+        // 为什么不用物理总量：wired + 其他进程已占掉大半，实测 16 GB 机器 wired
+        // 就有 8 GB、可用只剩 1.5 GB。按物理总量校验会宽松 7×，放行后照样换页。
+        // swap 是**写**操作、消耗 SSD 寿命，所以宁可 fail-fast 也不要静默换页。
+        // 留 10% 余量：进程自身还有 KV cache / workspace / 栈等未计入的开销。
         const uint64_t cache_bytes =
             static_cast<uint64_t>(effective_slots) * expert_store.per_expert_bytes();
         const uint64_t total_bytes = file.resident_bytes() + cache_bytes;
         const uint64_t phys = physical_memory_bytes();
+        const uint64_t avail = available_memory_bytes();
+        const uint64_t budget = avail ? avail - avail / 10 : 0;  // 可用 × 90%
         std::fprintf(stderr,
                      "[init] moe: experts=%d per_tok=%d ssd=%s cache_slots=%d\n"
                      "[init] mem budget: resident %.0f MB + expert cache %.0f MB "
-                     "= %.0f MB (物理 %.0f MB, 占 %.0f%%)\n",
+                     "= %.0f MB\n"
+                     "[init] mem available: %.0f MB (物理 %.0f MB), 留 10%% 余量后 "
+                     "上限 %.0f MB\n",
                      model->config().n_routed_experts, model->config().num_experts_per_tok,
                      args.moe_ssd ? "on" : "off", effective_slots,
                      file.resident_bytes() / 1048576.0, cache_bytes / 1048576.0,
-                     total_bytes / 1048576.0, phys / 1048576.0,
-                     phys ? total_bytes * 100.0 / phys : 0.0);
-        if (phys && total_bytes > phys) {
+                     total_bytes / 1048576.0,
+                     avail / 1048576.0, phys / 1048576.0, budget / 1048576.0);
+        if (budget && total_bytes > budget) {
             std::fprintf(stderr,
-                         "error: 内存需求 %.0f MB 超过物理内存 %.0f MB —— 必然换页，"
-                         "计时将不可信。请用 --moe-expert-cache-mb 缩小专家缓存预算。\n",
-                         total_bytes / 1048576.0, phys / 1048576.0);
-            return 1;
+                         "error: 内存需求 %.0f MB 超过可用上限 %.0f MB（可用 %.0f MB "
+                         "留 10%% 余量）—— 会触发换页，而 swap 是写操作、消耗 SSD 寿命。\n"
+                         "       请先释放内存（关掉其他大进程），或用 "
+                         "--moe-expert-cache-mb 缩小专家缓存预算。\n"
+                         "       加 --force-over-memory-budget 可强制继续（不推荐）。\n",
+                         total_bytes / 1048576.0, budget / 1048576.0, avail / 1048576.0);
+            if (!args.force_over_mem_budget) return 1;
+            std::fprintf(stderr, "warn: 已按 --force-over-memory-budget 强制继续，"
+                                 "可能换页，计时与 SSD 寿命均需自行评估。\n");
         }
     }
     std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",

@@ -129,7 +129,7 @@ namespace tinyqwen {
             return nullptr;
         }
         // dtype 校验：量化文件（i4/vq2/gptq）与 MoE 文件允许混合 dtype
-        // （大矩阵量化、小向量/embed kF32）。MoE 文件 master 可为 kF32 而
+        // （大矩阵量化、小向量/embed kF32/kF16）。MoE 文件 master 可为 kF32 而
         // 路由专家为 kGPTQ4，故 MoE 额外放行 kGPTQ4。
         const bool mixed_ok = [&] {
             if (t->dtype == dtype_) return true;                        // 与主 dtype 一致
@@ -140,6 +140,10 @@ namespace tinyqwen {
                                           t->dtype == Dtype::kI4)) return true;
             if (cfg_.is_moe() && t->dtype == Dtype::kGPTQ4) return true;
             if (dtype_ == Dtype::kGPTQ4 && t->dtype == Dtype::kGPTQ4) return true;
+            // GPTQ / MoE 文件放行 fp16：真 checkpoint 的 norm / embed / lm_head
+            // 本来就是 fp16，保留源 dtype 而非升 fp32（升了只是白白翻倍，实测无损）。
+            if ((dtype_ == Dtype::kGPTQ4 || cfg_.is_moe()) &&
+                t->dtype == Dtype::kF16) return true;
             return false;
         }();
         if (!mixed_ok) {
@@ -418,8 +422,23 @@ namespace tinyqwen {
         };
 
         // 全局权重：词嵌入、最后 norm、lm_head
-        if (!bind_mat("model.embed_tokens.weight", {vocab, hidden}, &m->embed_)) return false;
-        m->embed_dtype_ = file.get("model.embed_tokens.weight")->dtype; // embed 真实 dtype
+        {
+            const TensorView *ev = file.get("model.embed_tokens.weight");
+            if (!ev) {
+                *err = "missing tensor: model.embed_tokens.weight";
+                return false;
+            }
+            m->embed_dtype_ = ev->dtype;  // embed 真实 dtype
+            if (ev->data == nullptr) {
+                // embed 已卸载到 SSD：记偏移，查表时按需 pread 单行。
+                // bind_mat 会因 data==nullptr 失败，故这里单独处理。
+                m->embed_ = nullptr;
+                m->embed_file_offset_ = ev->file_offset;
+                m->embed_row_.resize(static_cast<size_t>(hidden));
+            } else if (!bind_mat("model.embed_tokens.weight", {vocab, hidden}, &m->embed_)) {
+                return false;
+            }
+        }
         if (!bind_vec("model.norm.weight", {hidden}, &m->final_norm_)) return false;
         if (cfg.tied_embeddings) {
             // tied：lm_head 与词嵌入同源。默认共享 embed（省内存）；但若文件里

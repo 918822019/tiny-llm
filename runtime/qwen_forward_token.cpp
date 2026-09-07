@@ -120,11 +120,33 @@ namespace tinyqwen {
         // embed 布局 [vocab, hidden]，第 token_id 行起点 = embed_ + token_id*hidden。
         {
             ScopedTimer t(prof, "embed");
+            // embed 卸载到 SSD 时：按需 pread 单行到 embed_row_，再走同一套
+            // dtype 分支。每 token 只读 1 行（hidden*4 = 8 KB），开销可忽略。
+            const void *embed_src = embed_;
+            if (embed_file_offset_ != 0) {
+                // 行字节数随 dtype 变：fp32 = hidden*4，fp16 = hidden*2。
+                // 硬编码 sizeof(float) 会让 fp16 embed 读到错误偏移的数据
+                // （实测 CosSim 掉到 0.87、argmax 全错）。
+                const size_t row_bytes = static_cast<size_t>(hidden) *
+                                         (embed_dtype_ == Dtype::kF16 ? 2 : 4);
+                if (!expert_store_ ||
+                    !expert_store_->read_bytes(
+                        embed_file_offset_ +
+                            static_cast<uint64_t>(token_id) * row_bytes,
+                        row_bytes, embed_row_.data())) {
+                    std::fprintf(stderr, "tinyqwen: embed 卸载 pread 失败 (token=%d)\n",
+                                 token_id);
+                    std::abort();
+                }
+                embed_src = embed_row_.data();
+            }
             if (embed_dtype_ == Dtype::kF32) {
                 // f32 文件或 I4 文件（embed 存为 fp32 lookup table）：直接 memcpy
                 std::memcpy(hidden_.data(),
-                            static_cast<const float *>(embed_) +
-                                    static_cast<size_t>(token_id) * hidden,
+                            static_cast<const float *>(embed_src) +
+                                    (embed_file_offset_ != 0
+                                         ? 0
+                                         : static_cast<size_t>(token_id) * hidden),
                             hidden * sizeof(float));
             } else if (embed_dtype_ == Dtype::kI4) {
                 // 紧凑 INT4 embed：反量化该行（每 token 只解一行，开销可忽略）
@@ -133,8 +155,10 @@ namespace tinyqwen {
             } else {
                 // f16：嵌入行转回 fp32 进残差流（hidden 流全程保持 fp32，
                 // 只有权重是半精度）。每 token 只转一行（896 元素），开销可忽略
-                const uint16_t *row = static_cast<const uint16_t *>(embed_) +
-                                      static_cast<size_t>(token_id) * hidden;
+                const uint16_t *row = static_cast<const uint16_t *>(embed_src) +
+                                      (embed_file_offset_ != 0
+                                           ? 0
+                                           : static_cast<size_t>(token_id) * hidden);
                 for (int j = 0; j < hidden; ++j) hidden_[j] = half_to_float(row[j]);
             }
         }

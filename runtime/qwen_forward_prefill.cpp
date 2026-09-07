@@ -145,10 +145,29 @@ namespace tinyqwen {
                 int tid = token_ids[c]; // 当前 token 的 ID
                 // 目标位置：hid_batch 的第 c 列（偏移 c * hidden）
                 float *dst = hid_batch.data() + static_cast<size_t>(c) * hidden;
+                // embed 卸载时按需 pread 单行（与 decode 侧同一套逻辑）
+                const void *embed_src = embed_;
+                size_t row_off = static_cast<size_t>(tid) * hidden;
+                if (embed_file_offset_ != 0) {
+                    // 行字节数随 dtype 变（fp32=hidden*4，fp16=hidden*2）；
+                    // 硬编码 sizeof(float) 会让 fp16 embed 读到错误偏移的数据
+                    const size_t row_bytes = static_cast<size_t>(hidden) *
+                                             (embed_dtype_ == Dtype::kF16 ? 2 : 4);
+                    if (!expert_store_ ||
+                        !expert_store_->read_bytes(
+                            embed_file_offset_ +
+                                static_cast<uint64_t>(tid) * row_bytes,
+                            row_bytes, embed_row_.data())) {
+                        std::fprintf(stderr,
+                                     "tinyqwen: embed 卸载 pread 失败 (token=%d)\n", tid);
+                        std::abort();
+                    }
+                    embed_src = embed_row_.data();
+                    row_off = 0;
+                }
                 if (embed_dtype_ == Dtype::kF32) {
                     // fp32 或 I4 文件（embed 存为 fp32 lookup table）：直接 memcpy
-                    std::memcpy(dst, static_cast<const float *>(embed_) +
-                                    static_cast<size_t>(tid) * hidden,
+                    std::memcpy(dst, static_cast<const float *>(embed_src) + row_off,
                                 hidden * sizeof(float));
                 } else if (embed_dtype_ == Dtype::kI4) {
                     // 紧凑 INT4 embed：反量化该行
@@ -156,8 +175,7 @@ namespace tinyqwen {
                                    group_size_, dst);
                 } else {
                     // f16 文件：逐元素转为 fp32
-                    const uint16_t *row = static_cast<const uint16_t *>(embed_) +
-                                          static_cast<size_t>(tid) * hidden;
+                    const uint16_t *row = static_cast<const uint16_t *>(embed_src) + row_off;
                     for (int j = 0; j < hidden; ++j) dst[j] = half_to_float(row[j]);
                 }
             }

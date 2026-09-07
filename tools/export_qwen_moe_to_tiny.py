@@ -25,8 +25,8 @@ import numpy as np
 from safetensors import safe_open
 
 from export_qwen_to_tiny import (
-    ALIGN, DTYPE_F32, HEADER_FMT, MAGIC, align_up, pack_v2_ext,
-    repack_gptq_from_hf,
+    ALIGN, DTYPE_F16, DTYPE_F32, HEADER_FMT, MAGIC, align_up, pack_v2_ext,
+    quant_rtn_to_gptq_inband, repack_gptq_from_hf,
 )
 
 FORMAT_VERSION = 3
@@ -102,6 +102,9 @@ def main() -> int:
     ap.add_argument("--max-seq-len", type=int, default=0, help="0 = 用 config 的值")
     ap.add_argument("--max-layers", type=int, default=0,
                     help="只导出前 N 层（冒烟测试用；0 = 全部）")
+    ap.add_argument("--quant-lm-head", action="store_true",
+                    help="把 lm_head 用 RTN 量化成 GPTQ in-band（省 ~1022 MB resident）；"
+                         "误差须用 tools/validate_lm_head_quant.py 实测")
     args = ap.parse_args()
 
     cfg = json.load(open(os.path.join(args.model, "config.json")))
@@ -147,12 +150,26 @@ def main() -> int:
                 qw_shape = f.get_slice(srcs[0]).get_shape()
                 shape = [int(qw_shape[1]), int(qw_shape[0]) * 8]
                 nbytes = None  # 真正字节数在 repack 后才知道
+                dtype_code = DTYPE_GPTQ4
+            elif args.quant_lm_head and n == "lm_head.weight":
+                # lm_head 走 RTN → GPTQ in-band：nbytes 要量化后才知道，
+                # 与 GPTQ 专家同样走"先算块再定布局"的两遍流程
+                sh = f.get_slice(n).get_shape()
+                shape = [int(d) for d in sh]
+                nbytes = None
+                dtype_code = DTYPE_GPTQ4
             else:
                 sh = f.get_slice(n).get_shape()
                 shape = [int(d) for d in sh]
-                dtype_code = DTYPE_F32
-                nbytes = int(np.prod(shape)) * 4
-            entries.append([n, kind, shape, nbytes, None])
+                # **保留源 dtype，不升 fp32**。源 checkpoint 的 lm_head / embed_tokens
+                # / layernorm 都是 fp16，硬编码升 fp32 会让每个张量白白翻倍
+                # （lm_head 594→1187 MB）且零收益——实测 fp16 相对 RMS 误差
+                # 0.0000%、argmax 一致率 100%、CosSim 1.0（就是原值）。
+                src_dtype = f.get_slice(n).get_dtype()
+                elem = 2 if src_dtype == "F16" else 4
+                dtype_code = DTYPE_F16 if src_dtype == "F16" else DTYPE_F32
+                nbytes = int(np.prod(shape)) * elem
+            entries.append([n, kind, shape, nbytes, None, None, dtype_code])
             if nbytes is not None:
                 off = align_up(off + nbytes, ALIGN)
 
@@ -162,17 +179,23 @@ def main() -> int:
         for e in entries:
             if e[3] is None:
                 n = e[0]
-                _, srcs = src_names_for(n, has_gptq)
-                block = repack_gptq_from_hf(
-                    f.get_tensor(srcs[0]), f.get_tensor(srcs[1]),
-                    f.get_tensor(srcs[2]), f.get_tensor(srcs[3]), gs)
+                if n == "lm_head.weight":
+                    block = quant_rtn_to_gptq_inband(f.get_tensor(n), gs)
+                    sys.stderr.write(
+                        f"[moe-export] lm_head RTN→GPTQ: {e[3+1] and ''}"
+                        f"{len(block)/1048576:.1f} MB\n")
+                else:
+                    _, srcs = src_names_for(n, has_gptq)
+                    block = repack_gptq_from_hf(
+                        f.get_tensor(srcs[0]), f.get_tensor(srcs[1]),
+                        f.get_tensor(srcs[2]), f.get_tensor(srcs[3]), gs)
                 e[3] = len(block)
                 e[4] = block
         sys.stderr.write("[moe-export] repacked all GPTQ tensors, computing layout...\n")
 
         off = data_off
         for e in entries:
-            e.append(off)
+            e[5] = off   # entry = [name, kind, shape, nbytes, block, offset, dtype_code]
             off = align_up(off + e[3], ALIGN)
         total = off
 
@@ -218,7 +241,10 @@ def main() -> int:
             out_f.write(hdr)
             for e in entries:
                 n, kind, shape, nbytes, block, offset = e[:6]
-                dtype_code = DTYPE_GPTQ4 if kind == "gptq" else DTYPE_F32
+                # dtype 取自 pass 1 算好的值（保留源 dtype；量化 lm_head 标 GPTQ4）。
+                # 标错会让 runtime 按错误的 dtype 解析，算错且不报错
+                # （AGENTS.md 坑 #19 同类失效模式）。
+                dtype_code = e[6]
                 entry = struct.pack(
                     ENTRY_FMT, n.encode().ljust(MAX_NAME, b"\x00")[:MAX_NAME],
                     dtype_code, len(shape),
@@ -232,11 +258,13 @@ def main() -> int:
             for e in entries:
                 n, kind, shape, nbytes, block, offset = e[:6]
                 out_f.seek(offset)
-                if kind == "gptq":
+                if block is not None:
                     out_f.write(block)
                 else:
+                    # 保留源 dtype：fp16 源不升 fp32（升了只是白白翻倍，实测无损）
                     arr = f.get_tensor(n)
-                    out_f.write(np.ascontiguousarray(arr, np.float32).tobytes())
+                    target = np.float16 if arr.dtype == np.float16 else np.float32
+                    out_f.write(np.ascontiguousarray(arr, target).tobytes())
             # 补齐到 total。最后一个 tensor 末尾可能已恰好对齐到 total（无需填充），
             # 此时无条件 seek(total-1) 写零会覆盖它的末字节，损坏最后一个 tensor。
             out_f.seek(0, os.SEEK_END)

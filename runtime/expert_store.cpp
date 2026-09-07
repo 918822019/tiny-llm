@@ -101,6 +101,25 @@ namespace tinyqwen {
         return done == nbytes;
     }
 
+    bool ExpertStore::read_bytes(uint64_t offset, size_t nbytes, void *out) {
+        uint8_t *dst = static_cast<uint8_t *>(out);
+        size_t done = 0;
+        while (done < nbytes) {
+            ssize_t r = ::pread(fd_, dst + done, nbytes - done,
+                                static_cast<off_t>(offset + done));
+            if (r < 0) {
+                std::fprintf(stderr,
+                             "tinyqwen: ExpertStore read_bytes failed at off=%llu "
+                             "nbytes=%zu\n",
+                             static_cast<unsigned long long>(offset + done), nbytes - done);
+                return false;
+            }
+            if (r == 0) break;
+            done += static_cast<size_t>(r);
+        }
+        return done == nbytes;
+    }
+
     const ExpertWeights ExpertStore::get(int layer, int expert) {
         const int64_t key = make_key(layer, expert);
         auto lit = layout_map_.find(key);

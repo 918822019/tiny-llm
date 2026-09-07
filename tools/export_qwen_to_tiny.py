@@ -219,6 +219,66 @@ def repack_gptq_from_hf(qweight, qzeros, scales, g_idx, group_size: int) -> byte
     return bytes(buf)
 
 
+def quant_rtn_to_gptq_inband(weight, group_size: int) -> bytes:
+    """把 fp32/fp16 权重用 RTN 量化成 runtime 的 GPTQ in-band 块。
+
+    与 repack_gptq_from_hf 输出**同一布局**，因此复用同一个 C++ dequant kernel
+    （matvec_gptq_neon），不必为量化 lm_head 引入新的 dtype 路由。
+
+    布局（同 repack_gptq_from_hf）：
+      [header 8B: {u32 magic, u32 flags=0}][scales fp16 (ng,out)][qzeros fp16 (ng,out)]
+      [qweight u32 (in//8, out) 列主序]
+
+    为什么用 RTN 而不是 GPTQ 的逐列误差补偿：lm_head 只需要一次量化、不做
+    Hessian 校准，RTN 足够；且这里的目标是省内存（1187 MB fp32 → ~165 MB），
+    不是追求极致精度。量化误差必须实测（见 tools/validate_lm_head_quant.py），
+    不能假设"i4 一定够准"。
+
+    weight: [out, in] fp32/fp16。要求 in % group_size == 0 且 in % 8 == 0。
+    """
+    w = np.asarray(weight, dtype=np.float32)
+    out_dim, in_dim = w.shape
+    if in_dim % group_size != 0 or in_dim % GPTQ_PACK != 0:
+        raise ValueError(f"in_dim={in_dim} 须被 group_size({group_size}) 与 "
+                         f"{GPTQ_PACK} 整除")
+    ng = in_dim // group_size
+
+    # 每组（列方向分组，与 repack_gptq_from_hf 一致：组沿 in_dim 切）
+    grp = w.reshape(out_dim, ng, group_size)
+    vmin = grp.min(axis=2)          # [out, ng]
+    vmax = grp.max(axis=2)
+    scale = np.where(vmax > vmin, (vmax - vmin) / 15.0, 0.0).astype(np.float32)
+    # 存 fp16（与 repack 一致），量化时用回读值以保证 C++ 侧看到同一个 scale
+    scale_h = scale.astype(np.float16)
+    scale_r = scale_h.astype(np.float32)
+    zero = np.where(scale_r > 0, -vmin / np.where(scale_r > 0, scale_r, 1.0), 0.0)
+    zero_h = zero.astype(np.float16)
+    zero_r = zero_h.astype(np.float32)
+
+    # 量化：q = round(w/s + z)，clamp 到 [0,15]
+    q = np.zeros((out_dim, ng, group_size), dtype=np.uint8)
+    for g in range(ng):
+        s = scale_r[:, g]
+        z = zero_r[:, g]
+        safe_s = np.where(s > 0, s, 1.0)
+        vals = grp[:, g, :] / safe_s[:, None] + z[:, None]
+        q[:, g, :] = np.clip(np.rint(vals), 0, 15).astype(np.uint8)
+    q = q.reshape(out_dim, in_dim)   # [out, in]
+
+    # 打包 qweight：[in//8, out] 列主序，一个 word 装 8 个连续 in_dim，低 nibble=最小下标
+    qw = np.zeros((in_dim // GPTQ_PACK, out_dim), dtype=np.uint32)
+    for k in range(GPTQ_PACK):
+        qw |= (q[:, k::GPTQ_PACK].T.astype(np.uint32) & 0xF) << (k * 4)
+
+    buf = bytearray()
+    buf += struct.pack("<II", GPTQ_MAGIC, 0)   # flags=0：无 g_idx（contiguous）
+    # scales/qzeros 按 [ng, out] 行主序存（与 C++ 侧 (g*out_dim + o) 索引一致）
+    buf += scale_h.T.astype(np.float16).tobytes()
+    buf += zero_h.T.astype(np.float16).tobytes()
+    buf += qw.tobytes()
+    return bytes(buf)
+
+
 def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]",
                 dtype: str = "f32", version: int = 1, ext: dict | None = None) -> int:
     """写一个 .tqwen 文件，返回文件总字节数。
