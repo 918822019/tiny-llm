@@ -87,16 +87,27 @@ namespace tinyqwen {
         const bool is_qwen35 = (cfg_.model_type == ModelType::kQwen35) ||
                                (cfg_.model_type == ModelType::kQwen35MoE);
 
+        // MoE 暂不支持批量 prefill GEMM 路径（专家 gather/scatter 未实现），
+        // 一律强制逐 token（forward_token 已支持 MoE FFN）。这个分支必须在
+        // 架构判断之前：dense-attention 的 kQwen3MoE 不属于 is_qwen35，否则会
+        // 掉进下面 Qwen2 的批量路径——那条路径算的是 dense SwiGLU 而非 MoE，
+        // 不报错但结果全错。
+        if (cfg_.is_moe()) {
+            int last = -1;
+            for (int i = 0; i < n; ++i)
+                last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k,
+                                     /*need_logits=*/i == n - 1);
+            return last;
+        }
+
         // GDN (linear attention) layers need sequential state updates — but the
         // 线性投影部分仍可批量。批量路径（qwen_forward_prefill_qwen35.cpp）：
         // 投影/FFN 走 GEMM（权重每层只读一遍），GDN 递归与因果 attention
         // 保留逐 token 顺序扫描。长 prompt 的 TTFT 大幅下降。
         // 无法处理时（无 BLAS 后端 / dtype 不支持 / 开关关闭 / token 太少）
         // 返回 -2，回退到逐 token。
-        // MoE 暂不支持批量 prefill GEMM 路径（专家 gather/scatter 未实现），
-        // 强制逐 token（forward_token 已支持 MoE FFN）。
         if (is_qwen35) {
-            if (!cfg_.is_moe() && batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35) {
+            if (batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35) {
                 const int r = forward_prefill_qwen35_batch(token_ids, n, topk, topk_k);
                 if (r != -2) return r;
                 // fallthrough：逐 token 回退

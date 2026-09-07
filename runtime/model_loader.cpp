@@ -466,7 +466,7 @@ namespace tinyqwen {
             std::memcpy(&ext, header_.reserved, sizeof(ext));
 
             // model_type 必须在已知范围内
-            if (ext.model_type > static_cast<uint32_t>(ModelType::kQwen35MoE)) {
+            if (ext.model_type > static_cast<uint32_t>(ModelType::kQwen3MoE)) {
                 fail(err, "unknown model_type: " + std::to_string(ext.model_type));
                 return false;
             }
@@ -546,22 +546,28 @@ namespace tinyqwen {
             // MoE 自洽性校验
             if (config_.is_moe()) {
                 if (config_.n_routed_experts == 0 || config_.num_experts_per_tok == 0 ||
-                    config_.moe_intermediate_size == 0 ||
-                    config_.shared_expert_intermediate_size == 0 ||
-                    config_.n_shared_experts == 0) {
-                    fail(err, "qwen3_5_moe: expert shape fields must all be set "
-                              "(n_routed_experts/num_experts_per_tok/moe_intermediate_size/"
-                              "shared_expert_intermediate_size/n_shared_experts)");
+                    config_.moe_intermediate_size == 0) {
+                    fail(err, "moe: expert shape fields must be set "
+                              "(n_routed_experts/num_experts_per_tok/moe_intermediate_size)");
+                    return false;
+                }
+                // 共享专家是可选的：Qwen3.5-MoE 有，Qwen3-MoE（真模型
+                // Qwen3-30B-A3B）没有。两个字段必须同为 0 或同非 0，
+                // 只填一个说明导出器写错了。
+                const bool has_shared = config_.n_shared_experts > 0;
+                if (has_shared != (config_.shared_expert_intermediate_size > 0)) {
+                    fail(err, "moe: n_shared_experts and shared_expert_intermediate_size "
+                              "must both be zero (no shared expert) or both non-zero");
                     return false;
                 }
                 if (config_.num_experts_per_tok > config_.n_routed_experts) {
-                    fail(err, "qwen3_5_moe: num_experts_per_tok > n_routed_experts");
+                    fail(err, "moe: num_experts_per_tok > n_routed_experts");
                     return false;
                 }
                 // 拓扑要求：intermediate_size（文件头）对 MoE 无意义但保留；
                 // 路由专家的 in_dim = hidden，须满足 GPTQ 打包约束
                 if (config_.gptq_group_size == 0) {
-                    fail(err, "qwen3_5_moe: gptq_group_size must be set");
+                    fail(err, "moe: gptq_group_size must be set");
                     return false;
                 }
             }

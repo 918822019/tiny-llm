@@ -188,6 +188,9 @@ namespace tinyqwen {
         kQwen35MoE = 2, // Qwen3.5 MoE: 同 kQwen35 的 attention 混合，但 FFN 换成 MoE
                         // （路由门 + top-k + 共享专家 + 路由专家）。专家权重可
                         // 留盘按需加载（见 runtime/expert_store.h）。
+        kQwen3MoE = 3,  // Qwen3-MoE（HF model_type=qwen3_moe）：所有层都是 full
+                        // attention（无 GDN 混合），FFN 是 MoE 且**没有共享专家**
+                        // （n_shared_experts=0）。真模型 Qwen3-30B-A3B 属此类。
     };
 
     // 数据类型枚举。v1 只用 f32，其余是为将来量化预留的

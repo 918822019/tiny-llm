@@ -154,6 +154,19 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    校验就中招过，改成只 pread 前 4 字节）。紧凑打包时每个 tensor 起点仍须 64B 对齐
    （kernel 有按对齐选路的分支）。内存是否真降看启动行 `[init] weights: resident ..
    offloaded ..`，logits 逐位一致只证明算对了、不证明内存省了。
+18. **MoE 实现原本只适配 Qwen3.5-MoE，真模型 Qwen3-MoE 会静默算错**。三个坑都是
+   拿真 checkpoint（`Qwen3-30B-A3B-GPTQ-Int4`）才暴露的：
+   **(a) HF `model_type=qwen3_moe` 不是 `qwen3_5_moe`**，且它是 dense attention
+   （无 GDN 混合）、**没有共享专家**。原来 loader 硬性要求
+   `shared_expert_intermediate_size != 0 && n_shared_experts != 0`，直接拒绝。
+   现共享专家改为可选，用 `ModelConfig::has_shared_expert()` 判断，两个字段必须
+   同为 0 或同非 0（只填一个 = 导出器写错，fail fast）。新增 `ModelType::kQwen3MoE=3`。
+   **(b) `qwen_forward_prefill.cpp` 的 MoE 逐 token 分支原本在 `if (is_qwen35)`
+   里面**，`kQwen3MoE` 不属于 `is_qwen35`，会掉进 Qwen2 批量 prefill 路径 ——
+   那条算 dense SwiGLU 而非 MoE，**不报错但结果全错**。已提到架构判断之前。
+   **(c) `full_layer_cache_index()` 除零**（坑 #16）：dense-attention MoE 每层都是
+   full attention，`full_attention_interval` 为 0/1 时该函数每层都会被调用。已补守卫。
+   **教训：只在 fake 模型上验证过的架构假设，遇到真模型基本都会破。**
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

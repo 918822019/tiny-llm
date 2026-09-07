@@ -10,12 +10,28 @@ embed / norm 常驻内存（resident）。
 
 ## 架构
 
-`ModelType::kQwen35MoE` = Qwen3.5 attention（GDN + full attention 3:1 混合，**全部
-既有代码复用**）+ MoE FFN 替换 dense SwiGLU FFN。每层 FFN 都是 MoE：
+支持两种 MoE 拓扑（`ModelType`）：
+
+| ModelType | attention | 共享专家 | 对应 HF model_type | 真模型 |
+|---|---|---|---|---|
+| `kQwen35MoE` (2) | GDN + full 3:1 混合 | **有** | `qwen3_5_moe` | Qwen3.5-35B-A3B |
+| `kQwen3MoE` (3) | 全层 full attention | **无**（`n_shared_experts=0`） | `qwen3_moe` | Qwen3-30B-A3B |
+
+两者都是"既有 attention 代码复用 + MoE FFN 替换 dense SwiGLU FFN"。每层 FFN：
 
 ```
-post_attn_norm → router_gate(resident) → topk_softmax → 共享专家(resident) + Σ 路由专家
+有共享专家： post_attn_norm → router_gate → topk_softmax → 共享专家 + Σ 路由专家
+无共享专家： post_attn_norm → router_gate → topk_softmax →              Σ 路由专家
+                                                        （ffn_acc 从 0 起算）
 ```
+
+`kQwen3MoE` 的 `full_attention_interval` 必须为 0 或 1（`is_linear_layer()` 的
+`<= 1` 守卫据此判定"全层 full attention"）。注意 `full_layer_cache_index()` 原先
+缺这个守卫会除零，已补（见 AGENTS.md 坑 #16）。
+
+**prefill 路径的坑**：MoE 的逐 token 分支必须放在架构判断**之前**。原先它在
+`if (is_qwen35)` 里面，而 `kQwen3MoE` 不属于 `is_qwen35`，会掉进 Qwen2 的批量
+prefill 路径 —— 那条路径算的是 dense SwiGLU 而非 MoE，**不报错但结果全错**。
 
 路由专家权重访问二选一（`--moe-ssd` 开关）：
 - **resident 模式**（默认，正确性锚点）：ModelFile 整文件读入，专家权重直接绑自

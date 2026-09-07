@@ -88,7 +88,13 @@ namespace tinyqwen {
         uint32_t gptq_group_size = 0;                // GPTQ 每组元素数（专家为 kGPTQ4 时 >0）
 
         // 是否为 MoE 架构（FFN 换成 MoE，attention 部分与 kQwen35 完全一致）
-        bool is_moe() const { return model_type == ModelType::kQwen35MoE; }
+        bool is_moe() const {
+            return model_type == ModelType::kQwen35MoE ||
+                   model_type == ModelType::kQwen3MoE;
+        }
+
+        // MoE 是否有共享专家（Qwen3-MoE 没有，Qwen3.5-MoE 有）
+        bool has_shared_expert() const { return n_shared_experts > 0; }
 
         // ---------------------------------------------------------------------
         // is_linear_layer: 判断 layer_idx 是否为 linear attention（GDN）层
@@ -134,6 +140,10 @@ namespace tinyqwen {
         //     layer 3、7、11... 映射到 cache index 0、1、2...
         // ---------------------------------------------------------------------
         int full_layer_cache_index(uint32_t layer_idx) const {
+            // interval <= 1 = 所有层都是 full attention（如 kQwen3MoE），此时全局层号
+            // 就是紧凑下标。缺这个守卫会除零——is_linear_layer / n_full_layers 都有
+            // <= 1 守卫，本函数原先没有（同结构体三个函数守卫不一致）。
+            if (full_attention_interval <= 1) return static_cast<int>(layer_idx);
             return static_cast<int>((layer_idx + 1) / full_attention_interval - 1);
         }
 

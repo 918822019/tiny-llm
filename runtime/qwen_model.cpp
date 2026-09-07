@@ -458,12 +458,16 @@ namespace tinyqwen {
                 const uint64_t n_exp = cfg.n_routed_experts;
                 if (!bind_mat((p + "mlp.gate.weight").c_str(), {n_exp, hidden}, &w.moe_router))
                     return false;
-                if (!bind_mat((p + "mlp.shared_experts.gate_proj.weight").c_str(),
-                              {shared_inter, hidden}, &w.moe_shared_gate)) return false;
-                if (!bind_mat((p + "mlp.shared_experts.up_proj.weight").c_str(),
-                              {shared_inter, hidden}, &w.moe_shared_up)) return false;
-                if (!bind_mat((p + "mlp.shared_experts.down_proj.weight").c_str(),
-                              {hidden, shared_inter}, &w.moe_shared_down)) return false;
+                // 共享专家可选：Qwen3-MoE 没有这组权重，文件里不存在这些 tensor，
+                // 无条件绑定会报 "missing tensor"。
+                if (cfg.has_shared_expert()) {
+                    if (!bind_mat((p + "mlp.shared_experts.gate_proj.weight").c_str(),
+                                  {shared_inter, hidden}, &w.moe_shared_gate)) return false;
+                    if (!bind_mat((p + "mlp.shared_experts.up_proj.weight").c_str(),
+                                  {shared_inter, hidden}, &w.moe_shared_up)) return false;
+                    if (!bind_mat((p + "mlp.shared_experts.down_proj.weight").c_str(),
+                                  {hidden, shared_inter}, &w.moe_shared_down)) return false;
+                }
                 // 路由专家：resident 模式绑定内存指针；稀疏加载下 data==nullptr，
                 // 只注册文件 offset 给 ExpertStore 按需 pread。
                 w.moe_experts.resize(n_exp);

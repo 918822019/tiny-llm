@@ -158,7 +158,7 @@ def write_tqwen_moe(path, header_cfg, tensors, ext_v2, ext_v3):
     return total
 
 
-def build(seed=42):
+def build(seed=42, shared_expert=True):
     rng = np.random.default_rng(seed)
     C = FAKE_CFG
     H = C["hidden_size"]
@@ -202,9 +202,10 @@ def build(seed=42):
         add_f32(p + "post_attention_layernorm.weight", np.ones(H, np.float32) * 0.1)
         # MoE FFN
         add_quant(p + "mlp.gate.weight", W(n_exp, H))  # router
-        add_quant(p + "mlp.shared_experts.gate_proj.weight", W(shared_inter, H))
-        add_quant(p + "mlp.shared_experts.up_proj.weight", W(shared_inter, H))
-        add_quant(p + "mlp.shared_experts.down_proj.weight", W(H, shared_inter))
+        if shared_expert:
+            add_quant(p + "mlp.shared_experts.gate_proj.weight", W(shared_inter, H))
+            add_quant(p + "mlp.shared_experts.up_proj.weight", W(shared_inter, H))
+            add_quant(p + "mlp.shared_experts.down_proj.weight", W(H, shared_inter))
         for e in range(n_exp):
             pe = p + f"mlp.experts.{e}."
             add_quant(pe + "gate_proj.weight", W(moe_inter, H))
@@ -244,22 +245,25 @@ def build(seed=42):
                   eos_token_id=C["eos_token_id"], quant_group_size=0)
     ext_v3 = dict(n_routed_experts=n_exp, num_experts_per_tok=C["num_experts_per_tok"],
                   moe_intermediate_size=moe_inter,
-                  shared_expert_intermediate_size=shared_inter,
-                  n_shared_experts=C["n_shared_experts"], moe_topk_norm=1,
-                  gptq_group_size=gs)
+                  shared_expert_intermediate_size=shared_inter if shared_expert else 0,
+                  n_shared_experts=C["n_shared_experts"] if shared_expert else 0,
+                  moe_topk_norm=1, gptq_group_size=gs)
     return FAKE_CFG, tensors, ext_v2, ext_v3
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--no-shared-expert", action="store_true",
+                    help="omit the shared expert (Qwen3-MoE topology)")
     args = ap.parse_args()
-    cfg, tensors, ext2, ext3 = build()
+    cfg, tensors, ext2, ext3 = build(shared_expert=not args.no_shared_expert)
     total = write_tqwen_moe(args.out, cfg, tensors, ext2, ext3)
     sys.stderr.write(
         f"[fake-moe] wrote {args.out}: {total} bytes, {len(tensors)} tensors, "
         f"experts={cfg['n_routed_experts']} per_tok={cfg['num_experts_per_tok']} "
-        f"gptq_group={cfg['gptq_group_size']}\n")
+        f"gptq_group={cfg['gptq_group_size']} "
+        f"shared_expert={'no' if args.no_shared_expert else 'yes'}\n")
 
 
 if __name__ == "__main__":

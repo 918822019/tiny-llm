@@ -446,8 +446,9 @@ namespace tinyqwen {
                                            experts_per_tok_, moe_topk_idx_.data(),
                                            moe_topk_w_.data());
                 }
-                // 共享专家（resident，权重 1）：gate/up -> swiglu -> down
-                {
+                // 共享专家（resident，权重 1）：gate/up -> swiglu -> down。
+                // Qwen3-MoE 没有共享专家，此时 ffn_acc 从 0 起算，只累加路由专家。
+                if (cfg_.has_shared_expert()) {
                     ScopedTimer t(prof, scope("layer_%d.shared_ffn", i));
                     mv_pair(w.moe_shared_gate, w.moe_shared_up, normed_.data(),
                             moe_expert_gate_.data(), moe_expert_up_.data(),
@@ -456,9 +457,10 @@ namespace tinyqwen {
                                      shared_inter_);
                     mv(w.moe_shared_down, moe_expert_gate_.data(),
                        moe_shared_out_.data(), hidden, shared_inter_);
+                    for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = moe_shared_out_[j];
+                } else {
+                    for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = 0.0f;
                 }
-                // ffn_acc 初始化为共享专家输出
-                for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = moe_shared_out_[j];
 
                 // 路由专家：按 top-k 权重加权累加。权重走 resident 指针或
                 // ExpertStore SSD 卸载（pread + LRU）——两者须逐位一致。
