@@ -64,6 +64,20 @@ dispatch.h / dispatch.cpp     # 分发层 + 注册表：model 只调通用入口
   lm_head vs ref 合计 **~89×**。
   评测用 `./scripts/bench_kernels.sh --family vq2`（见 docs/optimization.md §6；
   mt 变体对比须分进程，避免常驻池互扰）。
+- **GPTQ kernel 阶梯**（AutoGPTQ 列主序，与 i4 的 HQQ interleaved 布局不兼容，
+  是**独立注册表**）：
+  - matvec：`ref`（double 累加锚）→ `neon`（c8-outer/o-inner + o 分块 64 +
+    **反量化因式分解** `Σ_k((nib_k-z)·s·x_k) = s·[Σ_k(nib_k·x_k) - z·Σ_k(x_k)]`）
+    → `neon_mt`（+常驻线程池动态领取 o_block）。decode 9157 → 308 ms/tok。
+  - matmul（批量 GEMM，MoE 批量 prefill 用）：`ref` → `neon`。结构与
+    `matvec_gptq_neon` 同构，只是外面多一层列循环。
+    **注意：X 是列主序 [K,N]，元素 (r,c) 在 `c*K+r`——固定 r 变化 c 步长是 K，
+    不连续，不能对列向量化。正确方向是 o**（初版搞错，实测结果全错）。
+- **MoE 批量 prefill 的收益上限由 I/O 原本占比决定**：批量路径把 I/O 降了 96%
+  （n=128：230 GB → 8.4 GB），但 TTFT 只快 1.44×——因为逐 token prefill 里 I/O
+  只占 28.4%，省掉 96% 的理论上限就是 `1/(1-0.284×0.96)` = 1.39×。
+  **且批量路径的 matmul 必须有 NEON 版**：初版只有标量 ref 时 prefill 反而慢
+  3.5×（用 5× 计算变慢换 96% I/O 降幅，净亏）。
 - **i4 kernel 阶梯**（归因用，只增不删）：
   `sdot`（W4A8 SDOT 首版）→ `sdot2`（+预计算 scale/zero + 2-row 并行，首次反超 f16）
   → `sdot3`（+work-stealing 调度 + 内联组头硬件 FCVT + 128 位解包）→

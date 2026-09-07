@@ -517,19 +517,27 @@ decode 616 → **492 ms/tok（1.25×）**。
 
 #### 下一阶段方向（CPU/IO 已到顶）
 
-1. **读更少数据**（最有希望）：更激进的专家量化（i4 → i3/i2），或按热度只
+1. ✅ **MoE 批量 prefill 按专家分组**（已完成，TTFT 1.44× @ n=128，I/O -96%）。
+   详见 `docs/optimization_log.md`。要点：每专家只加载一次 + 一次 batch GEMM，
+   新增 `matmul_gptq`（ref + neon）。**n<16 回退逐 token**（小 n 时固定开销
+   超过复用收益，实测 n=8 只有 0.97×）。
+2. **读更少数据**（最有希望）：更激进的专家量化（i4 → i3/i2），或按热度只
    常驻高频专家。直接攻击 1.682 GB/token 这个带宽下限的来源。
-2. **专家层多线程并行**：top-8 专家 FFN 彼此独立，48 次 fork-join/token
+3. **专家层多线程并行**：top-8 专家 FFN 彼此独立，48 次 fork-join/token
    （而非 kernel 级的 1152 次）。但 I/O 占 32.8%，计算并行收益有限。
-3. **MoE 批量 prefill**：解决 TTFT 4687 ms / 7 tok 的线性放大（长 prompt 场景）。
+4. **Metal prefill 支持 GPTQ**：`metal_prefill_create` 目前 fail-fast 拒绝 GPTQ。
+   但 Metal 只能覆盖 attention 投影（28.4%），专家部分无法上 GPU（M4 统一内存
+   = 系统内存 16 GB < 文件 16.36 GB），**预期上限仅 1.40×**，且需写 Metal GPTQ
+   dequant kernel。性价比低于方向 2。
 
 #### 执行顺序建议
 
 1. ✅ **B-1**（合并 pread）：1.47×
 2. ✅ 重测归因：I/O 60.5% → 45.1%
 3. ✅ **B-2**（层内预取）：1.17×（预估 1.83× 因粒度错配高估）
-4. ✅ 重测归因：decode 已达带宽峰值 84%，距下限 49 ms → **CPU/IO 到顶**
-5. ⏳ 转向"读更少数据"方向（量化/热度常驻），而非继续优化调度
+4. ✅ 重测归因：decode 已达带宽峰值 84%，距下限 49 ms → **decode 侧到顶**
+5. ✅ **MoE 批量 prefill**：TTFT 1.44× @ n=128（decode 不受影响）
+6. ⏳ 转向"读更少数据"方向（量化/热度常驻），而非继续优化调度或上 Metal
 
 ### ⏳ Phase C-2/3：剩余计算优化
 1. **专家层多线程并行**：top-8 专家 FFN 彼此独立。当前 kernel 级 MT 无效

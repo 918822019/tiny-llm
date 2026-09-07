@@ -3734,6 +3734,107 @@ MPS f16，慢 13–17%；但 **lm_head 的 N=1 GEMV（M=151936）快 2.92×**。
 
 ---
 
+### MoE 批量 prefill 按专家分组：TTFT 1.44× @ n=128，I/O -96%（2026-09-07）
+
+- **优化栈**：… + B-2 层内异步预取 + **MoE 批量 prefill（按专家分组）**
+- **是什么**：逐 token prefill 的浪费 —— 同一专家被多个 token 重复选中，却每次
+  都重新读盘、各算一次 matvec（实测 n=32 时 bytes_read 57.5 GB、**hits=0 零复用**）。
+  改为按专家分组：router 算完全部 N token → 按专家归组 → **每专家只加载一次** →
+  对其所有 token 做一次 batch GEMM → 按 topk 权重散回各 token。
+  新增 `matmul_gptq`（ref + neon 两个变体）。
+- **假设**：每层 n×8 次专家选择从 128 个专家里挑，重叠率随 n 上升 → I/O 可省 ~50%
+- **结果**：I/O 降幅**远超预测**（预测 50%，实际 75–96%）：
+
+  | n | I/O 逐 token | I/O 批处理 | 降幅 | TTFT 加速 |
+  |---|---|---|---|---|
+  | 8 | 14.31 GB | 3.55 GB | **-75%** | 0.97× |
+  | 32 | 57.50 GB | 6.04 GB | **-89.5%** | 1.21× |
+  | 128 | 230.14 GB | 8.41 GB | **-96.3%** | **1.44×** |
+
+  generated_ids 与逐 token 版**完全一致**。
+- **意外 / 教训**：
+  1. **I/O 收益会被计算反噬吃掉**。初版 `matmul_gptq` 只有标量 ref，prefill
+     **反而慢 3.5×**（expert_ffn 25.14s vs 逐 token 4.50s）—— 用 96% I/O 降幅
+     换了 ~5× 计算变慢，净亏。补 NEON 版才转正到 1.44×。
+     **做"减少 I/O"的优化前，先确认计算侧不会因换实现而变慢。**
+  2. **列主序矩阵不能对"列"向量化**。X 是列主序 `[K, N]`，元素 (r,c) 在 `c*K+r`。
+     初版误以为 `x[k*N+c]` 对固定 k 连续，实测 generated_ids **完全错**。
+     正确方向是 **o**（qweight 是 `[(K/8), M]`，固定 c8 变化 o 才连续）。
+     **写 GEMM kernel 前先画清布局：哪个维度连续就沿它向量化。**
+  3. **批量路径的每个张量都要按自身 dtype 读**。router 初版按 fp32 读，但真
+     checkpoint 是 **fp16** → 垃圾 → NaN → 输出全 0（坑 #24 同类）。
+     **定位手段：逐层插 NaN 检查**（`std::isfinite` 扫描中间缓冲），首个 NaN
+     出现在 `gate_logits` 就锁定 router。比逐行读代码快得多。
+  4. **加速随 n 增长**：n=8 时 0.97×（批处理固定开销超过复用收益），n=32 才
+     1.21×，n=128 达 1.44×。故加 `n < 16` 阈值回退逐 token。
+     原因：每层 n×8 次选择从 128 个专家里挑，重叠率随 n 上升。
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                   # 196 单测
+  # A/B：批处理 vs 逐 token（--no-batch-prefill），3 次取 min
+  for extra in "" "--no-batch-prefill"; do
+    ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4_fp16.tqwen \
+      --tokens <128 个 id> --max-new-tokens 1 --max-seq-len 136 --moe-ssd \
+      --moe-expert-cache-slots 4 --matvec-impl neon --moe-prefetch $extra
+  done   # 看 stderr 的 bytes_read 与 profile 的 first_token_ms
+  ```
+
+---
+
+### MoE 批量 prefill 按专家分组：TTFT 1.44× @ n=128，I/O -96%（2026-09-07）
+
+- **优化栈**：… + GPTQ NEON matvec + embed 卸载 + 保留源 fp16 + B-1 单次 pread
+  + B-2 异步预取 + **MoE 批量 prefill（按专家分组）**
+- **是什么**：逐 token prefill 的浪费——同一专家被多个 token 重复选中，却每次
+  都重新读盘、各算一次 matvec（实测 n=32 时 bytes_read 57.5 GB、**hits=0 零复用**）。
+  改为按专家分组：router 算完全部 N token → 按专家归组 → **每专家只加载一次** →
+  对其所有 token 做一次 batch GEMM → 按 topk 权重散回各 token。
+  新增 `matmul_gptq`（ref + neon 两个变体）。
+- **假设**：每层 n×8 次选择从 128 个专家里挑，重叠率随 n 升 → I/O 可省 ~50%
+- **结果**：
+
+  | n | I/O 逐token | I/O 批处理 | 降幅 | TTFT 加速 |
+  |---|---|---|---|---|
+  | 8 | 14.31 GB | 3.55 GB | **-75%** | 0.97× |
+  | 32 | 57.50 GB | 6.04 GB | **-89.5%** | 1.21× |
+  | 128 | 230.14 GB | **8.41 GB** | **-96.3%** | **1.44×** |
+
+  generated_ids 与逐 token 版**完全一致**。196 单测全过。
+- **验证**：3 条 matmul_gptq 单测护栏（N=1 须与 matvec_gptq 一致、多 token
+  逐列一致、带 g_idx）。
+- **意外 / 教训**：
+  1. **I/O 降幅远超预测（96% vs 预测 50%）**，但 TTFT 只快 1.44×。因为逐 token
+     prefill 里 I/O 只占 28.4%，省掉 96% 的 I/O 理论上限就是 1.39×
+     （`1/(1-0.284×0.96)`）——实测 1.44× 与理论吻合。**减少 I/O 的收益上限由
+     I/O 原本的占比决定，不是由降幅决定。**
+  2. **批量路径的 matmul 必须有 NEON 版，否则 I/O 收益被计算反噬吃掉**。初版
+     `matmul_gptq` 只有标量 ref，结果 **prefill 反而慢 3.5×**（expert_ffn
+     25.14s vs 逐 token 4.50s）。等于用 5× 计算变慢换 96% I/O 降幅 —— 净亏。
+     **教训：做"减少 I/O"的优化前，先确认计算侧不会因换实现而变慢。**
+  3. **列主序矩阵不能对"列"向量化**。`matmul_gptq` 的 X 是列主序 `[K, N]`，
+     元素 (r, c) 在 `c*K + r`。**固定 r、变化 c 的步长是 K —— 不连续**。初版
+     误以为 `x[k*N + c]` 对固定 k 连续，实测 generated_ids **完全错**。正确方向
+     是 **o**（qweight 是 `[(K/8), M]`，固定 c8 变化 o 才连续）。
+     **写 GEMM kernel 前先画清布局：哪个维度在内存里连续，就沿它向量化。**
+  4. **批量路径每个张量都要按自身 dtype 读**。router 初版按 fp32 读，但真
+     checkpoint 的 router 是 **fp16** → 垃圾 → NaN → 输出全 0（坑 #24 同类）。
+     **定位手段：逐层插 NaN 检查**（`std::isfinite` 扫各中间缓冲），首个 NaN
+     出现在 `gate_logits` 就直接锁定 router，比逐行读代码快得多。
+  5. **小 n 要设阈值回退**：n<16 走逐 token。实测 n=8 批处理 0.97×（缓冲分配 +
+     每列重算 sx8 的固定开销超过复用收益），n=32 才 1.21×。
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                   # 196 单测
+  # I/O 与 TTFT 对比（--no-batch-prefill 关掉批量路径）
+  for n in 8 32 128; do
+    ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4_fp16.tqwen \
+      --tokens <n 个 token> --max-new-tokens 1 --max-seq-len $((n+8)) --moe-ssd \
+      --moe-expert-cache-slots 4 --matvec-impl neon --moe-prefetch [--no-batch-prefill]
+  done   # 看 [moe] expert cache 的 bytes_read 与 profile 的 first_token_ms
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

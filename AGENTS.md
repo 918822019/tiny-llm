@@ -259,6 +259,24 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    有效带宽 5.46 GB/s（M4 NVMe 峰值 **84%**），理论下限 259 ms/tok，距当前
    308 ms/tok 仅 **49 ms** 空间。要再快只能**读更少数据**（更激进量化、按热度
    常驻高频专家），不是继续优化计算或调度。
+30. **批量路径的 matmul 必须有 NEON 版，否则 I/O 收益会被计算反噬吃掉**。
+   MoE 批量 prefill 把 I/O 降了 **96%**（n=128：230 GB → 8.4 GB），但初版
+   `matmul_gptq` 只有标量 ref，结果 **prefill 反而慢 3.5×**（expert_ffn
+   25.14s vs 逐 token 4.50s）。补 NEON 版才转正到 1.44×。
+   **教训：做"减少 I/O"的优化前，先确认计算侧不会因为换实现而变慢。**
+   逐 token 路径用的是优化过的 `matvec_gptq_neon`，批量路径若退回标量就等于
+   用 5× 计算变慢换 96% I/O 降幅 —— 净亏。
+31. **列主序矩阵不能对"列"向量化**。`matmul_gptq` 的 X 是列主序 `[K, N]`，
+   元素 (row r, col c) 在 `c*K + r`。**固定 r、变化 c 的步长是 K —— 不连续**。
+   初版误以为 `x[k*N + c]` 对固定 k 连续，实测 generated_ids **完全错**。
+   正确的向量化方向是 **o**（qweight 是 `[(K/8), M]`，固定 c8 变化 o 才连续），
+   与 `matvec_gptq_neon` 同构，只是外面多一层列循环。
+   **写 GEMM kernel 前先画清布局：哪个维度在内存里连续，就沿它向量化。**
+32. **批量路径的每个张量都要按自身 dtype 读**。MoE 批量 prefill 的 router 初版
+   按 fp32 读，但真 checkpoint 的 router 是 **fp16** → 把 fp16 字节当 fp32 解析
+   → 垃圾 → NaN → 输出全 0。坑 #24 同类。
+   **定位手段：逐层插 NaN 检查**（`std::isfinite` 扫描各中间缓冲），首个 NaN
+   出现在 `gate_logits` 就直接锁定 router。比逐行读代码快得多。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

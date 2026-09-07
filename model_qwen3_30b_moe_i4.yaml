@@ -32,6 +32,15 @@ benchmark:
     b2_prefetch_speedup: 1.17x
     b2_prefetch_hit_rate_pct: 7
     b2_prefetch_fallback_rate_pct: 70
+    batch_prefill_min_n: 16
+    batch_prefill_ttft_speedup:
+      n8: 0.97x
+      n32: 1.21x
+      n128: 1.44x
+    batch_prefill_io_reduction_pct:
+      n8: 75
+      n32: 89.5
+      n128: 96.3
     cache_slots_sweep_ms_per_tok:
       slots_0: 344
       slots_4_default: 365
