@@ -312,6 +312,12 @@ namespace tinyqwen {
                 if (ps != nullptr && ps->ready) return ps->w;
                 // 预取失败或槽被复用 → 落到下面的同步路径
             }
+            // 主线程决定自己同步读这个专家：把它从预取队列移除，否则预取线程
+            // 稍后仍会 pread 同一专家 → 同一份数据被读两次。实测这个重复读让
+            // bytes_read 涨 1.87×（39.6 GB vs 21.2 GB），白白消耗 SSD 带宽与寿命。
+            for (auto it = pf_queue_.begin(); it != pf_queue_.end(); ++it) {
+                if (*it == key) { pf_queue_.erase(it); break; }
+            }
             stats_.pf_fallbacks++;
         }
 
