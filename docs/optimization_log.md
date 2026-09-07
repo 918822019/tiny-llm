@@ -3632,6 +3632,46 @@ MPS f16，慢 13–17%；但 **lm_head 的 N=1 GEMV（M=151936）快 2.92×**。
 
 ---
 
+### B-1 合并三块 pread：decode 538→365 ms/tok（1.47×，累计 25.1×）（2026-09-07）
+
+- **优化栈**：… + GPTQ NEON matvec + embed 卸载 + 保留源 fp16 + **B-1 单次 pread**
+- **是什么**：专家权重 gate/up/down 在文件内**连续**（exporter 按 gate_proj →
+  up_proj → down_proj 顺序写入同一专家，卸载张量保留原始文件偏移，块间仅 64B
+  对齐填充），故三次 pread 可合并成一次：syscall 3→1，且单次大顺序读更容易
+  打满 NVMe 带宽。
+- **假设**：I/O 是带宽受限（实测 4.45 GB/s = NVMe 峰值 74%），合并读能把带宽
+  推向峰值 → 预估 1.19×
+- **结果**：
+
+  | | B-1 前 | **B-1 后** | 加速 |
+  |---|---|---|---|
+  | decode (slots=4) | 538 ms/tok | **365 ms/tok** | **1.47×** |
+  | decode (slots=0) | 633 ms/tok | **344 ms/tok** | **1.84×** |
+  | expert_load (I/O) | 5.11s (60.5%) | **2.71s (45.1%)** | **-47%** |
+  | 有效带宽 | ~2.6 GB/s | **~5.0 GB/s** | ≈ NVMe 峰值 83% |
+
+  **累计 vs ref 基线：9157 → 365 ms/tok = 25.1×**
+- **验证**：generated_ids 与优化前**完全一致**
+  （`13 358 2776 4460 311 11625 419 3491 25 362 220 16 15 15 15 20972`），
+  190 单测全过。
+- **意外 / 教训**：
+  1. **实际收益 1.47× 高于预估 1.19×**。预估只算了"把带宽推向峰值"，漏了
+     syscall 次数从 3 降到 1 本身的收益（每 token 384 次专家加载 × 2 次省下的
+     syscall = 768 次）。**估算 I/O 优化收益时要同时算带宽与 syscall 两项。**
+  2. **I/O 占比从 60.5% 降到 45.1%**，说明带宽确实被推近了峰值（83%）。剩余
+     I/O 已接近硬件下限，B-2 异步预取的收益空间相应收窄——需重估（见下）。
+- **复现**：
+  ```bash
+  ./scripts/verify.sh                                   # 190 单测
+  for s in 4 0; do   # 3 次取 min，见坑 #7
+    ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4_fp16.tqwen \
+      --tokens 9707,11,358,1229,9826,105129,12 --max-new-tokens 8 --max-seq-len 32 \
+      --moe-ssd --moe-expert-cache-slots $s --matvec-impl neon --profile-out /tmp/p.json
+  done
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）
