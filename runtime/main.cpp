@@ -480,6 +480,9 @@ int main(int argc, char **argv) {
         if (!tinyqwen::set_matvec_f16_impl_by_name("neon_mt_kv_nt")) {
             tinyqwen::set_matvec_f16_impl_by_name("ref");
         }
+        // 批量 GEMM（MoE 批量 prefill）用 NEON 版；标量 ref 会让 prefill
+        // 反而比逐 token 慢 3.5×（实测 expert_ffn 25.14s vs 4.50s）。
+        tinyqwen::set_matmul_gptq_impl_by_name("neon");
         std::fprintf(stderr,
                      "[init] matvec impl: %s (gptq4 weights, group=%u; router/lm_head f32: %s)\n",
                      tinyqwen::matvec_gptq_impl_name(), file.config().quant_group_size,

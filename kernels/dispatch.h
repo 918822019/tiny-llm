@@ -252,6 +252,17 @@ namespace tinyqwen {
     void matmul_i4(const uint8_t *w, const float *x, float *y,
                    int M, int K, int N, int group_size);             // 通用入口
 
+    // GPTQ matmul 签名（与 matmul_i4 同形状约定：Y[M,N]=W[M,K]×X[K,N]，
+    // X/Y 列主序，每列一个 token）。MoE 批量 prefill 用：同一专家权重被多个
+    // token 共享，一次加载 + 一次 GEMM，而非逐 token 各读一次盘。
+    using MatmulGPTQFn = void (*)(const uint8_t *w, const float *x, float *y,
+                                  int M, int K, int N, int group_size);
+    void register_matmul_gptq_impl(const char *name, MatmulGPTQFn fn);
+    bool set_matmul_gptq_impl_by_name(const char *name);
+    const char *matmul_gptq_impl_name();
+    void matmul_gptq(const uint8_t *w, const float *x, float *y,
+                     int M, int K, int N, int group_size);           // 通用入口
+
     // ================================================================
     // Matmul 自注册宏
     // ================================================================
@@ -266,6 +277,10 @@ namespace tinyqwen {
 #define TINYQWEN_MATMUL_I4_VARIANT(fn, name)                                           \
     [[maybe_unused]] static const bool tqwen_reg_mm_i4_## fn =                          \
             (tinyqwen::register_matmul_i4_impl(name, fn), true)
+
+#define TINYQWEN_MATMUL_GPTQ_VARIANT(fn, name)                                         \
+    [[maybe_unused]] static const bool tqwen_reg_mm_gptq_## fn =                        \
+            (tinyqwen::register_matmul_gptq_impl(name, fn), true)
 
     // ================================================================
     // 非 matvec 算子分发（ops dispatch）

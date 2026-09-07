@@ -92,6 +92,12 @@ namespace tinyqwen {
         // 掉进下面 Qwen2 的批量路径——那条路径算的是 dense SwiGLU 而非 MoE，
         // 不报错但结果全错。
         if (cfg_.is_moe()) {
+            // 批量路径优先：按专家分组，每专家只加载一次（省 ~50% I/O）
+            if (batch_prefill_enabled_) {
+                const int r = forward_prefill_moe_batch(token_ids, n, nullptr, 0);
+                if (r != -2) return r;
+                // fallthrough：逐 token 回退
+            }
             int last = -1;
             for (int i = 0; i < n; ++i)
                 last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k,
@@ -184,6 +190,7 @@ namespace tinyqwen {
         // =====================================================================
         // Step 2: 逐层循环（Transformer 层）
         // =====================================================================
+
         char name[64]; // profiler 作用域名的栈上缓冲区，避免每次分配 std::string
         for (uint32_t li = 0; li < cfg_.n_layers; ++li) {
             const LayerWeights &w = layers_[li];
@@ -404,6 +411,331 @@ namespace tinyqwen {
         ppl_mode_ = false;
         if (out_count) *out_count = ppl_count_;
         return ppl_count_ > 0 ? -ppl_sum_logprob_ / static_cast<double>(ppl_count_) : 0.0;
+    }
+
+    // =====================================================================
+    // QwenModel::forward_prefill_moe_batch() — MoE 批量 prefill
+    // =====================================================================
+    // 逐 token prefill 的浪费：同一专家被多个 token 重复选中，却每次都重新读盘、
+    // 各算一次 matvec。实测 n=32 时 bytes_read 57.4 GB、hits=0（零复用）。
+    //
+    // 本路径改为**按专家分组**：router 算完全部 N token → 按专家归组 → 每专家
+    // 只加载一次 → 对其所有 token 做一次 batch GEMM → 按 topk 权重散回各 token。
+    //
+    // 批量的部分：qkv_proj / o_proj / router / 专家 FFN（都走 matmul_gptq）。
+    // 顺序的部分：rope / kv_append / causal attention（token i 只看 0..i，
+    // 必须顺序扫描；但 attention 只占 0.5%，不影响收益）。
+    //
+    // 返回最后一个 token 的 argmax；无法处理时返回 -2 让调用方回退逐 token。
+    int QwenModel::forward_prefill_moe_batch(const int *token_ids, int n,
+                                             int *topk, int topk_k) {
+        if (!cfg_.is_moe() || n <= 0) return -2;
+        // 专家权重必须是 GPTQ（matmul_gptq 只支持该布局）
+        if (expert_dtype_ != Dtype::kGPTQ4) return -2;
+        // 小 n 时批处理的固定开销（缓冲分配、每列重算 sx8）超过专家复用收益：
+        // 实测 n=8 批处理 0.97×（略慢），n=32 才 1.21×，n=128 达 1.44×。
+        // 复用收益随 n 增长（每层 n×8 次选择从 128 个专家里挑，重叠率随 n 升）。
+        constexpr int kMoEBatchPrefillMinN = 16;
+        if (n < kMoEBatchPrefillMinN) return -2;
+
+        Profiler &prof = *profiler_;
+        const int hidden = cfg_.hidden_size;
+        const int head_dim = static_cast<int>(cfg_.head_dim);
+        const int N = n;
+        const size_t hN = static_cast<size_t>(hidden) * N;
+        char name[64];
+        const auto scope = [&](const char *fmt, int layer) {
+            std::snprintf(name, sizeof(name), fmt, layer);
+            return name;
+        };
+
+        // 缓冲（prefill 只跑一次，分配开销可忽略）
+        std::vector<float> hid(hN), normed(hN), out(hN);
+        std::vector<float> qkv_buf(static_cast<size_t>(q_dim_ + 2 * kv_dim_) * N);
+        std::vector<float> attn_buf(static_cast<size_t>(q_dim_) * N);
+        std::vector<float> gate_logits(static_cast<size_t>(n_experts_) * N);
+        std::vector<float> ffn_acc(hN, 0.0f);
+        std::vector<int> topk_idx(static_cast<size_t>(experts_per_tok_) * N);
+        std::vector<float> topk_w(static_cast<size_t>(experts_per_tok_) * N);
+        // 专家分组用
+        std::vector<std::vector<int>> groups(static_cast<size_t>(n_experts_));
+        std::vector<float> X_g, gate_g, up_g, down_g;
+
+        // ---- Step 1: 词嵌入 ----
+        {
+            ScopedTimer t(prof, "prefill_embed");
+            for (int c = 0; c < N; ++c) {
+                const int tid = token_ids[c];
+                float *dst = hid.data() + static_cast<size_t>(c) * hidden;
+                if (embed_file_offset_ != 0) {
+                    const size_t row_bytes = static_cast<size_t>(hidden) *
+                                             (embed_dtype_ == Dtype::kF16 ? 2 : 4);
+                    if (!expert_store_ ||
+                        !expert_store_->read_bytes(
+                            embed_file_offset_ + static_cast<uint64_t>(tid) * row_bytes,
+                            row_bytes, embed_row_.data())) {
+                        std::fprintf(stderr,
+                                     "tinyqwen: embed 卸载 pread 失败 (token=%d)\n", tid);
+                        std::abort();
+                    }
+                    if (embed_dtype_ == Dtype::kF16) {
+                        const uint16_t *row =
+                            reinterpret_cast<const uint16_t *>(embed_row_.data());
+                        for (int j = 0; j < hidden; ++j) dst[j] = half_to_float(row[j]);
+                    } else {
+                        std::memcpy(dst, embed_row_.data(), hidden * sizeof(float));
+                    }
+                } else if (embed_dtype_ == Dtype::kF32) {
+                    std::memcpy(dst, static_cast<const float *>(embed_) +
+                                         static_cast<size_t>(tid) * hidden,
+                                hidden * sizeof(float));
+                } else if (embed_dtype_ == Dtype::kF16) {
+                    const uint16_t *row = static_cast<const uint16_t *>(embed_) +
+                                          static_cast<size_t>(tid) * hidden;
+                    for (int j = 0; j < hidden; ++j) dst[j] = half_to_float(row[j]);
+                } else {
+                    return -2;   // i4 embed 暂不支持批量路径
+                }
+            }
+        }
+
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        // ---- Step 2: 逐层 ----
+        for (int i = 0; i < cfg_.n_layers; ++i) {
+            const LayerWeights &w = layers_[static_cast<size_t>(i)];
+
+            // 2a. input_layernorm（逐 token）
+            {
+                ScopedTimer t(prof, scope("layer_%d.input_layernorm", i));
+                for (int c = 0; c < N; ++c) {
+                    backend_->rmsnorm(hid.data() + static_cast<size_t>(c) * hidden,
+                                      w.input_ln,
+                                      normed.data() + static_cast<size_t>(c) * hidden,
+                                      hidden, cfg_.rms_norm_eps);
+                }
+            }
+
+            // 2b. qkv_proj：批量 GEMM（权重每层只读一遍）
+            {
+                ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
+                const int qkv_out = q_dim_ + 2 * kv_dim_;
+                // 三次独立 GEMM 写进同一缓冲的不同区段（列主序：每投影占 N 列）
+                matmul_gptq(static_cast<const uint8_t *>(w.q_proj), normed.data(),
+                            qkv_buf.data(), q_dim_, hidden, N, gptq_group_size_);
+                matmul_gptq(static_cast<const uint8_t *>(w.k_proj), normed.data(),
+                            qkv_buf.data() + static_cast<size_t>(q_dim_) * N,
+                            kv_dim_, hidden, N, gptq_group_size_);
+                matmul_gptq(static_cast<const uint8_t *>(w.v_proj), normed.data(),
+                            qkv_buf.data() + static_cast<size_t>(q_dim_ + kv_dim_) * N,
+                            kv_dim_, hidden, N, gptq_group_size_);
+                (void)qkv_out;
+            }
+
+            // 2c. rope + kv_append + causal attention（顺序扫描，token i 只看 0..i）
+            {
+                ScopedTimer t(prof, scope("layer_%d.attention", i));
+                for (int c = 0; c < N; ++c) {
+                    float *qc = qkv_buf.data() + static_cast<size_t>(c) * q_dim_;
+                    float *kc = qkv_buf.data() + static_cast<size_t>(N) * q_dim_ +
+                                static_cast<size_t>(c) * kv_dim_;
+                    float *vc = qkv_buf.data() + static_cast<size_t>(N) * (q_dim_ + kv_dim_) +
+                                static_cast<size_t>(c) * kv_dim_;
+                    if (w.q_norm) {
+                        for (int h = 0; h < cfg_.n_heads; ++h)
+                            backend_->rmsnorm(qc + h * head_dim, w.q_norm,
+                                              qc + h * head_dim, head_dim,
+                                              cfg_.rms_norm_eps);
+                        for (int h = 0; h < cfg_.n_kv_heads; ++h)
+                            backend_->rmsnorm(kc + h * head_dim, w.k_norm,
+                                              kc + h * head_dim, head_dim,
+                                              cfg_.rms_norm_eps);
+                    }
+                    backend_->rope(qc, kc, cfg_.n_heads, cfg_.n_kv_heads, head_dim,
+                                   c, cfg_.rope_theta);
+                    // 必须先 write_token 再 attend：当前 token 要能看到自己
+                    kv_.write_token(i, c, kc, vc);
+                    attention_kv(qc, i, c + 1, cfg_.n_heads, cfg_.n_kv_heads,
+                                 head_dim, attn_scale,
+                                 attn_buf.data() + static_cast<size_t>(c) * q_dim_);
+                }
+            }
+
+            // 2d. o_proj：批量 GEMM + 残差
+            {
+                ScopedTimer t(prof, scope("layer_%d.o_proj", i));
+                matmul_gptq(static_cast<const uint8_t *>(w.o_proj), attn_buf.data(),
+                            out.data(), hidden, q_dim_, N, gptq_group_size_);
+                for (size_t j = 0; j < hN; ++j) hid[j] += out[j];
+            }
+
+            // 2e. post_attn_layernorm（逐 token）
+            {
+                ScopedTimer t(prof, scope("layer_%d.post_attn_layernorm", i));
+                for (int c = 0; c < N; ++c) {
+                    backend_->rmsnorm(hid.data() + static_cast<size_t>(c) * hidden,
+                                      w.post_ln,
+                                      normed.data() + static_cast<size_t>(c) * hidden,
+                                      hidden, cfg_.rms_norm_eps);
+                }
+            }
+
+            // 2f. router：批量 GEMM → gate_logits [n_experts, N]
+            {
+                ScopedTimer t(prof, scope("layer_%d.moe_router", i));
+                if (moe_router_dtype_ == Dtype::kGPTQ4) {
+                    matmul_gptq(static_cast<const uint8_t *>(w.moe_router), normed.data(),
+                                gate_logits.data(), n_experts_, hidden, N,
+                                gptq_group_size_);
+                } else {
+                    // router 按**自身 dtype** 逐 token matvec（router 很小，占比 0.1%）。
+                    // 真 checkpoint 的 router 是 fp16——按 fp32 读会把 fp16 字节当
+                    // fp32 解析，得到垃圾并产生 NaN（AGENTS.md 坑 #24 同类）。
+                    for (int c = 0; c < N; ++c) {
+                        float *dst = gate_logits.data() +
+                                     static_cast<size_t>(c) * n_experts_;
+                        const float *src = normed.data() + static_cast<size_t>(c) * hidden;
+                        if (moe_router_dtype_ == Dtype::kF16) {
+                            matvec_f16(static_cast<const uint16_t *>(w.moe_router),
+                                       src, dst, n_experts_, hidden);
+                        } else {
+                            matvec_f32(static_cast<const float *>(w.moe_router),
+                                       src, dst, n_experts_, hidden);
+                        }
+                    }
+                }
+            }
+
+            // 2g. topk（逐 token）+ 按专家分组
+            {
+                ScopedTimer t(prof, scope("layer_%d.topk_softmax", i));
+                for (size_t e = 0; e < groups.size(); ++e) groups[e].clear();
+                for (int c = 0; c < N; ++c) {
+                    int *idx = topk_idx.data() + static_cast<size_t>(c) * experts_per_tok_;
+                    float *wt = topk_w.data() + static_cast<size_t>(c) * experts_per_tok_;
+                    backend_->topk_softmax(
+                        gate_logits.data() + static_cast<size_t>(c) * n_experts_,
+                        n_experts_, experts_per_tok_, idx, wt);
+                    for (int t = 0; t < experts_per_tok_; ++t) {
+                        groups[static_cast<size_t>(idx[t])].push_back(c);
+                    }
+                }
+            }
+
+            // 2h. 共享专家（若有）：批量 GEMM
+            if (cfg_.has_shared_expert()) {
+                ScopedTimer t(prof, scope("layer_%d.shared_ffn", i));
+                std::vector<float> sg(static_cast<size_t>(shared_inter_) * N);
+                std::vector<float> su(static_cast<size_t>(shared_inter_) * N);
+                matmul_gptq(static_cast<const uint8_t *>(w.moe_shared_gate), normed.data(),
+                            sg.data(), shared_inter_, hidden, N, gptq_group_size_);
+                matmul_gptq(static_cast<const uint8_t *>(w.moe_shared_up), normed.data(),
+                            su.data(), shared_inter_, hidden, N, gptq_group_size_);
+                for (int c = 0; c < N; ++c) {
+                    backend_->swiglu(sg.data() + static_cast<size_t>(c) * shared_inter_,
+                                     su.data() + static_cast<size_t>(c) * shared_inter_,
+                                     shared_inter_);
+                }
+                matmul_gptq(static_cast<const uint8_t *>(w.moe_shared_down), sg.data(),
+                            ffn_acc.data(), hidden, shared_inter_, N, gptq_group_size_);
+            } else {
+                for (size_t j = 0; j < hN; ++j) ffn_acc[j] = 0.0f;
+            }
+
+            // 2i. 路由专家：**按专家分组，每专家只加载一次 + 一次 batch GEMM**
+            {
+                ScopedTimer t(prof, scope("layer_%d.expert_ffn", i));
+                for (int e = 0; e < n_experts_; ++e) {
+                    const std::vector<int> &toks = groups[static_cast<size_t>(e)];
+                    if (toks.empty()) continue;      // 本层没有 token 选中该专家
+                    const int M = static_cast<int>(toks.size());
+
+                    const uint8_t *eg, *eu, *ed;
+                    if (moe_ssd_) {
+                        const ExpertWeights ew =
+                            expert_store_->get(i, e);   // 整层只读一次
+                        eg = ew.gate; eu = ew.up; ed = ew.down;
+                    } else {
+                        eg = static_cast<const uint8_t *>(w.moe_experts[e].gate);
+                        eu = static_cast<const uint8_t *>(w.moe_experts[e].up);
+                        ed = static_cast<const uint8_t *>(w.moe_experts[e].down);
+                    }
+
+                    // gather：把该专家的 token 的 normed 向量拼成 X_g [hidden, M]
+                    X_g.resize(static_cast<size_t>(hidden) * M);
+                    for (int m = 0; m < M; ++m) {
+                        std::memcpy(X_g.data() + static_cast<size_t>(m) * hidden,
+                                    normed.data() +
+                                        static_cast<size_t>(toks[m]) * hidden,
+                                    hidden * sizeof(float));
+                    }
+
+                    gate_g.resize(static_cast<size_t>(moe_inter_) * M);
+                    up_g.resize(static_cast<size_t>(moe_inter_) * M);
+                    matmul_gptq(eg, X_g.data(), gate_g.data(), moe_inter_, hidden, M,
+                                gptq_group_size_);
+                    matmul_gptq(eu, X_g.data(), up_g.data(), moe_inter_, hidden, M,
+                                gptq_group_size_);
+                    // 列主序下每列天然连续，swiglu 可直接按列调用
+                    for (int m = 0; m < M; ++m) {
+                        backend_->swiglu(gate_g.data() + static_cast<size_t>(m) * moe_inter_,
+                                         up_g.data() + static_cast<size_t>(m) * moe_inter_,
+                                         moe_inter_);
+                    }
+                    down_g.resize(hN > 0 ? static_cast<size_t>(hidden) * M : 0);
+                    matmul_gptq(ed, gate_g.data(), down_g.data(), hidden, moe_inter_, M,
+                                gptq_group_size_);
+
+                    // scatter：按 topk 权重累加回各 token
+                    for (int m = 0; m < M; ++m) {
+                        const int c = toks[m];
+                        // 找到该 token 选中专家 e 的位置以取权重
+                        const int *idx = topk_idx.data() +
+                                         static_cast<size_t>(c) * experts_per_tok_;
+                        const float *wt = topk_w.data() +
+                                          static_cast<size_t>(c) * experts_per_tok_;
+                        float w_e = 0.0f;
+                        for (int t = 0; t < experts_per_tok_; ++t) {
+                            if (idx[t] == e) { w_e = wt[t]; break; }
+                        }
+                        float *acc = ffn_acc.data() + static_cast<size_t>(c) * hidden;
+                        const float *src = down_g.data() + static_cast<size_t>(m) * hidden;
+                        for (int j = 0; j < hidden; ++j) acc[j] += w_e * src[j];
+                    }
+                }
+            }
+
+            // 2j. 残差
+            {
+                ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
+                for (size_t j = 0; j < hN; ++j) hid[j] += ffn_acc[j];
+            }
+        }
+
+        // ---- Step 3: final norm + lm_head（只算最后一列）----
+        int last = -1;
+        {
+            ScopedTimer t(prof, "final_norm");
+            backend_->rmsnorm(hid.data() + static_cast<size_t>(N - 1) * hidden,
+                              final_norm_, normed_.data(), hidden, cfg_.rms_norm_eps);
+        }
+        {
+            ScopedTimer t(prof, "lm_head");
+            if (lm_head_dtype_ == Dtype::kGPTQ4) {
+                matvec_gptq(static_cast<const uint8_t *>(lm_head_), normed_.data(),
+                            logits_.data(), cfg_.vocab_size, hidden, gptq_group_size_);
+            } else if (lm_head_dtype_ == Dtype::kF16) {
+                matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
+                           logits_.data(), cfg_.vocab_size, hidden);
+            } else {
+                matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                           logits_.data(), cfg_.vocab_size, hidden);
+            }
+            last = backend_->argmax(logits_.data(), cfg_.vocab_size);
+        }
+        kv_.advance(N);
+        (void)topk; (void)topk_k;   // 批量路径不输出 topk（prefill 只需末位 argmax）
+        return last;
     }
 
 } // namespace tinyqwen

@@ -101,6 +101,8 @@ add_library(tinyqwen_kernels OBJECT
         matvec/matvec_i4_sdot5.cpp
         matvec/matmul_ref.cpp
         matvec/matmul_i4_ref.cpp
+        matvec/matmul_gptq_ref.cpp
+        matvec/matmul_gptq_neon.cpp
         # Qwen3.5 Gated DeltaNet（GDN）算子：l2norm / causal conv1d 单步 /
         # gated delta rule 递归步 / 门控 RMSNorm / partial RoPE（v2 新增）。
         gdn/gdn_ops_ref.cpp

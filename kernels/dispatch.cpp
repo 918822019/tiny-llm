@@ -617,6 +617,14 @@ namespace tinyqwen {
             return r;
         }
         MatmulI4Fn g_mm_i4_current = nullptr;  // 当前 INT4 matmul 选择
+
+        // GPTQ matmul 注册表
+        std::unordered_map<std::string, MatmulGPTQFn> &mm_gptq_registry() {
+            static std::unordered_map<std::string, MatmulGPTQFn> r;
+            return r;
+        }
+        MatmulGPTQFn g_mm_gptq_current = nullptr;
+        const char *g_mm_gptq_name = "ref";
     } // namespace
 
     // 注册 matmul f32 实现；首次注册自动设为默认
@@ -649,6 +657,28 @@ namespace tinyqwen {
     void matmul_i4(const uint8_t *w, const float *x, float *y,
                    int M, int K, int N, int group_size) {
         g_mm_i4_current(w, x, y, M, K, N, group_size);
+    }
+
+    // ---- GPTQ matmul 分发 ----
+    void register_matmul_gptq_impl(const char *name, MatmulGPTQFn fn) {
+        mm_gptq_registry()[name] = fn;
+        if (!g_mm_gptq_current) g_mm_gptq_current = fn;   // 首个注册的成为默认
+    }
+
+    bool set_matmul_gptq_impl_by_name(const char *name) {
+        auto &r = mm_gptq_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_mm_gptq_current = it->second;
+        g_mm_gptq_name = it->first.c_str();
+        return true;
+    }
+
+    const char *matmul_gptq_impl_name() { return g_mm_gptq_name; }
+
+    void matmul_gptq(const uint8_t *w, const float *x, float *y,
+                     int M, int K, int N, int group_size) {
+        g_mm_gptq_current(w, x, y, M, K, N, group_size);
     }
 
     // ====================================================================

@@ -381,3 +381,82 @@ TEST(matvec_gptq_neon_perm_gidx) {
     check_gptq_perm("neon_mt", 48, 128, 32, 1e-2);
     check_gptq_perm("neon_mt", 768, 2048, 128, 1e-2);
 }
+
+// ============================================================================
+// matmul_gptq（批量 GEMM，MoE 批量 prefill 用）
+// ============================================================================
+// 关键契约：N=1 时必须与 matvec_gptq **逐位一致**（同一反量化语义、同一 double
+// 累加顺序）。若不一致说明列主序约定或 sx8 预算写错了——那会让批量 prefill
+// 静默算错。
+
+TEST(matmul_gptq_n1_matches_matvec) {
+    const int out_dim = 32, in_dim = 64, gs = 16;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 42);
+    const std::vector<float> x = random_vec(in_dim, 7);
+    const std::vector<uint8_t> buf = pack_gptq(w, out_dim, in_dim, gs, false);
+
+    std::vector<float> y_mv(out_dim, 0.0f), y_mm(out_dim, 0.0f);
+    tinyqwen::matvec_gptq(buf.data(), x.data(), y_mv.data(), out_dim, in_dim, gs);
+    // X 列主序、N=1：第 0 列就是 x 本身
+    tinyqwen::matmul_gptq(buf.data(), x.data(), y_mm.data(), out_dim, in_dim, 1, gs);
+
+    // 相对容差：matvec 把 (nib-z)*s 先算成 float 再乘 x，matmul 全程 double，
+    // 故两者差 ~1e-7 相对（fp32 舍入量级）。matmul 实际更精确。
+    for (int i = 0; i < out_dim; ++i) {
+        const float tol = std::max(1e-5f, std::fabs(y_mv[i]) * 1e-5f);
+        EXPECT_NEAR(y_mv[i], y_mm[i], tol);
+    }
+}
+
+TEST(matmul_gptq_multi_token) {
+    const int out_dim = 24, in_dim = 64, gs = 16, N = 5;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 99);
+    const std::vector<uint8_t> buf = pack_gptq(w, out_dim, in_dim, gs, false);
+
+    // X 列主序 [in_dim, N]：第 col 列 = 第 col 个 token 的向量
+    std::vector<float> X(static_cast<size_t>(in_dim) * N);
+    for (int col = 0; col < N; ++col) {
+        const std::vector<float> xc = random_vec(in_dim, 100 + col);
+        for (int k = 0; k < in_dim; ++k)
+            X[static_cast<size_t>(col) * in_dim + k] = xc[k];
+    }
+
+    // Y 列主序 [out_dim, N]
+    std::vector<float> Y(static_cast<size_t>(out_dim) * N, 0.0f);
+    tinyqwen::matmul_gptq(buf.data(), X.data(), Y.data(), out_dim, in_dim, N, gs);
+
+    // 逐列与 matvec_gptq 对比：每列必须等于对该 token 单独做 matvec 的结果
+    for (int col = 0; col < N; ++col) {
+        std::vector<float> y_ref(out_dim, 0.0f);
+        tinyqwen::matvec_gptq(buf.data(), X.data() + static_cast<size_t>(col) * in_dim,
+                              y_ref.data(), out_dim, in_dim, gs);
+        for (int o = 0; o < out_dim; ++o) {
+            const float tol = std::max(1e-5f, std::fabs(y_ref[o]) * 1e-5f);
+            EXPECT_NEAR(Y[static_cast<size_t>(col) * out_dim + o], y_ref[o], tol);
+        }
+    }
+}
+
+TEST(matmul_gptq_with_gidx) {
+    // 带 contiguous g_idx 的布局也必须正确
+    const int out_dim = 32, in_dim = 64, gs = 16, N = 3;
+    const std::vector<float> w = random_vec(static_cast<size_t>(out_dim) * in_dim, 55);
+    const std::vector<uint8_t> buf = pack_gptq(w, out_dim, in_dim, gs, true);
+    std::vector<float> X(static_cast<size_t>(in_dim) * N);
+    for (int col = 0; col < N; ++col) {
+        const std::vector<float> xc = random_vec(in_dim, 200 + col);
+        for (int k = 0; k < in_dim; ++k)
+            X[static_cast<size_t>(col) * in_dim + k] = xc[k];
+    }
+    std::vector<float> Y(static_cast<size_t>(out_dim) * N, 0.0f);
+    tinyqwen::matmul_gptq(buf.data(), X.data(), Y.data(), out_dim, in_dim, N, gs);
+    for (int col = 0; col < N; ++col) {
+        std::vector<float> y_ref(out_dim, 0.0f);
+        tinyqwen::matvec_gptq(buf.data(), X.data() + static_cast<size_t>(col) * in_dim,
+                              y_ref.data(), out_dim, in_dim, gs);
+        for (int o = 0; o < out_dim; ++o) {
+            const float tol = std::max(1e-5f, std::fabs(y_ref[o]) * 1e-5f);
+            EXPECT_NEAR(Y[static_cast<size_t>(col) * out_dim + o], y_ref[o], tol);
+        }
+    }
+}

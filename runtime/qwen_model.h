@@ -192,6 +192,23 @@ namespace tinyqwen {
         int forward_prefill_qwen35_batch(const int *token_ids, int n,
                                          TopKResult *topk = nullptr, int topk_k = 5);
 
+        // ---------------------------------------------------------------------
+        // forward_prefill_moe_batch: MoE 批量 prefill（按专家分组）
+        //
+        // 逐 token prefill 的浪费：同一专家被多个 token 重复选中，却每次都重新
+        // 读盘、各算一次 matvec（实测 n=32 时 bytes_read 57.4 GB、hits=0）。
+        // 本路径改为按专家分组：router 算完全部 N token → 按专家归组 → 每专家
+        // 只加载一次 → 对其所有 token 做一次 batch GEMM → 按 topk 权重散回。
+        //
+        // 批量：qkv_proj / o_proj / router / 专家 FFN（走 matmul_gptq）。
+        // 顺序：rope / kv_append / causal attention（token i 只看 0..i）。
+        //
+        // 返回值: 末位 prompt token 的 greedy 下一 token；-2 = 无法处理
+        // （专家非 GPTQ / n<=0），调用方回退逐 token 路径。
+        // ---------------------------------------------------------------------
+        int forward_prefill_moe_batch(const int *token_ids, int n,
+                                      int *topk = nullptr, int topk_k = 0);
+
         // 批量 prefill 的最小 token 数（低于此值走逐 token）。
         // 反量化全部权重到 fp32 是一笔固定开销（单线程，~0.7s @4B），
         // 需要足够多的 token 才能摊平。4B 实测 crossover ≈ 30 token：
