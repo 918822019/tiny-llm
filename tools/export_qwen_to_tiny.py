@@ -43,8 +43,11 @@ from pathlib import Path  # 路径操作
 # 必须与 runtime/tiny_format.h 保持一致 -------------------------------
 # 文件魔数，用于快速识别 .tqwen 文件格式
 MAGIC = b"TINYQWEN"
-# 当前最高支持的格式版本号；v2 增加了 Qwen3.5 混合架构扩展字段
-FORMAT_VERSION = 2  # 当前最高版本（v1 文件布局不变，按 model_type 选择）
+# 当前最高支持的格式版本号：
+#   v2 = Qwen3.5 混合架构扩展字段（reserved 前 64B = TinyHeaderV2Ext）
+#   v3 = MoE + GPTQ 扩展字段（reserved 后 32B = TinyHeaderV3Ext；V2Ext 布局不变）
+#   v1/v2 文件仍可加载（FORMAT_VERSION_MIN=1，向后兼容）
+FORMAT_VERSION = 3  # 当前最高版本
 # 最低兼容版本号
 FORMAT_VERSION_MIN = 1
 # 所有数据区的对齐粒度（字节），保证 SIMD 加载时地址对齐

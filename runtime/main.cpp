@@ -67,6 +67,8 @@ namespace {
         bool no_fuse_qkv = false;       // 禁用 Q/K/V 投影融合
         bool no_batch_prefill = false;  // 禁用 Qwen3.5 批量 prefill（A/B 对照用）
         bool kv_fp16 = false;           // KV cache 用 fp16 存储（内存/带宽减半，opt-in）
+        bool moe_ssd = false;           // MoE：路由专家走 SSD 卸载（ExpertStore pread+LRU）
+        int moe_cache_slots = 4;       // MoE 专家 LRU 缓存槽数（0 = 全 miss）
         bool ppl = false;               // PPL 模式：teacher-forcing 困惑度（不生成）
         std::string ppl_jsonl;          // PPL 多序列输入 JSONL（每行 {"tokens": [...]}）
         std::string config;             // 配置文件路径（可选）
@@ -101,6 +103,11 @@ namespace {
                      "                          argmax): ref (default) / neon\n"
                      "  --kv-f16                store KV cache in fp16 (halves KV memory + attn\n"
                      "                          read bandwidth; store fp16, compute fp32)\n"
+                     "  --moe-ssd               MoE: route experts via SSD offload (ExpertStore\n"
+                     "                          pread + LRU) instead of resident pointers\n"
+                     "  --moe-expert-cache-slots N\n"
+                     "                          MoE expert LRU slots (0 = every expert re-pread;\n"
+                     "                          default 4)\n"
                      "  --engine NAME           engine: '' = CPU forward (default) / cuda (decode) / metal (prefill)\n"
                      "                          (GPU-resident whole-forward; requires CUDA build)\n"
                      "  --backend NAME          compute backend: '' = CPU (default) / cuda\n"
@@ -145,6 +152,8 @@ namespace {
             else if (a == "--no-fuse-qkv") out->no_fuse_qkv = true;
             else if (a == "--no-batch-prefill") out->no_batch_prefill = true;
             else if (a == "--kv-f16") out->kv_fp16 = true;
+            else if (a == "--moe-ssd") out->moe_ssd = true;
+            else if (a == "--moe-expert-cache-slots") out->moe_cache_slots = std::atoi(value("--moe-expert-cache-slots").c_str());
             else if (a == "--verbose") out->verbose = true;
             else if (a == "--help" || a == "-h") {
                 usage(argv[0]);
@@ -412,11 +421,28 @@ int main(int argc, char **argv) {
     }
 
     // ---- 建模：校验权重、分配 KV cache 和 workspace ----
+    // MoE：ExpertStore 在 create() 之前打开（create 注册专家 offset 进去），
+    // 运行时由 --moe-ssd 决定走 pread 还是 resident 指针。
+    tinyqwen::ExpertStore expert_store;
+    if (file.config().is_moe()) {
+        if (!expert_store.open(args.model, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        expert_store.set_cache_slots(args.moe_cache_slots);
+    }
     std::unique_ptr<tinyqwen::QwenModel> model;
     if (!tinyqwen::QwenModel::create(file, args.max_seq_len, profiler, &err, &model,
-                                     std::move(backend), args.kv_fp16)) {
+                                     std::move(backend), args.kv_fp16,
+                                     file.config().is_moe() ? &expert_store : nullptr)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
+    }
+    if (file.config().is_moe()) {
+        model->set_moe_ssd(args.moe_ssd);
+        std::fprintf(stderr, "[init] moe: experts=%d per_tok=%d ssd=%s cache_slots=%d\n",
+                     model->config().n_routed_experts, model->config().num_experts_per_tok,
+                     args.moe_ssd ? "on" : "off", args.moe_cache_slots);
     }
     std::fprintf(stderr, "[init] kv cache: %.1f MB (max_seq_len=%d)\n",
                  model->kv_cache().memory_bytes() / (1024.0 * 1024.0), args.max_seq_len);
@@ -793,5 +819,12 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[profile] %s\n", args.profile_out.c_str());
     }
     if (logits_out) std::fclose(logits_out);
+    // MoE SSD 卸载统计（命中/miss/淘汰/读字节）——机制归因用
+    if (file.config().is_moe() && args.moe_ssd) {
+        const auto s = model->moe_stats();
+        std::fprintf(stderr,
+                     "[moe] expert cache: hits=%zu misses=%zu evictions=%zu bytes_read=%zu\n",
+                     s.hits, s.misses, s.evictions, s.bytes_read);
+    }
     return 0;
 }

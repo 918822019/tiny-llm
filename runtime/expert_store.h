@@ -1,0 +1,114 @@
+// ============================================================================
+// 文件: expert_store.h
+// 作用: MoE 路由专家的 SSD 卸载存储 —— 按需 pread + LRU 缓存
+//
+// 核心命题（本项目要验证的）：
+//   35B MoE 权重 ~17.5GB 装不进内存；但每个 token 只激活 k 个专家。
+//   把路由专家权重留在 .tqwen 文件（SSD），只有被路由门选中的专家才
+//   pread 进一个固定大小的 LRU 缓存参与计算。未激活的专家永远不进 RAM。
+//
+// 设计要点：
+//   - pread 而非 mmap：mmap 的 readahead 会把未激活专家也读进 page cache，
+//     违背"只读激活专家"的命题；pread 精确只读所需字节。
+//   - LRU 槽缓存：槽数 = 可容纳专家数（每个专家 = gate/up/down 三块）。
+//     命中返零拷贝指针；未命中淘汰最久未用槽 + pread 三块。
+//   - 共享专家 / 路由门 / attention 等不在本 store（resident，在 ModelFile）。
+//
+// 与 ModelFile 的关系：
+//   ModelFile 仍加载 header + tensor 表（含专家 tensor 的元信息），但其
+//   "data_ 整文件缓冲"对专家 tensor 不被 forward 直接引用——forward 只经
+//   ExpertStore::get() 取专家权重。offset/nbytes 在 create() 时由
+//   view.data - file.base() 反推（与 print_summary 同款指针算式）注册。
+//
+// 生命周期：返回的 ExpertWeights 指针指向缓存槽内部缓冲，**仅在当前 forward
+//   步内有效**（下一 token 可能淘汰该槽）。同步 get() 下不跨 token 持有。
+// ============================================================================
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace tinyqwen {
+
+    // 一个被激活专家的三块权重视图（指针指向 ExpertStore 缓存槽内部缓冲）
+    struct ExpertWeights {
+        const uint8_t *gate = nullptr;  // [inter, hidden] GPTQ in-band 块
+        const uint8_t *up = nullptr;    // [inter, hidden]
+        const uint8_t *down = nullptr;  // [hidden, inter]
+    };
+
+    struct ExpertStoreStats {
+        size_t hits = 0;
+        size_t misses = 0;
+        size_t evictions = 0;
+        size_t bytes_read = 0;  // 累计 pread 字节（不含命中的零拷贝）
+    };
+
+    class ExpertStore {
+    public:
+        ExpertStore() = default;
+        ~ExpertStore();
+
+        ExpertStore(const ExpertStore &) = delete;
+        ExpertStore &operator=(const ExpertStore &) = delete;
+
+        // 打开 .tqwen 文件供后续 pread（只读）
+        bool open(const std::string &path, std::string *err);
+
+        // 注册一个专家的三块权重（offset = 文件内绝对偏移，nbytes = 块字节数）。
+        // create() 遍历专家 tensor 调用本函数建表。inter/hidden/group_size 供
+        // 调用方（forward）取维度，store 本身只按 nbytes 读字节。
+        void register_expert(int layer, int expert,
+                             uint64_t gate_off, uint64_t gate_nbytes,
+                             uint64_t up_off, uint64_t up_nbytes,
+                             uint64_t down_off, uint64_t down_nbytes,
+                             int inter, int hidden, int group_size);
+
+        // 设置 LRU 缓存槽数（= 可同时驻留的专家数）。0 = 全 miss（每次都 pread）。
+        void set_cache_slots(int n);
+
+        // 取一个专家的三块权重：命中缓存则零拷贝返回；未命中淘汰 LRU + pread。
+        // 返回的指针指向缓存槽内部，仅在下次淘汰前有效。
+        const ExpertWeights get(int layer, int expert);
+
+        ExpertStoreStats stats() const { return stats_; }
+
+        // 丢弃 page cache（benchmark 测 cold-load 用：pread 后 posix_fadvise DONTNEED）
+        void drop_page_cache();
+
+    private:
+        struct ExpertLayout {
+            uint64_t gate_off, gate_nbytes;
+            uint64_t up_off, up_nbytes;
+            uint64_t down_off, down_nbytes;
+            int inter, hidden, group_size;
+        };
+        struct Slot {
+            int64_t key = -1;     // (layer, expert) 编码；-1 = 空槽
+            uint64_t tick = 0;    // LRU 时戳
+            std::vector<uint8_t> gate, up, down;
+            ExpertWeights w;
+        };
+
+        // (layer, expert) → 唯一 key
+        static int64_t make_key(int layer, int expert) {
+            return (static_cast<int64_t>(layer) << 20) | static_cast<int64_t>(expert & 0xFFFFF);
+        }
+
+        // 从 fd 在 offset 处读 exactly nbytes 字节到 buf（循环 pread，处理短读）
+        bool pread_all(uint64_t offset, size_t nbytes, std::vector<uint8_t> &buf);
+
+        int fd_ = -1;                              // .tqwen 文件描述符（pread 用）
+        std::unordered_map<int64_t, ExpertLayout> layout_map_;
+
+        std::vector<Slot> slots_;
+        std::unordered_map<int64_t, size_t> slot_index_;  // key → slots_ 下标
+        int max_slots_ = 4;
+        uint64_t tick_ = 0;
+        ExpertStoreStats stats_;
+    };
+
+} // namespace tinyqwen

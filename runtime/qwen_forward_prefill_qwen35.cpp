@@ -31,6 +31,7 @@
 
 #include "qwen_model.h"
 
+#include <algorithm>  // std::partial_sort（top_k_logits_pf）
 #include <atomic>     // 反量化线程池的原子行计数 / job 代际
 #include <cmath>      // std::sqrt, std::exp, std::log1p
 #include <cstdint>

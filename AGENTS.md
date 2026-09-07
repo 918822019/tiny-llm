@@ -55,6 +55,10 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
   Qwen3.5 可用阿里 ModelScope 下载（`modelscope download --model Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B`）。
 - **数值对齐（无需真模型）**：`tools/align_fake_model.py`（Qwen2）/ `tools/align_fake_qwen35_model.py`（Qwen3.5）。
   通过标准：worst max_abs_err ~1e-6/1e-7（tol 1e-5）。
+- **MoE SSD 卸载对齐（fake MoE）**：`.venv/bin/python tools/align_fake_qwen35_moe_model.py`
+  —— 生成 fake MoE 模型（GPTQ 专家），跑 resident vs SSD（slots=0/4）三遍，
+  逐字节比对 logits。验证 ExpertStore pread+LRU 与 resident 指针逐位一致。
+  cache 抖动扫描：`./scripts/bench_moe.sh`。机制见 `docs/moe_offload.md`。
 - **测速**：`MODEL=<file.tqwen> ./scripts/bench.sh <label> --extra-args "..."`
   （固定 prompt、decode 32、丢预热 4、取稳态中位）。
 - **正式记录一条优化**：`./scripts/record.sh <label> [--extra-args ...]`（门禁 + 稳定测速 + 自动写日志）。

@@ -84,7 +84,8 @@ namespace tinyqwen {
         const int n_kv_heads = static_cast<int>(cfg_.n_kv_heads);
         const int head_dim = static_cast<int>(cfg_.head_dim);
         const int base_pos = kv_.seq_len(); // 当前 KV cache 中已存储的序列长度
-        const bool is_qwen35 = cfg_.model_type == ModelType::kQwen35;
+        const bool is_qwen35 = (cfg_.model_type == ModelType::kQwen35) ||
+                               (cfg_.model_type == ModelType::kQwen35MoE);
 
         // GDN (linear attention) layers need sequential state updates — but the
         // 线性投影部分仍可批量。批量路径（qwen_forward_prefill_qwen35.cpp）：
@@ -92,8 +93,10 @@ namespace tinyqwen {
         // 保留逐 token 顺序扫描。长 prompt 的 TTFT 大幅下降。
         // 无法处理时（无 BLAS 后端 / dtype 不支持 / 开关关闭 / token 太少）
         // 返回 -2，回退到逐 token。
+        // MoE 暂不支持批量 prefill GEMM 路径（专家 gather/scatter 未实现），
+        // 强制逐 token（forward_token 已支持 MoE FFN）。
         if (is_qwen35) {
-            if (batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35) {
+            if (!cfg_.is_moe() && batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35) {
                 const int r = forward_prefill_qwen35_batch(token_ids, n, topk, topk_k);
                 if (r != -2) return r;
                 // fallthrough：逐 token 回退

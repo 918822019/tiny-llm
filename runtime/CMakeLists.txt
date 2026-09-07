@@ -29,6 +29,7 @@ add_library(tinyqwen_runtime OBJECT
         qwen_forward_token.cpp  # Decode 阶段单 token forward
         qwen_forward_prefill.cpp # Prefill 阶段 prompt forward（Qwen2.x 批量 + 分发）
         qwen_forward_prefill_qwen35.cpp # Qwen3.5 批量 prefill（GEMM 路径，权重只读一遍）
+        expert_store.cpp       # MoE 专家 SSD 卸载存储（pread + LRU 缓存）
         ../quantization/quant.cpp # 量化子系统实现（放在 quantization/ 目录）
 )
 

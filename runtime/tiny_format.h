@@ -42,9 +42,11 @@ namespace tinyqwen {
 
     // 格式版本号
     //   v1: Qwen2.x 单一架构（所有层同构 full attention + SwiGLU）
-    //   v2: header 布局不变（仍是 192 字节），reserved[96] 按 TinyHeaderV2Ext 解读
+    //   v2: header 布局不变（仍是 192 字节），reserved[96] 前 64 字节按 TinyHeaderV2Ext 解读
+    //   v3: reserved[96] 后 32 字节按 TinyHeaderV3Ext 解读（MoE + GPTQ 扩展），
+    //       V2Ext（前 64 字节）布局不变；v1/v2 文件仍可加载（kFormatVersionMin=1）
     // 将来改了布局就 +1，老 loader 遇到新版本会直接拒绝
-    inline constexpr uint32_t kFormatVersion = 2;
+    inline constexpr uint32_t kFormatVersion = 3;
 
     // loader 接受的最低版本（v1 文件向后兼容）
     inline constexpr uint32_t kFormatVersionMin = 1;
@@ -100,19 +102,98 @@ namespace tinyqwen {
                static_cast<size_t>(rows) * (static_cast<size_t>(cols) / kVQ2BlockDim);
     }
 
+    // =========================================================================
+    // GPTQ-INT4 packing 布局常量（原生 AutoGPTQ 打包）
+    //
+    // 与上面的 i4（HQQ 风格 interleaved）不同：GPTQ 的 scale/zero/qweight 是
+    // 分离的、按列主序 int32 打包。我们把 GPTQ 张量的所有部件 in-band 存在
+    // 数据区（仿 VQ2 码本 in-band 的思路），让 WeightTensor 不必加多指针字段。
+    //
+    // 一个 GPTQ 权重张量 [out_dim, in_dim] 的 in-band 块布局（从 data 指针起）：
+    //   [ GptqBlockHeader   ]  8 字节：{u32 magic=0x47505451("GPTQ"), u32 flags}
+    //                            flags bit0 = has_g_idx（g_idx 段是否存在）
+    //   [ scales            ]  n_groups * out_dim 个 fp16（行主序 [n_groups, out_dim]）
+    //   [ qzeros            ]  n_groups * out_dim 个 fp16（同形；存 fp16 简化解包，
+    //                            与 i4 的 zero 用 fp16 一致；真模型若要 int4-packed
+    //                            qzero 再加 unpack，记为后续优化）
+    //   [ g_idx (可选)       ]  in_dim 个 u32：每列→所属组；contiguous-group 时
+    //                            全为 col/group_size，可省略（flags bit0=0）
+    //   [ qweight           ]  (in_dim/8) * out_dim 个 u32：AutoGPTQ 列主序，
+    //                            每个 int32 装 8 个 4-bit，对应同一列(out_dim)的
+    //                            8 个连续 in_dim 行；低 nibble = 行 0。
+    // 反量化语义（与 AutoGPTQ/HF 一致）：
+    //   g = has_g_idx ? g_idx[col] : (col / group_size)
+    //   nibble(row,col) = (qweight[col * (in_dim/8) + row/8] >> ((row % 8) * 4)) & 0xF
+    //   val(row,col) = (float(nibble) - qzero[g*out_dim+col]) * scale[g*out_dim+col]
+    // 要求 in_dim % group_size == 0 且 in_dim % 8 == 0（GPTQ 打包硬约束）。
+    // =========================================================================
+    inline constexpr uint32_t kGptqMagic = 0x47505451u; // 'G','P','T','Q'（小端）
+    inline constexpr int kGptqHeaderBytes = 8;          // {magic, flags}
+    inline constexpr int kGptqPackInts = 8;              // 每个 int32 装 8 个 uint4
+
+    // n_groups = in_dim / group_size（要求整除）
+    inline constexpr int gptq_n_groups(int in_dim, int group_size) {
+        return in_dim / group_size;
+    }
+
+    // GPTQ in-band 块的字节数（header + scales + qzeros + 可选 g_idx + qweight）
+    inline constexpr size_t gptq_tensor_bytes(int out_dim, int in_dim, int group_size,
+                                              bool has_g_idx) {
+        const int n_groups = gptq_n_groups(in_dim, group_size);
+        const size_t scales_bytes = static_cast<size_t>(n_groups) * out_dim * 2;
+        const size_t qzeros_bytes = static_cast<size_t>(n_groups) * out_dim * 2;
+        const size_t gidx_bytes = has_g_idx ? static_cast<size_t>(in_dim) * 4 : 0;
+        const size_t qweight_bytes =
+            static_cast<size_t>(in_dim / kGptqPackInts) * out_dim * 4;
+        return static_cast<size_t>(kGptqHeaderBytes) + scales_bytes + qzeros_bytes +
+               gidx_bytes + qweight_bytes;
+    }
+
+    // 解析 GPTQ in-band 块各段偏移（相对 data 起点）。返回各段字节偏移到 out 参数。
+    // 调用方按这些偏移从 w 指针取 scales/qzeros/g_idx/qweight。
+    struct GptqBlockOffsets {
+        size_t header_off;   // GptqBlockHeader 起点
+        size_t scales_off;   // [n_groups, out_dim] fp16
+        size_t qzeros_off;   // [n_groups, out_dim] fp16
+        size_t gidx_off;     // [in_dim] u32（has_g_idx==false 时未用）
+        size_t qweight_off;  // (in_dim/8, out_dim) u32 列主序
+        bool has_g_idx;
+        int n_groups;
+    };
+    inline constexpr GptqBlockOffsets gptq_block_offsets(int out_dim, int in_dim,
+                                                         int group_size) {
+        GptqBlockOffsets o{};
+        o.n_groups = gptq_n_groups(in_dim, group_size);
+        o.header_off = 0;
+        o.scales_off = kGptqHeaderBytes;
+        const size_t sq = static_cast<size_t>(o.n_groups) * out_dim * 2;
+        o.qzeros_off = o.scales_off + sq;
+        // has_g_idx 由 header flags 决定，这里先按无 g_idx 排列 gidx/qweight；
+        // loader 读 flags 后若 has_g_idx，gidx 紧跟 qzeros，qweight 再跟在 gidx 后。
+        o.gidx_off = o.qzeros_off + sq;
+        o.qweight_off = o.gidx_off; // has_g_idx==false：qweight 紧跟 qzeros
+        o.has_g_idx = false;
+        return o;
+    }
+
     // 模型架构族枚举。决定 forward 走哪条路径、按什么名字绑定权重
     enum class ModelType : uint32_t {
-        kQwen2 = 0,  // Qwen2 / Qwen2.5: 所有层同构（full attention + SwiGLU）
-        kQwen35 = 1, // Qwen3.5 混合架构: Gated DeltaNet + full attention 3:1 交替
+        kQwen2 = 0,     // Qwen2 / Qwen2.5: 所有层同构（full attention + SwiGLU）
+        kQwen35 = 1,    // Qwen3.5 混合架构: Gated DeltaNet + full attention 3:1 交替
+        kQwen35MoE = 2, // Qwen3.5 MoE: 同 kQwen35 的 attention 混合，但 FFN 换成 MoE
+                        // （路由门 + top-k + 共享专家 + 路由专家）。专家权重可
+                        // 留盘按需加载（见 runtime/expert_store.h）。
     };
 
     // 数据类型枚举。v1 只用 f32，其余是为将来量化预留的
     enum class Dtype : uint32_t {
-        kF32 = 0, // 32 位浮点（IEEE 754 single precision）
-        kF16 = 1, // 16 位浮点（IEEE 754 half precision），weight-only 半精度
-        kI8 = 2,  // 预留: weight-only INT8 量化
-        kI4 = 3,  // 打包 INT4 量化（亚字节，需要专门布局）
-        kVQ2 = 4, // 2-bit 向量量化：每权重 1 字节 uint8 码本索引 + per-tensor 码本
+        kF32 = 0,   // 32 位浮点（IEEE 754 single precision）
+        kF16 = 1,   // 16 位浮点（IEEE 754 half precision），weight-only 半精度
+        kI8 = 2,    // 预留: weight-only INT8 量化
+        kI4 = 3,    // 打包 INT4 量化（HQQ 风格 interleaved：scale/zero 内联每组）
+        kVQ2 = 4,   // 2-bit 向量量化：每权重 1 字节 uint8 码本索引 + per-tensor 码本
+        kGPTQ4 = 5, // 原生 GPTQ-INT4：in-band 存 scales/qzeros/(g_idx)/qweight，
+                    // AutoGPTQ 列主序 int32 打包（见上方 GptqBlockOffsets）
     };
 
     // 返回每种 dtype 每元素占多少字节；未知/亚字节类型返回 0
@@ -177,6 +258,28 @@ namespace tinyqwen {
     };
     // 编译期断言: 确保 V2 扩展头恰好 64 字节
     static_assert(sizeof(TinyHeaderV2Ext) == 64, "TinyHeaderV2Ext must be 64 bytes");
+
+    // -------------------------------------------------------------------------
+    // TinyHeaderV3Ext: v3 扩展头
+    //
+    // 复用 TinyHeader::reserved[96] 的**后 32 字节**（前 64 字节仍是 V2Ext，
+    // 布局不变）。version >= 3 时加载端把 reserved + 64（即第 64..95 字节）
+    // 按此结构 memcpy 出来读。导出端写 v3 文件时填这些字段。
+    //
+    // 只在 ModelType == kQwen35MoE 时有意义；非 MoE 文件此处全 0。
+    // -------------------------------------------------------------------------
+    struct TinyHeaderV3Ext {
+        uint32_t n_routed_experts;             // 路由专家数（如 256）
+        uint32_t num_experts_per_tok;          // 每个 token 激活的路由专家数 k（如 8）
+        uint32_t moe_intermediate_size;        // 每个路由专家 FFN 的中间层宽度
+        uint32_t shared_expert_intermediate_size; // 共享专家 FFN 的中间层宽度
+        uint32_t n_shared_experts;             // 共享专家数（Qwen3 通常 = 1）
+        uint32_t moe_topk_norm;                // 1 = top-k 权重 softmax 归一（Qwen3）；0 = 不归一
+        uint32_t gptq_group_size;              // GPTQ 每组元素数（dtype==kGPTQ4 时 > 0）
+        uint32_t pad;                          // 必须填 0，保持 8 字节对齐
+    };
+    // 编译期断言: 确保 V3 扩展头恰好 32 字节
+    static_assert(sizeof(TinyHeaderV3Ext) == 32, "TinyHeaderV3Ext must be 32 bytes");
 
     // tensor 名字最长 64 字节（包括结尾的 NUL 字符）
     inline constexpr size_t kMaxTensorName = 64;

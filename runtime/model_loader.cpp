@@ -158,8 +158,9 @@ namespace tinyqwen {
         if (header_.dtype != static_cast<uint32_t>(Dtype::kF32) &&
             header_.dtype != static_cast<uint32_t>(Dtype::kF16) &&
             header_.dtype != static_cast<uint32_t>(Dtype::kI4) &&
-            header_.dtype != static_cast<uint32_t>(Dtype::kVQ2)) {
-            fail(err, "loader supports dtype f32/f16/i4/vq2, got " + std::to_string(header_.dtype));
+            header_.dtype != static_cast<uint32_t>(Dtype::kVQ2) &&
+            header_.dtype != static_cast<uint32_t>(Dtype::kGPTQ4)) {
+            fail(err, "loader supports dtype f32/f16/i4/vq2/gptq4, got " + std::to_string(header_.dtype));
             return false;
         }
         // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了
@@ -239,6 +240,14 @@ namespace tinyqwen {
                               "vq2/f32/f16/i4 tensors, got dtype " + std::to_string(e.dtype));
                     return false;
                 }
+            } else if (static_cast<Dtype>(header_.dtype) == Dtype::kGPTQ4) {
+                // GPTQ 文件允许混合（大矩阵 kGPTQ4、小向量/embed kF32）
+                if (e.dtype != static_cast<uint32_t>(Dtype::kGPTQ4) &&
+                    e.dtype != static_cast<uint32_t>(Dtype::kF32)) {
+                    fail(err, "tensor #" + std::to_string(i) + ": gptq file allows only "
+                              "gptq4/f32 tensors, got dtype " + std::to_string(e.dtype));
+                    return false;
+                }
             } else {
                 if (e.dtype != header_.dtype) {
                     fail(err, "tensor #" + std::to_string(i) + ": dtype " +
@@ -263,11 +272,12 @@ namespace tinyqwen {
                     return false;
                 }
             }
-            // 声明的字节数校验：INT4/VQ2 用专门公式；f32/f16 用元素数 * 元素字节
+            // 声明的字节数校验：INT4/VQ2/GPTQ4 用专门公式；f32/f16 用元素数 * 元素字节
             if (static_cast<Dtype>(e.dtype) == Dtype::kI4 ||
-                static_cast<Dtype>(e.dtype) == Dtype::kVQ2) {
+                static_cast<Dtype>(e.dtype) == Dtype::kVQ2 ||
+                static_cast<Dtype>(e.dtype) == Dtype::kGPTQ4) {
                 if (e.ndim != 2) {
-                    fail(err, "tensor #" + std::to_string(i) + ": i4/vq2 tensor must be 2D");
+                    fail(err, "tensor #" + std::to_string(i) + ": i4/vq2/gptq tensor must be 2D");
                     return false;
                 }
                 // nbytes 延迟到阶段 5 用对应公式再验（此处先记录）
@@ -333,7 +343,7 @@ namespace tinyqwen {
             std::memcpy(&ext, header_.reserved, sizeof(ext));
 
             // model_type 必须在已知范围内
-            if (ext.model_type > static_cast<uint32_t>(ModelType::kQwen35)) {
+            if (ext.model_type > static_cast<uint32_t>(ModelType::kQwen35MoE)) {
                 fail(err, "unknown model_type: " + std::to_string(ext.model_type));
                 return false;
             }
@@ -355,9 +365,11 @@ namespace tinyqwen {
             config_.eos_token_id = ext.eos_token_id;
             config_.quant_group_size = ext.quant_group_size;
 
-            // 混合架构（qwen3_5）自洽性校验。fail fast：这些值接下来直接用来
-            // 建模，错一个就是静默算错。
-            if (config_.model_type == ModelType::kQwen35) {
+            // 混合架构（qwen3_5 / qwen3_5_moe）自洽性校验。fail fast：这些值
+            // 接下来直接用来建模，错一个就是静默算错。MoE 与 dense 共用同一套
+            // attention（GDN+full 混合），故 attention 形状校验对两者都适用。
+            if (config_.model_type == ModelType::kQwen35 ||
+                config_.model_type == ModelType::kQwen35MoE) {
                 // linear attention 的形状字段必须全部设置
                 if (config_.linear_num_qk_heads == 0 || config_.linear_num_v_heads == 0 ||
                     config_.linear_qk_head_dim == 0 || config_.linear_v_head_dim == 0 ||
@@ -386,6 +398,47 @@ namespace tinyqwen {
                 // GDN 的 query/key 头数要能对齐到 value 头数（repeat_interleave）
                 if (config_.linear_num_v_heads % config_.linear_num_qk_heads != 0) {
                     fail(err, "qwen3_5: linear_num_v_heads % linear_num_qk_heads != 0");
+                    return false;
+                }
+            }
+        }
+
+        // ---- 阶段 4b：v3 扩展头（MoE + GPTQ 字段）。version >= 3 时从 reserved
+        //         的后 32 字节（reserved+64..reserved+96）读取 TinyHeaderV3Ext ----
+        if (header_.version >= 3) {
+            TinyHeaderV3Ext ext3{};
+            std::memcpy(&ext3, header_.reserved + sizeof(TinyHeaderV2Ext), sizeof(ext3));
+            if (ext3.pad != 0) {
+                fail(err, "v3 ext pad field must be 0");
+                return false;
+            }
+            config_.n_routed_experts = ext3.n_routed_experts;
+            config_.num_experts_per_tok = ext3.num_experts_per_tok;
+            config_.moe_intermediate_size = ext3.moe_intermediate_size;
+            config_.shared_expert_intermediate_size = ext3.shared_expert_intermediate_size;
+            config_.n_shared_experts = ext3.n_shared_experts;
+            config_.moe_topk_norm = ext3.moe_topk_norm;
+            config_.gptq_group_size = ext3.gptq_group_size;
+
+            // MoE 自洽性校验
+            if (config_.is_moe()) {
+                if (config_.n_routed_experts == 0 || config_.num_experts_per_tok == 0 ||
+                    config_.moe_intermediate_size == 0 ||
+                    config_.shared_expert_intermediate_size == 0 ||
+                    config_.n_shared_experts == 0) {
+                    fail(err, "qwen3_5_moe: expert shape fields must all be set "
+                              "(n_routed_experts/num_experts_per_tok/moe_intermediate_size/"
+                              "shared_expert_intermediate_size/n_shared_experts)");
+                    return false;
+                }
+                if (config_.num_experts_per_tok > config_.n_routed_experts) {
+                    fail(err, "qwen3_5_moe: num_experts_per_tok > n_routed_experts");
+                    return false;
+                }
+                // 拓扑要求：intermediate_size（文件头）对 MoE 无意义但保留；
+                // 路由专家的 in_dim = hidden，须满足 GPTQ 打包约束
+                if (config_.gptq_group_size == 0) {
+                    fail(err, "qwen3_5_moe: gptq_group_size must be set");
                     return false;
                 }
             }
@@ -459,6 +512,39 @@ namespace tinyqwen {
                 if (t.nbytes != exp_i4) {
                     fail(err, "tensor '" + kv.first + "': i4 embed nbytes mismatch, expected " +
                               std::to_string(exp_i4) + " got " + std::to_string(t.nbytes));
+                    return false;
+                }
+            }
+        }
+
+        // ---- 阶段 5c：GPTQ-Int4 校验（每个 kGPTQ4 tensor：in-band magic + 形状约束）----
+        // GPTQ 的 nbytes 由 in-band 布局决定（header flags 的 has_g_idx 影响总长），
+        // 这里读 in-band 头（前 8 字节）验 magic + 检查 in_dim 整除约束；精确 nbytes
+        // 由 kernel 运行时按 header 算。MoE 专家权重走本路径（fake 模型 expert=GPTQ）。
+        if (config_.gptq_group_size > 0) {
+            const int gs = static_cast<int>(config_.gptq_group_size);
+            for (const auto &kv : tensors_) {
+                const TensorView &t = kv.second;
+                if (t.dtype != Dtype::kGPTQ4) continue;
+                if (t.ndim != 2) {
+                    fail(err, "tensor '" + kv.first + "': gptq tensor must be 2D");
+                    return false;
+                }
+                if (t.nbytes < static_cast<uint64_t>(kGptqHeaderBytes)) {
+                    fail(err, "tensor '" + kv.first + "': gptq block too small for header");
+                    return false;
+                }
+                // in-band magic（数据在 data_ 内，可读；fake 模型全文件已加载）
+                uint32_t magic = 0;
+                std::memcpy(&magic, t.data, 4);
+                if (magic != kGptqMagic) {
+                    fail(err, "tensor '" + kv.first + "': gptq magic mismatch");
+                    return false;
+                }
+                const int in_dim = static_cast<int>(t.shape[1]);
+                if (in_dim % gs != 0 || in_dim % kGptqPackInts != 0) {
+                    fail(err, "tensor '" + kv.first + "': gptq in_dim must be divisible by "
+                              "group_size and " + std::to_string(kGptqPackInts));
                     return false;
                 }
             }

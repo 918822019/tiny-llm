@@ -119,6 +119,10 @@ namespace tinyqwen {
         void top_k_logits(const float* logits, int n, int k,
                          int* indices, float* values) override;
 
+        // MoE 路由 top-k + softmax：CUDA 后端暂未实现，调用即 abort。
+        void topk_softmax(const float* gate_logits, int n, int k,
+                          int* indices, float* weights) override;
+
         // =====================================================================
         // GDN 算子: Qwen3.5 线性注意力所需
         // =====================================================================

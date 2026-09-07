@@ -51,6 +51,8 @@ add_library(tinyqwen_kernels OBJECT
         argmax/argmax_ref.cpp
         # argmax NEON 变体（两遍法：NEON 求 max + NEON 找首个相等下标，与 ref 逐位一致；仅 aarch64）。
         argmax/argmax_neon.cpp
+        # MoE 路由门 top-k + softmax：ref（全平台，正确性锚 + 兜底）。
+        topk_softmax/topk_softmax_ref.cpp
         # INT4 weight-only：非对称 uint4 per-group 量化（正确性锚 ref + NEON + 多线程）。
         matvec/matvec_i4_ref.cpp
         matvec/matvec_i4_neon.cpp
@@ -59,6 +61,10 @@ add_library(tinyqwen_kernels OBJECT
         # 反量化纯查表（2.0bit 部署洁净点）。ref=double 累加锚；neon=fp32+4路ILP。
         matvec/matvec_vq2_ref.cpp
         matvec/matvec_vq2_neon.cpp
+        # 原生 GPTQ-INT4：AutoGPTQ 列主序 int32 打包 + 分离 scales/qzeros/g_idx，
+        # in-band 存（见 tiny_format.h GptqBlockOffsets）。ref=double 累加锚，
+        # 供 MoE 专家 SSD 卸载路径与未来 GPTQ 优化变体对齐。
+        matvec/matvec_gptq_ref.cpp
         # neon_mr = neon + 4 行并行（独立 FMA 链隐藏延迟 + 共享 x4 加载），
         # 归因阶梯下一层（对齐 i4 族 sdot2 的 multi-row 路径；仅 aarch64）。
         matvec/matvec_vq2_neon_mr.cpp

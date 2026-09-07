@@ -22,6 +22,8 @@ namespace tinyqwen {
             matvec_vq2(static_cast<const uint8_t*>(w.data), x, y, out_dim, in_dim);
         } else if (w.quant_type == QuantType::kI4) {
             matvec_i4(static_cast<const uint8_t*>(w.data), x, y, out_dim, in_dim, w.group_size);
+        } else if (w.quant_type == QuantType::kGPTQ) {
+            matvec_gptq(static_cast<const uint8_t*>(w.data), x, y, out_dim, in_dim, w.group_size);
         } else if (w.quant_type == QuantType::kF16) {
             matvec_f16(static_cast<const uint16_t*>(w.data), x, y, out_dim, in_dim);
         } else {
@@ -41,6 +43,10 @@ namespace tinyqwen {
             matvec_pair_i4(static_cast<const uint8_t*>(w1.data),
                           static_cast<const uint8_t*>(w2.data),
                           x, y1, y2, out_dim, in_dim, w1.group_size);
+        } else if (w1.quant_type == QuantType::kGPTQ) {
+            // GPTQ 暂无 pair 融合内核：拆成两次 matvec_gptq（数值不变）
+            matvec_gptq(static_cast<const uint8_t*>(w1.data), x, y1, out_dim, in_dim, w1.group_size);
+            matvec_gptq(static_cast<const uint8_t*>(w2.data), x, y2, out_dim, in_dim, w1.group_size);
         } else if (w1.quant_type == QuantType::kF16) {
             matvec_pair_f16(static_cast<const uint16_t*>(w1.data),
                            static_cast<const uint16_t*>(w2.data),
@@ -67,6 +73,11 @@ namespace tinyqwen {
                          static_cast<const uint8_t*>(wk.data),
                          static_cast<const uint8_t*>(wv.data),
                          x, yq, yk, yv, q_dim, kv_dim, in_dim, wq.group_size);
+        } else if (wq.quant_type == QuantType::kGPTQ) {
+            // GPTQ 暂无 qkv 融合：拆成 matvec_gptq(q) + 两次 matvec_gptq(k/v)
+            matvec_gptq(static_cast<const uint8_t*>(wq.data), x, yq, q_dim, in_dim, wq.group_size);
+            matvec_gptq(static_cast<const uint8_t*>(wk.data), x, yk, kv_dim, in_dim, wq.group_size);
+            matvec_gptq(static_cast<const uint8_t*>(wv.data), x, yv, kv_dim, in_dim, wq.group_size);
         } else if (wq.quant_type == QuantType::kF16) {
             matvec_qkv_f16(static_cast<const uint16_t*>(wq.data),
                           static_cast<const uint16_t*>(wk.data),
@@ -157,6 +168,12 @@ namespace tinyqwen {
     void CPUBackend::top_k_logits(const float* logits, int n, int k,
                                  int* indices, float* values) {
         (void)logits; (void)n; (void)k; (void)indices; (void)values;
+    }
+
+    // MoE 路由门 top-k + softmax：转发到 dispatch::topk_softmax（未注册兜底 ref）
+    void CPUBackend::topk_softmax(const float* gate_logits, int n, int k,
+                                  int* indices, float* weights) {
+        ::tinyqwen::topk_softmax(gate_logits, n, k, indices, weights);
     }
 
     // 因果一维卷积单步更新（GDN）：每个通道独立做 causal conv1d

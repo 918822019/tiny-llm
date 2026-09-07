@@ -133,6 +133,13 @@ namespace tinyqwen {
     // 返回第一个最大值的下标（平局取靠前者）
     int argmax_ref(const float *logits, int n);
 
+    // MoE 路由门 top-k + softmax 参考实现（正确性锚点）
+    // 从 gate_logits[n] 选 k 个最大值（降序），记下标到 indices[k]，
+    // 对这 k 个 logits 做 softmax（减最大值稳定）写入 weights[k]（和为 1）。
+    // k > n 时只取 n 个；平局按靠前者。
+    void topk_softmax_ref(const float *gate_logits, int n, int k,
+                          int *indices, float *weights);
+
     // 旋转位置编码 RoPE（in-place）
     // q: [n_heads * head_dim], k: [n_kv_heads * head_dim]
     // 与 HF Qwen2 的 rotate-half 约定一致:

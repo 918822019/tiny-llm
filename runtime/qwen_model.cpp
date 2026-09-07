@@ -51,6 +51,7 @@ namespace tinyqwen {
                 case Dtype::kF16: return QuantType::kF16;
                 case Dtype::kI4:  return QuantType::kI4;
                 case Dtype::kVQ2: return QuantType::kVQ2;
+                case Dtype::kGPTQ4: return QuantType::kGPTQ;
                 default:          return QuantType::kF32;
             }
         }
@@ -127,23 +128,24 @@ namespace tinyqwen {
             if (err) *err = "missing tensor: " + name;
             return nullptr;
         }
-        // dtype 校验：I4/VQ2 文件允许混合 dtype（大矩阵量化、小向量/embed kF32）
-        if (dtype_ == Dtype::kI4 || dtype_ == Dtype::kVQ2) {
-            const bool ok = (dtype_ == Dtype::kI4)
-                    ? (t->dtype == Dtype::kI4 || t->dtype == Dtype::kF32)
-                    : (t->dtype == Dtype::kVQ2 || t->dtype == Dtype::kF32 ||
-                       t->dtype == Dtype::kF16 || t->dtype == Dtype::kI4);
-            if (!ok) {
-                if (err)
-                    *err = "tensor " + name + " dtype mismatch: quant file allows quant/f32, got " +
-                           dtype_name(t->dtype);
-                return nullptr;
-            }
-        } else if (t->dtype != dtype_) {
-            // f32/f16 文件要求全文件单一 dtype
+        // dtype 校验：量化文件（i4/vq2/gptq）与 MoE 文件允许混合 dtype
+        // （大矩阵量化、小向量/embed kF32）。MoE 文件 master 可为 kF32 而
+        // 路由专家为 kGPTQ4，故 MoE 额外放行 kGPTQ4。
+        const bool mixed_ok = [&] {
+            if (t->dtype == dtype_) return true;                        // 与主 dtype 一致
+            if (t->dtype == Dtype::kF32) return true;                   // 小向量/embed 恒可 f32
+            if (dtype_ == Dtype::kI4 && t->dtype == Dtype::kI4) return true;
+            if (dtype_ == Dtype::kVQ2 && (t->dtype == Dtype::kVQ2 ||
+                                          t->dtype == Dtype::kF16 ||
+                                          t->dtype == Dtype::kI4)) return true;
+            if (cfg_.is_moe() && t->dtype == Dtype::kGPTQ4) return true;
+            if (dtype_ == Dtype::kGPTQ4 && t->dtype == Dtype::kGPTQ4) return true;
+            return false;
+        }();
+        if (!mixed_ok) {
             if (err)
                 *err = "tensor " + name + " dtype mismatch: got " + dtype_name(t->dtype) +
-                       " expected " + dtype_name(dtype_);
+                       " expected " + dtype_name(dtype_) + " (or allowed mixed)";
             return nullptr;
         }
         // ndim 校验：维度数必须匹配
@@ -204,7 +206,7 @@ namespace tinyqwen {
     //   in_dim  — 输入维度（矩阵列数）
     // 说明：通过 backend 接口调用具体实现，屏蔽 dtype 和实现细节。
     void QwenModel::mv(const void *w, const float *x, float *y, int out_dim, int in_dim) const {
-        WeightTensor wt{w, quant_type_of(dtype_), out_dim, in_dim, group_size_};
+        WeightTensor wt{w, quant_type_of(dtype_), out_dim, in_dim, cur_group_size()};
         backend_->matvec(wt, x, y, out_dim, in_dim);
     }
 
@@ -256,8 +258,8 @@ namespace tinyqwen {
     // 说明：同时计算 y1=W1*x 和 y2=W2*x，x 只加载一次。
     void QwenModel::mv_pair(const void *w1, const void *w2, const float *x, float *y1,
                             float *y2, int out_dim, int in_dim) const {
-        WeightTensor wt1{w1, quant_type_of(dtype_), out_dim, in_dim, group_size_};
-        WeightTensor wt2{w2, quant_type_of(dtype_), out_dim, in_dim, group_size_};
+        WeightTensor wt1{w1, quant_type_of(dtype_), out_dim, in_dim, cur_group_size()};
+        WeightTensor wt2{w2, quant_type_of(dtype_), out_dim, in_dim, cur_group_size()};
         backend_->matvec_pair(wt1, wt2, x, y1, y2, out_dim, in_dim);
     }
 
@@ -275,9 +277,9 @@ namespace tinyqwen {
     void QwenModel::mv_qkv(const void *wq, const void *wk, const void *wv, const float *x,
                            float *yq, float *yk, float *yv, int q_dim, int kv_dim,
                            int in_dim) const {
-        WeightTensor wqt{wq, quant_type_of(dtype_), q_dim, in_dim, group_size_};
-        WeightTensor wkt{wk, quant_type_of(dtype_), kv_dim, in_dim, group_size_};
-        WeightTensor wvt{wv, quant_type_of(dtype_), kv_dim, in_dim, group_size_};
+        WeightTensor wqt{wq, quant_type_of(dtype_), q_dim, in_dim, cur_group_size()};
+        WeightTensor wkt{wk, quant_type_of(dtype_), kv_dim, in_dim, cur_group_size()};
+        WeightTensor wvt{wv, quant_type_of(dtype_), kv_dim, in_dim, cur_group_size()};
         backend_->matvec_qkv(wqt, wkt, wvt, x, yq, yk, yv, q_dim, kv_dim, in_dim);
     }
 
@@ -300,7 +302,8 @@ namespace tinyqwen {
     //   所有失败经 *err 报告；成功后 *out 持有一个可直接运行的模型。
     bool QwenModel::create(const ModelFile &file, int max_seq_len, Profiler &profiler,
                            std::string *err, std::unique_ptr<QwenModel> *out,
-                           std::unique_ptr<IBackend> backend, bool kv_fp16) {
+                           std::unique_ptr<IBackend> backend, bool kv_fp16,
+                           ExpertStore *expert_store) {
         out->reset(); // 清空输出指针
         if (!file.loaded()) {
             if (err) *err = "model file not loaded";
@@ -330,8 +333,23 @@ namespace tinyqwen {
         m->q_dim_ = static_cast<int>(cfg.n_heads * cfg.head_dim);
         m->kv_dim_ = static_cast<int>(cfg.n_kv_heads * cfg.head_dim);
 
+        // MoE 配置（仅 kQwen35MoE 有意义；非 MoE 全为 0/默认）
+        m->expert_store_ = expert_store;
+        if (cfg.is_moe()) {
+            m->moe_inter_ = static_cast<int>(cfg.moe_intermediate_size);
+            m->shared_inter_ = static_cast<int>(cfg.shared_expert_intermediate_size);
+            m->n_experts_ = static_cast<int>(cfg.n_routed_experts);
+            m->experts_per_tok_ = static_cast<int>(cfg.num_experts_per_tok);
+            m->gptq_group_size_ = static_cast<int>(cfg.gptq_group_size);
+            // 专家 dtype 须文件里实际专家 tensor 的 dtype 决定（fake 模型 = kGPTQ4）
+            // 在逐层绑定时从首个专家 tensor 读出，这里先按 GPTQ 预设（fake）。
+            m->expert_dtype_ = (m->gptq_group_size_ > 0) ? Dtype::kGPTQ4 : Dtype::kF32;
+        }
+
         // Qwen3.5 混合架构：预计算 GDN 和 partial RoPE 的派生维度
-        const bool is_qwen35 = cfg.model_type == ModelType::kQwen35;
+        // MoE 与 dense 共用同一套 attention（GDN+full 混合），故 attention 形
+        // 状校验与 workspace 对两者都适用。
+        const bool is_qwen35 = (cfg.model_type == ModelType::kQwen35) || cfg.is_moe();
         if (is_qwen35) {
             // GDN linear attention 的维度
             m->gdn_qk_dim_ = static_cast<int>(cfg.linear_num_qk_heads * cfg.linear_qk_head_dim);
@@ -433,12 +451,55 @@ namespace tinyqwen {
                 return false;
             if (!bind_vec((p + "post_attention_layernorm.weight").c_str(), {hidden}, &w.post_ln))
                 return false;
-            if (!bind_mat((p + "mlp.gate_proj.weight").c_str(), {inter, hidden}, &w.gate))
-                return false;
-            if (!bind_mat((p + "mlp.up_proj.weight").c_str(), {inter, hidden}, &w.up))
-                return false;
-            if (!bind_mat((p + "mlp.down_proj.weight").c_str(), {hidden, inter}, &w.down))
-                return false;
+            if (cfg.is_moe()) {
+                // ---- MoE FFN：路由门 + 共享专家 + 路由专家 ----
+                const uint64_t moe_inter = cfg.moe_intermediate_size;
+                const uint64_t shared_inter = cfg.shared_expert_intermediate_size;
+                const uint64_t n_exp = cfg.n_routed_experts;
+                if (!bind_mat((p + "mlp.gate.weight").c_str(), {n_exp, hidden}, &w.moe_router))
+                    return false;
+                if (!bind_mat((p + "mlp.shared_experts.gate_proj.weight").c_str(),
+                              {shared_inter, hidden}, &w.moe_shared_gate)) return false;
+                if (!bind_mat((p + "mlp.shared_experts.up_proj.weight").c_str(),
+                              {shared_inter, hidden}, &w.moe_shared_up)) return false;
+                if (!bind_mat((p + "mlp.shared_experts.down_proj.weight").c_str(),
+                              {hidden, shared_inter}, &w.moe_shared_down)) return false;
+                // 路由专家：resident 指针绑定（fake 模型 data_ 内全有）+
+                // 向 ExpertStore 注册文件 offset（SSD 模式 pread 用）
+                w.moe_experts.resize(n_exp);
+                const uint8_t *base = file.base();
+                for (uint32_t e = 0; e < n_exp; ++e) {
+                    const std::string pe = p + "mlp.experts." + std::to_string(e) + ".";
+                    const TensorView *tg = m->require_view(file, pe + "gate_proj.weight",
+                                                           {moe_inter, hidden}, err);
+                    if (!tg) return false;
+                    const TensorView *tu = m->require_view(file, pe + "up_proj.weight",
+                                                           {moe_inter, hidden}, err);
+                    if (!tu) return false;
+                    const TensorView *td = m->require_view(file, pe + "down_proj.weight",
+                                                           {hidden, moe_inter}, err);
+                    if (!td) return false;
+                    w.moe_experts[e] = {tg->data, tu->data, td->data};
+                    m->expert_dtype_ = tg->dtype;  // 推断（fake = kGPTQ4）
+                    if (expert_store) {
+                        expert_store->register_expert(
+                            static_cast<int>(i), static_cast<int>(e),
+                            static_cast<uint64_t>(tg->data - base), tg->nbytes,
+                            static_cast<uint64_t>(tu->data - base), tu->nbytes,
+                            static_cast<uint64_t>(td->data - base), td->nbytes,
+                            static_cast<int>(moe_inter), static_cast<int>(hidden),
+                            m->gptq_group_size_);
+                    }
+                }
+            } else {
+                // ---- dense SwiGLU FFN ----
+                if (!bind_mat((p + "mlp.gate_proj.weight").c_str(), {inter, hidden}, &w.gate))
+                    return false;
+                if (!bind_mat((p + "mlp.up_proj.weight").c_str(), {inter, hidden}, &w.up))
+                    return false;
+                if (!bind_mat((p + "mlp.down_proj.weight").c_str(), {hidden, inter}, &w.down))
+                    return false;
+            }
 
             if (is_qwen35 && cfg.is_linear_layer(i)) {
                 // ---- Gated DeltaNet 层（Qwen3.5 linear attention）----
@@ -553,6 +614,19 @@ namespace tinyqwen {
             m->gdn_out_.resize(m->gdn_value_dim_); // GDN 输出
         }
 
+        // MoE workspace（仅 kQwen35MoE）
+        if (cfg.is_moe()) {
+            m->moe_gate_logits_.resize(cfg.n_routed_experts);
+            m->moe_expert_gate_.resize(m->moe_inter_);
+            m->moe_expert_up_.resize(m->moe_inter_);
+            m->moe_expert_out_.resize(hidden);
+            m->moe_ffn_acc_.resize(hidden);
+            m->moe_shared_out_.resize(hidden);
+            m->moe_topk_idx_.resize(m->experts_per_tok_);
+            m->moe_topk_w_.resize(m->experts_per_tok_);
+            // dense FFN workspace 仍按 inter 分配（非 MoE 层/兜底用；MoE 不用它）
+        }
+
         *out = std::move(m); // 所有权转移
         return true;
     }
@@ -580,7 +654,7 @@ namespace tinyqwen {
     //   N — 批量大小（token 数量）
     // 说明：通过 backend 接口调用具体实现。用于 prefill 阶段的批量线性投影。
     void QwenModel::mm(const void *w, const float *x, float *y, int M, int K, int N) const {
-        WeightTensor wt{w, quant_type_of(dtype_), M, K, group_size_};
+        WeightTensor wt{w, quant_type_of(dtype_), M, K, cur_group_size()};
         backend_->matmul(wt, x, y, M, K, N);
     }
 

@@ -16,6 +16,9 @@ add_executable(tinyqwen_tests
         test_matvec.cpp         # 矩阵向量乘法全变体测试（f32/f16/i4）
         test_matvec_i4.cpp      # INT4 matvec/matmul 专项测试
         test_matvec_vq2.cpp     # VQ2（2-bit 向量量化）matvec/pair/qkv/matmul 测试
+        test_matvec_gptq.cpp   # 原生 GPTQ-Int4 matvec（AutoGPTQ 列主序 dequant）测试
+        test_topk_softmax.cpp  # MoE 路由门 top-k + softmax 测试
+        test_expert_store.cpp  # MoE 专家 SSD 卸载存储（pread + LRU）测试
         test_biip_rotate.cpp    # BiIP 激活旋转（分块快速 Hadamard）正确性测试
         test_quant_ops.cpp      # 评测/量化 helper（log_softmax_at / dequant_i4_row）
         test_softmax_argmax.cpp # Softmax / Argmax 测试

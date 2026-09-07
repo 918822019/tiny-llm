@@ -33,10 +33,11 @@ TEST (format_header_layout) {
     EXPECT_EQ(sizeof(TinyHeader), (size_t) 192);
     EXPECT_EQ(sizeof(TensorEntry), (size_t) 120);
     EXPECT_EQ(sizeof(TinyHeaderV2Ext), (size_t) 64);
+    EXPECT_EQ(sizeof(TinyHeaderV3Ext), (size_t) 32); // v3 MoE 扩展头（reserved 后 32 字节）
     // 验证魔数字符串 "TINYQWEN"（8 字节）
     EXPECT_EQ(std::memcmp(kMagic, "TINYQWEN", 8), 0);
     // 验证版本号常量
-    EXPECT_EQ(kFormatVersion, 2u);
+    EXPECT_EQ(kFormatVersion, 3u);
     EXPECT_EQ(kFormatVersionMin, 1u);
     // 验证对齐要求：所有数据段偏移 64 字节对齐
     EXPECT_EQ(kAlignment, (size_t) 64);
@@ -44,6 +45,8 @@ TEST (format_header_layout) {
     EXPECT_EQ((int) Dtype::kF32, 0);
     EXPECT_EQ((int) ModelType::kQwen2, 0);
     EXPECT_EQ((int) ModelType::kQwen35, 1);
+    EXPECT_EQ((int) ModelType::kQwen35MoE, 2);
+    EXPECT_EQ((int) Dtype::kGPTQ4, 5);
 }
 
 // =============================================================================
@@ -57,7 +60,9 @@ TEST (format_dtype_sizes) {
     EXPECT_EQ(dtype_size(Dtype::kF16), (size_t) 2);  // float16: 2 字节
     EXPECT_EQ(dtype_size(Dtype::kI8), (size_t) 1);   // int8:    1 字节
     EXPECT_EQ(dtype_size(Dtype::kI4), (size_t) 0);   // int4:    亚字节类型，布局由 kernel 决定
+    EXPECT_EQ(dtype_size(Dtype::kGPTQ4), (size_t) 0); // gptq4:  列主序打包，整体大小见 gptq_tensor_bytes
     EXPECT_EQ(std::strcmp(dtype_name(Dtype::kF32), "f32"), 0); // 名称验证
+    EXPECT_EQ(std::strcmp(dtype_name(Dtype::kGPTQ4), "gptq4"), 0);
 }
 
 // =============================================================================
@@ -86,4 +91,25 @@ TEST (format_field_offsets) {
     EXPECT_EQ(offsetof(TensorEntry, shape), (size_t) 72);      // 形状数组：32 字节
     EXPECT_EQ(offsetof(TensorEntry, offset), (size_t) 104);    // 文件偏移：8 字节
     EXPECT_EQ(offsetof(TensorEntry, nbytes), (size_t) 112);    // 字节数：8 字节
+}
+
+// =============================================================================
+// format_gptq_layout — GPTQ in-band 块字节数验证
+// =============================================================================
+// 验证 gptq_tensor_bytes 与 gptq_block_offsets 的算式与 Python 导出端一致。
+// 形状取 fake MoE 模型的专家投影：out=16, in=32, group=16。
+//   n_groups = 32/16 = 2
+//   scales = 2*16*2 = 64B; qzeros = 64B; qweight = (32/8)*16*4 = 256B
+//   无 g_idx：total = 8 + 64 + 64 + 256 = 392B
+TEST (format_gptq_layout) {
+    const int out = 16, in_dim = 32, gs = 16;
+    EXPECT_EQ(gptq_n_groups(in_dim, gs), 2);
+    const size_t no_gidx = gptq_tensor_bytes(out, in_dim, gs, false);
+    EXPECT_EQ(no_gidx, (size_t)(8 + 64 + 64 + 256));
+    const size_t with_gidx = gptq_tensor_bytes(out, in_dim, gs, true);
+    EXPECT_EQ(with_gidx, no_gidx + (size_t)(in_dim * 4));
+    GptqBlockOffsets o = gptq_block_offsets(out, in_dim, gs);
+    EXPECT_EQ(o.n_groups, 2);
+    EXPECT_EQ(o.scales_off, (size_t) kGptqHeaderBytes);
+    EXPECT_EQ(o.qweight_off, o.qzeros_off + (size_t)(2 * out * 2)); // has_g_idx==false
 }

@@ -32,9 +32,11 @@ namespace tinyqwen {
     enum class QuantType {
         kF32 = 0,   // FP32 权重（32位浮点，无量化）
         kF16 = 1,   // FP16 权重（16位半精度浮点，weight-only）
-        kI4 = 2,    // INT4 权重量化（非对称 uint4，per-group scale+zero）
+        kI4 = 2,    // INT4 权重量化（非对称 uint4，per-group scale+zero，HQQ interleaved）
         kVQ2 = 3,   // 2-bit 向量量化（每权重 uint8 码本索引 + per-tensor fp16 码本）
-        // 未来扩展: kI8, kGPTQ, kAWQ, ...
+        kGPTQ = 4,  // 原生 GPTQ-INT4（AutoGPTQ 列主序 int32 打包 + 分离 scales/qzeros/g_idx，
+                    //  in-band 存于 data；见 tiny_format.h 的 GptqBlockOffsets）
+        // 未来扩展: kI8, kAWQ, ...
     };
 
     // -------------------------------------------------------------------------
@@ -292,6 +294,23 @@ namespace tinyqwen {
         // ---------------------------------------------------------------------
         virtual void top_k_logits(const float* logits, int n, int k,
                                  int* indices, float* values) = 0;
+
+        // ---------------------------------------------------------------------
+        // topk_softmax: MoE 路由门用——取 logits 前 k 大、做 softmax 归一
+        //
+        // 计算: 从 gate_logits[n] 选 k 个最大值，记其下标到 indices[k]，
+        //       并对这 k 个 logits 做 softmax（减最大值稳定）写入 weights[k]，
+        //       weights 和为 1。indices 按分数降序。
+        //
+        // 参数:
+        //   gate_logits: 路由门输出 [n_experts]
+        //   n:           专家数
+        //   k:           激活专家数（top-k）
+        //   indices:     输出，选中的专家下标 [k]
+        //   weights:     输出，归一化后的路由权重 [k]
+        // ---------------------------------------------------------------------
+        virtual void topk_softmax(const float* gate_logits, int n, int k,
+                                   int* indices, float* weights) = 0;
 
         // =====================================================================
         // GDN 专用算子（Qwen3.5 线性注意力层需要）

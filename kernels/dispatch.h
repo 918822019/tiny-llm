@@ -203,6 +203,22 @@ namespace tinyqwen {
     void matmul_vq2(const uint8_t *w, const float *x, float *y, int M, int K, int N);
 
     // ================================================================
+    // GPTQ-INT4 路径：第五套注册表（原生 AutoGPTQ 打包）
+    // ================================================================
+    // 权重 in-band 存 scales/qzeros/(g_idx)/qweight（见 tiny_format.h
+    // GptqBlockOffsets）。签名带 group_size（与 i4 同）。pair/qkv 无融合内核，
+    // 通用入口直接拆成多次 matvec_gptq。
+    using MatvecGPTQFn = void (*)(const uint8_t *w, const float *x, float *y,
+                                  int out_dim, int in_dim, int group_size);
+
+    void register_matvec_gptq_impl(const char *name, MatvecGPTQFn fn);  // 注册
+    bool set_matvec_gptq_impl_by_name(const char *name);                 // 按名字选择
+    const char *matvec_gptq_impl_name();                                  // 当前实现名
+    const char *available_matvec_gptq_impls();                            // 所有已注册名
+    void matvec_gptq(const uint8_t *w, const float *x, float *y,
+                     int out_dim, int in_dim, int group_size);            // 通用入口
+
+    // ================================================================
     // BiIP 激活旋转：推理时对激活施加旋转的配对逆变换
     // ================================================================
     // y = blockHadamard( (x / scale) ⊙ sign )；scale==nullptr 表示被中和(跳过除法)。
@@ -272,6 +288,8 @@ namespace tinyqwen {
                                        int head_dim, float scale, float *out);
     using SwigluFn = void (*)(float *gate, const float *up, int n);
     using ArgmaxFn = int (*)(const float *logits, int n);
+    using TopKSoftmaxFn = void (*)(const float *gate_logits, int n, int k,
+                                   int *indices, float *weights);
 
     // ---- 注册函数 ----
     void register_rmsnorm_impl(const char *name, RmsnormFn fn);
@@ -279,6 +297,7 @@ namespace tinyqwen {
     void register_attention_decode_impl(const char *name, AttentionDecodeFn fn);
     void register_swiglu_impl(const char *name, SwigluFn fn);
     void register_argmax_impl(const char *name, ArgmaxFn fn);
+    void register_topk_softmax_impl(const char *name, TopKSoftmaxFn fn);
 
     // 按名字选择 ops 实现（所有非 matvec 算子共用一个名字）。
     // "ref" 恒接受（清空当前名，各入口自动落回 _ref）。
@@ -296,6 +315,9 @@ namespace tinyqwen {
                           int head_dim, float scale, float *out);
     void swiglu(float *gate, const float *up, int n);
     int argmax(const float *logits, int n);
+    // MoE 路由门 top-k + softmax：未注册兜底 _ref
+    void topk_softmax(const float *gate_logits, int n, int k, int *indices,
+                      float *weights);
 
     // ================================================================
     // GPU decode engine 分发
@@ -436,6 +458,11 @@ namespace tinyqwen {
     [[maybe_unused]] static const bool tqwen_reg_vq2_## fn =                          \
             (tinyqwen::register_matvec_vq2_impl(name, fn), true)
 
+// GPTQ 路径的自注册宏（登记进 gptq 注册表）。
+#define TINYQWEN_MATVEC_GPTQ_VARIANT(fn, name)                                       \
+    [[maybe_unused]] static const bool tqwen_reg_gptq_## fn =                         \
+            (tinyqwen::register_matvec_gptq_impl(name, fn), true)
+
 // ---- 非 matvec 算子的自注册宏 ----
 // 各登记进对应算子注册表；key 用同一个实现名。
 
@@ -458,6 +485,10 @@ namespace tinyqwen {
 #define TINYQWEN_ARGMAX_VARIANT(fn, name)                                            \
     [[maybe_unused]] static const bool tqwen_reg_argmax_## fn =                       \
             (tinyqwen::register_argmax_impl(name, fn), true)
+
+#define TINYQWEN_TOPK_SOFTMAX_VARIANT(fn, name)                                     \
+    [[maybe_unused]] static const bool tqwen_reg_topk_softmax_## fn =                  \
+            (tinyqwen::register_topk_softmax_impl(name, fn), true)
 
 #define TINYQWEN_BIIP_ROTATE_VARIANT(fn, name)                                       \
     [[maybe_unused]] static const bool tqwen_reg_biip_## fn =                         \

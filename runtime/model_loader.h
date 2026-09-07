@@ -78,6 +78,18 @@ namespace tinyqwen {
         // --- 量化参数（仅 dtype == kI4 时有意义）---
         uint32_t quant_group_size = 0; // 0 = 未量化；128 = INT4 典型 group size
 
+        // --- v3 / MoE 扩展字段（仅 ModelType == kQwen35MoE 时有意义）---
+        uint32_t n_routed_experts = 0;             // 路由专家数（如 256；fake 用小值）
+        uint32_t num_experts_per_tok = 0;            // 每个 token 激活的路由专家数 k
+        uint32_t moe_intermediate_size = 0;          // 每个路由专家 FFN 的中间层宽度
+        uint32_t shared_expert_intermediate_size = 0;// 共享专家 FFN 的中间层宽度
+        uint32_t n_shared_experts = 0;               // 共享专家数（通常 1）
+        uint32_t moe_topk_norm = 1;                  // 1 = top-k 权重 softmax 归一
+        uint32_t gptq_group_size = 0;                // GPTQ 每组元素数（专家为 kGPTQ4 时 >0）
+
+        // 是否为 MoE 架构（FFN 换成 MoE，attention 部分与 kQwen35 完全一致）
+        bool is_moe() const { return model_type == ModelType::kQwen35MoE; }
+
         // ---------------------------------------------------------------------
         // is_linear_layer: 判断 layer_idx 是否为 linear attention（GDN）层
         //

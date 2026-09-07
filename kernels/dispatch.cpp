@@ -532,6 +532,74 @@ namespace tinyqwen {
     }
 
     // ====================================================================
+    // GPTQ-INT4 路径：与 i4 对称的第五套注册表/选择器/入口
+    // ====================================================================
+    // 原生 AutoGPTQ 打包：in-band 存 scales/qzeros/(g_idx)/qweight（见
+    // tiny_format.h 的 GptqBlockOffsets）。pair/qkv 无融合内核，拆成多次
+    // matvec_gptq。签名带 group_size（与 i4 同）。
+    namespace {
+        // GPTQ matvec 注册表
+        std::unordered_map<std::string, MatvecGPTQFn> &gptq_registry() {
+            static std::unordered_map<std::string, MatvecGPTQFn> r;
+            return r;
+        }
+        // GPTQ 当前选择
+        MatvecGPTQFn g_gptq_current = nullptr;   // nullptr = 未显式选择
+        std::string g_gptq_current_name;          // 空 = 未显式选择
+    } // namespace
+
+    // 注册 GPTQ matvec 实现
+    void register_matvec_gptq_impl(const char *name, MatvecGPTQFn fn) {
+        gptq_registry()[name] = fn;
+    }
+
+    // 按名字选择 GPTQ matvec 实现
+    bool set_matvec_gptq_impl_by_name(const char *name) {
+        const auto &r = gptq_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_gptq_current = it->second;
+        g_gptq_current_name = name;
+        return true;
+    }
+
+    // 获取当前 GPTQ matvec 实现名
+    const char *matvec_gptq_impl_name() {
+        return g_gptq_current_name.empty() ? "ref" : g_gptq_current_name.c_str();
+    }
+
+    // 获取所有已注册的 GPTQ matvec 实现名
+    const char *available_matvec_gptq_impls() {
+        static std::string joined;
+        if (joined.empty()) {
+            std::vector<std::string> names;
+            for (const auto &kv : gptq_registry()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i) joined += ", ";
+                joined += names[i];
+            }
+        }
+        return joined.c_str();
+    }
+
+    // GPTQ matvec 通用入口：未显式选择时兜底到 "ref"
+    void matvec_gptq(const uint8_t *w, const float *x, float *y,
+                     int out_dim, int in_dim, int group_size) {
+        MatvecGPTQFn fn = g_gptq_current;
+        if (!fn) {
+            auto it = gptq_registry().find("ref");
+            if (it == gptq_registry().end()) {
+                std::fprintf(stderr,
+                             "tinyqwen: matvec_gptq 'ref' 未注册——检查 kernels 是否被整体链接\n");
+                std::abort();
+            }
+            fn = it->second;
+        }
+        fn(w, x, y, out_dim, in_dim, group_size);
+    }
+
+    // ====================================================================
     // Matmul (GEMM) 分发：prefill 批量投影
     // ====================================================================
     // Y[M,N] = W[M,K] × X[K,N]。N=1 时退化为 matvec。
@@ -635,6 +703,12 @@ namespace tinyqwen {
             return r;
         }
 
+        // MoE 路由门 top-k + softmax 注册表
+        std::unordered_map<std::string, TopKSoftmaxFn> &topk_softmax_registry() {
+            static std::unordered_map<std::string, TopKSoftmaxFn> r;
+            return r;
+        }
+
         // 所有非 matvec 算子共用的当前实现名。
         // 空 = 未显式选择，通用入口兜底到各自的 _ref。
         std::string g_ops_name;
@@ -665,6 +739,9 @@ namespace tinyqwen {
     void register_rmsnorm_gated_impl(const char *name, RmsnormGatedFn fn) {
         rmsnorm_gated_registry()[name] = fn;
     }
+    void register_topk_softmax_impl(const char *name, TopKSoftmaxFn fn) {
+        topk_softmax_registry()[name] = fn;
+    }
 
     // ================================================================
     // set_ops_impl_by_name — 按名字选择 ops 实现
@@ -683,7 +760,8 @@ namespace tinyqwen {
                          attention_registry().count(n) || swiglu_registry().count(n) ||
                          argmax_registry().count(n) || biip_rotate_registry().count(n) ||
                          conv1d_registry().count(n) || l2norm_registry().count(n) ||
-                         gdn_step_registry().count(n) || rmsnorm_gated_registry().count(n);
+                         gdn_step_registry().count(n) || rmsnorm_gated_registry().count(n) ||
+                         topk_softmax_registry().count(n);
         if (!any) return false;  // 没有任何算子注册该名 → 拒绝
         g_ops_name = n;          // 接受并记录
         return true;
@@ -754,6 +832,18 @@ namespace tinyqwen {
             return it->second(logits, n);
         }
         return argmax_ref(logits, n);  // 兜底
+    }
+
+    // MoE 路由门 top-k + softmax 通用入口
+    void topk_softmax(const float *gate_logits, int n, int k, int *indices,
+                      float *weights) {
+        const auto &r = topk_softmax_registry();
+        auto it = r.find(ops_impl_name());
+        if (it != r.end()) {
+            it->second(gate_logits, n, k, indices, weights);
+            return;
+        }
+        topk_softmax_ref(gate_logits, n, k, indices, weights);  // 兜底
     }
 
     // BiIP 激活旋转通用入口

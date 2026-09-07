@@ -94,7 +94,12 @@
   （无 BLAS 后端时自动回退逐 token）；
 - INT8 weight-only reference quantization；
 - KronQ packing；
-- GPTQ / AWQ 等量化算法（接入流程见 `quantization_guide.md`）；
+- GPTQ / AWQ 等量化算法（接入流程见 `quantization_guide.md`）；注：原生 GPTQ-Int4
+  dequant（`matvec_gptq_ref`）+ MoE SSD 卸载机制已落地（见 `docs/moe_offload.md`），
+  但仅 ref 标量实现 + fake 模型验证；真 35B GPTQ 导出器与优化 kernel（marlin/sdot
+  风格）待 Phase C；
+- MoE 批量 prefill（同批 token 路由到不同专家的 gather/scatter GEMM）——当前 MoE
+  强制逐 token prefill；专家异步预取 overlap（Phase B）待补；
 - Speculative decoding（draft/verify/rollback）；
 - 多 LoRA adapter 调度；
 - mmap 加载、Android App。

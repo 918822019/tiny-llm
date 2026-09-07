@@ -357,6 +357,13 @@ namespace tinyqwen {
         std::abort();
     }
 
+    void CUDABackend::topk_softmax(const float* gate_logits, int n, int k,
+                                   int* indices, float* weights) {
+        (void)gate_logits; (void)n; (void)k; (void)indices; (void)weights;
+        std::fprintf(stderr, "CUDABackend: topk_softmax (MoE router) not yet implemented\n");
+        std::abort();
+    }
+
     // ==== GDN 算子（全部未实现）====
 
     void CUDABackend::causal_conv1d_update(float* x, float* state, const float* weight,

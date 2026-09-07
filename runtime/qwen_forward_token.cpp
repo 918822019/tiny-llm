@@ -150,7 +150,8 @@ namespace tinyqwen {
         //   - Qwen3.5 full 层  ：full attention（无 bias、QK-norm、partial RoPE、
         //                        sigmoid 输出门，gate 从 q_proj 后半取出）
         //   - Qwen3.5 linear 层：Gated DeltaNet（conv1d + delta rule 递归，O(1) 状态）
-        const bool is_qwen35 = cfg_.model_type == ModelType::kQwen35;
+        const bool is_qwen35 = (cfg_.model_type == ModelType::kQwen35) ||
+                               (cfg_.model_type == ModelType::kQwen35MoE);
         for (uint32_t i = 0; i < cfg_.n_layers; ++i) {
             const LayerWeights &w = layers_[i];
 
@@ -429,44 +430,106 @@ namespace tinyqwen {
                 backend_->rmsnorm(hidden_.data(), w.post_ln, normed_.data(), hidden, cfg_.rms_norm_eps);
             }
 
-            // 2i. gate 和 up 两个投影（SwiGLU 需要两条支路）
-            if (rotated_) {
-                // 旋转模型：gate/up 旋转不同，去融合逐个旋转+投影
-                ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
-                mv_rot(w.gate, normed_.data(), gate_.data(), inter, hidden, w.rot_gate);
-                mv_rot(w.up, normed_.data(), up_.data(), inter, hidden, w.rot_up);
-            } else if (fuse_gate_up_) {
-                // 融合版本：gate 和 up 一次投影完成
-                ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
-                mv_pair(w.gate, w.up, normed_.data(), gate_.data(), up_.data(), inter, hidden);
+            // 2i. FFN 块：dense SwiGLU 或 MoE（kQwen35MoE）二选一
+            if (cfg_.is_moe()) {
+                // ---- MoE FFN：路由门 -> topk softmax -> 共享专家 + Σ 路由专家 ----
+                // 路由门（resident，[n_experts, hidden]）
+                {
+                    ScopedTimer t(prof, scope("layer_%d.moe_router", i));
+                    mv(w.moe_router, normed_.data(), moe_gate_logits_.data(),
+                       n_experts_, hidden);
+                }
+                // top-k 选择 + softmax 归一
+                {
+                    ScopedTimer t(prof, scope("layer_%d.topk_softmax", i));
+                    backend_->topk_softmax(moe_gate_logits_.data(), n_experts_,
+                                           experts_per_tok_, moe_topk_idx_.data(),
+                                           moe_topk_w_.data());
+                }
+                // 共享专家（resident，权重 1）：gate/up -> swiglu -> down
+                {
+                    ScopedTimer t(prof, scope("layer_%d.shared_ffn", i));
+                    mv_pair(w.moe_shared_gate, w.moe_shared_up, normed_.data(),
+                            moe_expert_gate_.data(), moe_expert_up_.data(),
+                            shared_inter_, hidden);
+                    backend_->swiglu(moe_expert_gate_.data(), moe_expert_up_.data(),
+                                     shared_inter_);
+                    mv(w.moe_shared_down, moe_expert_gate_.data(),
+                       moe_shared_out_.data(), hidden, shared_inter_);
+                }
+                // ffn_acc 初始化为共享专家输出
+                for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] = moe_shared_out_[j];
+
+                // 路由专家：按 top-k 权重加权累加。权重走 resident 指针或
+                // ExpertStore SSD 卸载（pread + LRU）——两者须逐位一致。
+                for (int t = 0; t < experts_per_tok_; ++t) {
+                    const int e = moe_topk_idx_[t];
+                    const uint8_t *eg, *eu, *ed;
+                    {
+                        ScopedTimer tl(prof, scope("layer_%d.expert_load", i));
+                        if (moe_ssd_) {
+                            const ExpertWeights ew = expert_store_->get(
+                                static_cast<int>(i), e);
+                            eg = ew.gate; eu = ew.up; ed = ew.down;
+                        } else {
+                            eg = static_cast<const uint8_t *>(w.moe_experts[e].gate);
+                            eu = static_cast<const uint8_t *>(w.moe_experts[e].up);
+                            ed = static_cast<const uint8_t *>(w.moe_experts[e].down);
+                        }
+                    }
+                    {
+                        ScopedTimer tf(prof, scope("layer_%d.expert_ffn", i));
+                        mv_pair(eg, eu, normed_.data(), moe_expert_gate_.data(),
+                                moe_expert_up_.data(), moe_inter_, hidden);
+                        backend_->swiglu(moe_expert_gate_.data(), moe_expert_up_.data(),
+                                         moe_inter_);
+                        mv(ed, moe_expert_gate_.data(), moe_expert_out_.data(),
+                           hidden, moe_inter_);
+                    }
+                    const float wt = moe_topk_w_[t];
+                    for (int j = 0; j < hidden; ++j)
+                        moe_ffn_acc_[j] += wt * moe_expert_out_[j];
+                }
+                // 残差：x = x + moe_ffn
+                {
+                    ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
+                    for (int j = 0; j < hidden; ++j) hidden_[j] += moe_ffn_acc_[j];
+                }
             } else {
-                {
-                    ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
-                    mv(w.gate, normed_.data(), gate_.data(), inter, hidden);
+                // ---- dense SwiGLU FFN ----
+                // gate 和 up 两个投影
+                if (rotated_) {
+                    ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
+                    mv_rot(w.gate, normed_.data(), gate_.data(), inter, hidden, w.rot_gate);
+                    mv_rot(w.up, normed_.data(), up_.data(), inter, hidden, w.rot_up);
+                } else if (fuse_gate_up_) {
+                    ScopedTimer t(prof, scope("layer_%d.gate_up_proj", i));
+                    mv_pair(w.gate, w.up, normed_.data(), gate_.data(), up_.data(), inter, hidden);
+                } else {
+                    {
+                        ScopedTimer t(prof, scope("layer_%d.gate_proj", i));
+                        mv(w.gate, normed_.data(), gate_.data(), inter, hidden);
+                    }
+                    {
+                        ScopedTimer t(prof, scope("layer_%d.up_proj", i));
+                        mv(w.up, normed_.data(), up_.data(), inter, hidden);
+                    }
                 }
+                // SwiGLU 融合
                 {
-                    ScopedTimer t(prof, scope("layer_%d.up_proj", i));
-                    mv(w.up, normed_.data(), up_.data(), inter, hidden);
+                    ScopedTimer t(prof, scope("layer_%d.swiglu", i));
+                    backend_->swiglu(gate_.data(), up_.data(), inter);
                 }
-            }
-
-            // 2j. SwiGLU 融合：SiLU 只作用在 gate 支路，再和 up 逐元素相乘
-            // gate_ 就地复用为融合结果，直接喂给 down_proj
-            {
-                ScopedTimer t(prof, scope("layer_%d.swiglu", i));
-                backend_->swiglu(gate_.data(), up_.data(), inter);
-            }
-
-            // 2k. down 投影，把维度从 inter 压回 hidden
-            {
-                ScopedTimer t(prof, scope("layer_%d.down_proj", i));
-                mv_rot(w.down, gate_.data(), ffn_.data(), hidden, inter, w.rot_down);
-            }
-
-            // 2l. 第二次残差连接：x = x + ffn(x)
-            {
-                ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
-                for (int j = 0; j < hidden; ++j) hidden_[j] += ffn_[j];
+                // down 投影
+                {
+                    ScopedTimer t(prof, scope("layer_%d.down_proj", i));
+                    mv_rot(w.down, gate_.data(), ffn_.data(), hidden, inter, w.rot_down);
+                }
+                // 残差
+                {
+                    ScopedTimer t(prof, scope("layer_%d.residual_ffn", i));
+                    for (int j = 0; j < hidden; ++j) hidden_[j] += ffn_[j];
+                }
             }
         }
 

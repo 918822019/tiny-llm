@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "backend.h"
+#include "expert_store.h"
 #include "gdn_state.h"
 #include "kv_cache.h"
 #include "model_loader.h"
@@ -115,7 +116,8 @@ namespace tinyqwen {
         static bool create(const ModelFile &file, int max_seq_len, Profiler &profiler,
                            std::string *err, std::unique_ptr<QwenModel> *out,
                            std::unique_ptr<IBackend> backend = nullptr,
-                           bool kv_fp16 = false);
+                           bool kv_fp16 = false,
+                           ExpertStore *expert_store = nullptr);
 
         // ---------------------------------------------------------------------
         // forward_token: 在当前位置上前向一个 token（decode 模式）
@@ -223,6 +225,16 @@ namespace tinyqwen {
         // 设置是否融合 QKV 投影（默认 true，性能优化）
         void set_fuse_qkv(bool v) { fuse_qkv_ = v; }
 
+        // MoE：选择专家权重访问路径。false（默认）= resident 指针（专家常驻
+        // ModelFile 内存，是正确性锚点）；true = SSD 卸载（经 ExpertStore pread +
+        // LRU 缓存按需加载）。两者须逐位一致。
+        void set_moe_ssd(bool v) { moe_ssd_ = v; }
+        bool moe_ssd() const { return moe_ssd_; }
+        // ExpertStore 命中/miss 统计（SSD 模式归因用）
+        ExpertStoreStats moe_stats() const {
+            return expert_store_ ? expert_store_->stats() : ExpertStoreStats{};
+        }
+
         // ---- 属性访问器 ----
 
         // 模型配置（层数、维度、头数等）
@@ -309,6 +321,17 @@ namespace tinyqwen {
             const void *up = nullptr;    // up 投影 [intermediate, hidden]（dtype 随模型）
             const void *down = nullptr;  // down 投影 [hidden, intermediate]（dtype 随模型）
 
+            // ---- MoE（kQwen35MoE）专用：路由门 + 共享专家 + 路由专家 ----
+            // MoE 层替换 dense FFN：路由门选 top-k 专家 + 共享专家（常驻）+
+            // 路由专家（resident 指针 or ExpertStore SSD 卸载）。
+            const void *moe_router = nullptr;       // 路由门 [n_experts, hidden]（resident）
+            const void *moe_shared_gate = nullptr;  // 共享专家 gate [shared_inter, hidden]
+            const void *moe_shared_up = nullptr;    // 共享专家 up   [shared_inter, hidden]
+            const void *moe_shared_down = nullptr;  // 共享专家 down [hidden, shared_inter]
+            // 路由专家三块权重（resident 模式用；SSD 模式 moe_experts 为空，走 ExpertStore）
+            struct ExpertPtrs { const void *gate; const void *up; const void *down; };
+            std::vector<ExpertPtrs> moe_experts;
+
             // ---- QK per-head RMSNorm（Qwen3 稠密 / Qwen3.5 full_attention）----
             // Qwen2.x 没有这两个权重（nullptr）。语义按架构不同：Qwen3.5 是
             // zero-centered RMSNorm，导出时已折 +1；Qwen3 稠密是标准 RMSNorm，不折。
@@ -384,8 +407,14 @@ namespace tinyqwen {
         // ---------------------------------------------------------------------
 
         // 单路 matvec: y = W @ x
-        // W 是 const void*（可能 f32/f16/i4），按 dtype_ 分派
+        // W 是 const void*（可能 f32/f16/i4/gptq4），按 dtype_ 分派
         void mv(const void *w, const float *x, float *y, int out_dim, int in_dim) const;
+
+        // 当前权重 dtype 对应的 group_size：kGPTQ4 用 gptq_group_size_，
+        // 其余（i4）用 quant_group_size_（group_size_）。
+        int cur_group_size() const {
+            return (dtype_ == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
+        }
 
         // 旋转感知 matvec: 若 rot 有效，先对 x 施加 BiIP 配对旋转（进 rot_buf_），
         // 再做 matvec；rot.sign==nullptr 时等价于普通 mv（非旋转模型零开销分支）。
@@ -524,5 +553,27 @@ namespace tinyqwen {
         };
         BatchPrefillBufs bp_;
         bool batch_prefill_enabled_ = true;  // --no-batch-prefill 可关闭
+
+        // ==================== MoE（kQwen35MoE）状态 ====================
+        // 路由专家 dtype（fake 模型 expert=GPTQ；future 可 f32）；专家 FFN 经
+        // 专门路径调用对应 kernel（不走 mv 的 master dtype 路由）。
+        Dtype expert_dtype_ = Dtype::kF32;
+        int moe_inter_ = 0;          // 路由专家 FFN 中间层宽度
+        int shared_inter_ = 0;       // 共享专家 FFN 中间层宽度
+        int n_experts_ = 0;          // 路由专家数
+        int experts_per_tok_ = 0;    // top-k
+        int gptq_group_size_ = 0;    // 专家 GPTQ 分组（expert_dtype_==kGPTQ4 时）
+        bool moe_ssd_ = false;       // SSD 卸载模式开关
+        ExpertStore *expert_store_ = nullptr;  // SSD 模式取专家权重（非拥有）
+
+        // MoE workspace
+        std::vector<float> moe_gate_logits_;   // 路由门输出 [n_experts]
+        std::vector<float> moe_expert_gate_;    // 单专家 gate 支路 [moe_inter]
+        std::vector<float> moe_expert_up_;      // 单专家 up 支路 [moe_inter]
+        std::vector<float> moe_expert_out_;     // 单专家 down 输出 [hidden]
+        std::vector<float> moe_ffn_acc_;        // FFN 累加器 [hidden]
+        std::vector<float> moe_shared_out_;     // 共享专家 down 输出 [hidden]
+        std::vector<int> moe_topk_idx_;         // 选中专家下标 [k]
+        std::vector<float> moe_topk_w_;          // 归一化路由权重 [k]
     };
 } // namespace tinyqwen
