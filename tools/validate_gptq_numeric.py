@@ -6,14 +6,14 @@ fake MoE 模型的 GPTQ 是手写随机打包，测不出与真 AutoGPTQ 产物�
 逐张量比对 dequant 结果，并把"错误变体"一起跑出来证明本测试有判别力：
   - correct      : zp+1 修正 + 标准布局
   - no_zp_plus1  : 直接用存储值（AutoGPTQ 存的是 zp-1，不修正会整体偏一个步长）
-  - transposed   : qweight 布局解读反了（应得到垃圾）
+判别力指标是两者的 MSE 比值（实测 7.85~10.19×）。sym 量化的 qzeros nibble 恒为
+zp-1，看 nibble 分布区分不了布局，只有这个系统性偏差能证明测试有效。
 
-再把 correct 变体打包成我们的 in-band 块，跑 C++ matvec_gptq，与 numpy 参考
-逐位比对——这一步验证 C++ 实现与预期语义一致。
+打包走导出器的 repack_gptq_from_hf（真实导出器代码路径，非测试脚本的重复实现），
+再跑 C++ matvec_gptq 与 numpy 参考逐位比对。
 """
 import argparse
 import os
-import struct
 import subprocess
 import sys
 
@@ -24,7 +24,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "build", "benchmarks", "check_gptq_dequant")
 
-GPTQ_MAGIC = 0x47505451
+sys.path.insert(0, HERE)
+from export_qwen_to_tiny import repack_gptq_from_hf  # noqa: E402
+
 PACK = 8
 
 
@@ -54,17 +56,6 @@ def dequant(qweight, qzeros, scales, in_dim, out_dim, gs, zp_offset):
         rows = slice(g * gs, (g + 1) * gs)
         W[:, rows] = (q[rows, :].T - z[g][:, None]) * s[g][:, None]
     return W
-
-
-def pack_inband(W_qweight, qzeros, scales, in_dim, out_dim, gs, zp_offset):
-    """打包成 runtime 的 in-band 块（qzeros 解包为 fp16 并做 zp 修正）。"""
-    z = unpack_qzeros(qzeros, out_dim).astype(np.float32) + zp_offset
-    buf = bytearray()
-    buf += struct.pack("<II", GPTQ_MAGIC, 0)  # flags bit0=0：g_idx contiguous，省略
-    buf += scales.astype(np.float16).tobytes()
-    buf += z.astype(np.float16).tobytes()
-    buf += W_qweight.astype(np.uint32).tobytes()
-    return bytes(buf)
 
 
 def metrics(ref, got):
@@ -152,7 +143,7 @@ def main():
             tmp = "/tmp/gptq_check"
             os.makedirs(tmp, exist_ok=True)
             with open(f"{tmp}/block.bin", "wb") as f:
-                f.write(pack_inband(qw, qz, sc, in_dim, out_dim, gs, 1))
+                f.write(repack_gptq_from_hf(qw, qz, sc, G[name + ".g_idx"], gs))
             x.tofile(f"{tmp}/x.bin")
             r = subprocess.run([BIN, "--block", f"{tmp}/block.bin",
                                 "--out-dim", str(out_dim), "--in-dim", str(in_dim),

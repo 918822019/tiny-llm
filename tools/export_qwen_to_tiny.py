@@ -166,6 +166,59 @@ def unpack_v2_ext(reserved: bytes) -> dict:
     }
 
 
+GPTQ_MAGIC = 0x47505451  # 'GPTQ'（与 runtime/tiny_format.h 的 kGptqMagic 一致）
+GPTQ_PACK = 8            # 每个 int32 装 8 个 uint4（bits=4）
+
+
+def repack_gptq_from_hf(qweight, qzeros, scales, g_idx, group_size: int) -> bytes:
+    """把 HF/AutoGPTQ 的 GPTQ 张量重打包成 runtime 的 in-band 块。
+
+    形状契约（真 AutoGPTQ checkpoint 实测，见 tools/validate_gptq_numeric.py）：
+      qweight int32 [in//8, out]  — 一个 word 打包 8 个连续 in_dim，低 nibble=最小下标
+      qzeros  int32 [ng, out//8]  — 一个 word 打包 8 个连续 out_dim
+      scales  fp16  [ng, out]
+      g_idx   int32 [in]          — contiguous 时可省略
+
+    两处必须转换，否则 C++ dequant 静默算错：
+      1. qzeros 从 int4-packed 解包成逐元素 fp16 [ng, out]
+      2. 存的值 +1 —— AutoGPTQ 存的是 zp-1（sym/bits=4 下 nibble 恒为 7，真 zp=8）。
+         不修正会让 dequant 整体偏一个量化步长，MSE 恶化 8~10×。
+
+    返回 in-band 块字节：[header 8B][scales][qzeros][g_idx 可选][qweight]。
+    """
+    qw = qweight.astype(np.uint32)
+    in_dim = qw.shape[0] * GPTQ_PACK
+    out_dim = qw.shape[1]
+    if scales.shape != (in_dim // group_size, out_dim):
+        raise ValueError(f"scales shape {scales.shape} != "
+                         f"({in_dim // group_size}, {out_dim})")
+    if in_dim % group_size != 0 or in_dim % GPTQ_PACK != 0:
+        raise ValueError(f"in_dim {in_dim} must be divisible by group_size and {GPTQ_PACK}")
+
+    # qzeros: [ng, out//8] 每 word 8 个连续 out → [ng, out] 逐元素
+    qz = qzeros.astype(np.uint32)
+    if qz.shape != (in_dim // group_size, out_dim // GPTQ_PACK):
+        raise ValueError(f"qzeros shape {qz.shape} != "
+                         f"({in_dim // group_size}, {out_dim // GPTQ_PACK})")
+    nib = np.stack([(qz >> (k * 4)) & 0xF for k in range(GPTQ_PACK)], axis=2)
+    z_true = nib.reshape(qz.shape[0], out_dim).astype(np.float32) + 1.0
+
+    # g_idx：contiguous（= col//group_size）时省略，flags bit0=0
+    has_g_idx = False
+    if g_idx is not None:
+        gi = g_idx.astype(np.int64)
+        has_g_idx = not np.array_equal(gi, np.arange(in_dim) // group_size)
+
+    buf = bytearray()
+    buf += struct.pack("<II", GPTQ_MAGIC, 1 if has_g_idx else 0)
+    buf += scales.astype(np.float16).tobytes()
+    buf += z_true.astype(np.float16).tobytes()
+    if has_g_idx:
+        buf += g_idx.astype(np.uint32).tobytes()
+    buf += qw.tobytes()
+    return bytes(buf)
+
+
 def write_tqwen(out_path: str | Path, cfg: dict, tensors: "dict[str, object]",
                 dtype: str = "f32", version: int = 1, ext: dict | None = None) -> int:
     """写一个 .tqwen 文件，返回文件总字节数。
