@@ -13,7 +13,7 @@ benchmark:
     bytes_read_per_tok_gb: 1.64
     resident_mb: 3703
     offloaded_mb: 17290
-    offloaded_tensors: 30721
+    offloaded_tensors: 31333
     file_mb: 20995
     measured_with_swap: true
     gdn_proj_share_pct: 27.7
@@ -56,10 +56,24 @@ quantization:
   method: gptq
   sym: true
   note: >-
-    AutoGPTQ Int4（qweight/qzeros/scales/g_idx 列主序），导出时 repack 成 in-band
+    GPTQ Int4（qweight/qzeros/scales/g_idx 列主序），导出时 repack 成 in-band
     块。源 checkpoint 是 bf16，导出时 bf16→fp16（都是 2 字节，对权重安全）。
     router（mlp.gate.weight）与 lm_head 保留源 dtype，matvec 必须按张量自身
     dtype 路由（AGENTS.md 坑 #19/#24）。
+    **零点打包约定**：本 checkpoint 由 GPTQModel 量化，qzeros 直接存 zero
+    （packed=8）；AutoGPTQ 存的是 zero-1（packed=7）。两者正确零点都是 8，
+    导出器按数据归一（packed 恒为 7 才补 +1）。无条件 zp+1 会让零点变 9、
+    解量化权重带 rank-1 偏置 → 奇异值谱尖锐化 → 残差流逐层正反馈爆炸到
+    5×10⁵、输出退化成单一 token（AGENTS.md 坑 #33）。
+correctness:
+  verified: true
+  note: >-
+    逐组件对照 HF transformers 真实实现全部一致：GDN L0/L1/L2（用
+    torch_recurrent_gated_delta_rule + Qwen3_5MoeRMSNormGated）、full attention
+    L3（含 sigmoid 输出门，||o|| 12.7440 vs 12.74）、MoE FFN L0/L1/L2/L4、
+    router logits、embed/lm_head、专家权重（L0/L10/L20/L30/L39）。
+    残差范数收敛于 ~6-45（与已验证的 Qwen3.5-0.8B 同量级）。
+    生成连贯文本并正确识别 prompt 主题。
 recipe:
   matvec_impl: neon
   ops_impl: ref
@@ -72,8 +86,6 @@ known_limitations:
     不换页运行；内存校验会 fail-fast，--force-over-memory-budget 可强制但会换页
   - GDN 投影占 35.6%（gdn_proj 27.7% + gdn_out_proj 7.9%），是新的最大单项，
     取代了 dense attention 的 qkv+o_proj
-  - 生成文本有重复模式，需进一步排查（输入 token 本身无意义，可能是输入导致，
-    也可能是 GDN 或共享专家的数值问题）
   - 专家 I/O 24.0%，仍是 SSD 瓶颈的一部分
   - MTP（Multi-Token Prediction）模块未导出（checkpoint 有 mtp.* 张量），
     这是模型原生的投机解码机制，未来可考虑支持
