@@ -237,8 +237,12 @@ def main() -> int:
                 else:
                     arr = f.get_tensor(n)
                     out_f.write(np.ascontiguousarray(arr, np.float32).tobytes())
-            out_f.seek(total - 1)
-            out_f.write(b"\x00")
+            # 补齐到 total。最后一个 tensor 末尾可能已恰好对齐到 total（无需填充），
+            # 此时无条件 seek(total-1) 写零会覆盖它的末字节，损坏最后一个 tensor。
+            out_f.seek(0, os.SEEK_END)
+            if out_f.tell() < total:
+                out_f.seek(total - 1)
+                out_f.write(b"\x00")
 
     sys.stderr.write(f"[moe-export] done: {args.out} {total/1e9:.2f} GB, "
                      f"{len(names)} tensors\n")
