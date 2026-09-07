@@ -59,6 +59,10 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
   —— 生成 fake MoE 模型（GPTQ 专家），跑 resident vs SSD（slots=0/4）三遍，
   逐字节比对 logits。验证 ExpertStore pread+LRU 与 resident 指针逐位一致。
   cache 抖动扫描：`./scripts/bench_moe.sh`。机制见 `docs/moe_offload.md`。
+- **导出真 MoE GPTQ 模型**：`.venv/bin/python tools/export_qwen_moe_to_tiny.py
+  --model models/Qwen3-30B-A3B-GPTQ-Int4 --out model_qwen3_30b_moe_i4.tqwen`
+  （48 层 / 18867 tensors / 17.16 GB）。运行时加 `--moe-ssd`（专家字节不进 RAM，
+  resident 只剩 2884 MB）。**不开稀疏加载跑不起来**——文件 17.16 GB > 物理内存 16 GB。
 - **测速**：`MODEL=<file.tqwen> ./scripts/bench.sh <label> --extra-args "..."`
   （固定 prompt、decode 32、丢预热 4、取稳态中位）。
 - **正式记录一条优化**：`./scripts/record.sh <label> [--extra-args ...]`（门禁 + 稳定测速 + 自动写日志）。
@@ -70,6 +74,11 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    ~595 ms/tok；必须显式传优化实现（见各 `model*.yaml` 的 `recipe` 字段）。当前最佳 i4 配方：
    `--extra-args "--matvec-impl sdot4_mt --ops-impl neon"`（4B ≈36.5、0.8B ≈8.1 ms/tok，M4）。
    f16 满栈例：`--matvec-impl neon_mt_kv_nt --ops-impl neon` → 0.8B ~17.65 ms/tok（M4）。
+   **GPTQ 例外：变体族只有一个标量实现，传什么都没用**。`kernels/matvec/` 下 GPTQ 只有
+   `matvec_gptq_ref`，`--matvec-impl` 的可用列表（acc4/neon/neon_mt/sdot*/ref…）全是
+   HQQ/i4 interleaved 打包的实现，**不适用于 GPTQ 列主序布局**。所以 Qwen3-30B-A3B-GPTQ
+   实测 9400 ms/tok 是标量吞吐的真实反映，不是配置错误。别浪费时间调参，写 GPTQ
+   NEON+MT kernel 才是唯一出路（预估 37–374×，见 `docs/moe_offload.md`）。
 2. **Qwen3.5 对齐要 transformers main**：见上「Python 环境」。
 3. **align 脚本依赖逐位置 dump**：已加 `--verbose` 强制逐 token prefill 恢复契约（`tools/align_fake_*.py`），勿删。
 4. **fake Qwen3.5 的 tied lm_head**：`make_fake_qwen35_model.py` 对 tied 模型**不写**独立 `lm_head.weight`
@@ -189,7 +198,8 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 
 - `models/<repo>/`：HF 原始权重（modelscope / huggingface-cli 下载）。
-- `*.tqwen`：导出权重，如 `model_qwen35_f16.tqwen`（~1435 MB）。
+- `*.tqwen`：导出权重，如 `model_qwen35_f16.tqwen`（~1435 MB）、
+  `model_qwen3_30b_moe_i4.tqwen`（~17.16 GB，MoE GPTQ，须配 `--moe-ssd`）。
 - `model*.yaml`：模型注册表（架构 / dtype / recipe / 实测数字），`tools/model_registry.py` 读取。
 
 ## 代码约定

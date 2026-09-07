@@ -45,6 +45,12 @@ prefill 路径 —— 那条路径算的是 dense SwiGLU 而非 MoE，**不报�
 > ExpertStore 的 pread 路径，整文件缓冲也会让 17.5GB 专家权重全量常驻 ——
 > pread 只是在演示机制，内存一点没省。
 
+- **真 MoE GPTQ 导出器**（`tools/export_qwen_moe_to_tiny.py`）：从 HF/AutoGPTQ
+  checkpoint 导出，repack 成 in-band GPTQ 块（qzeros int4 解包 + zp+1）。支持
+  稠密 MoE（`qwen3_moe`，无共享专家）与混合架构 MoE（`qwen3_5_moe`）。
+  Qwen3-30B-A3B-GPTQ-Int4 实测导出 18867 tensors / 17.16 GB，其中 18432 个专家
+  张量走卸载。逐块校验与 `repack_gptq_from_hf` 输出逐位一致。
+
 ## 数据流（decode，单 token，MoE FFN 段）
 
 ```
@@ -82,6 +88,58 @@ residual += ffn_acc
   softmax 归一。ops 分发（`--ops-impl`）。
 - **fake MoE 模型**（`tools/make_fake_qwen35_moe_model.py`）：极小拓扑（hidden=16，
   8 专家，top-2，GPTQ group=8，GDN+full 3:1），全 GPTQ 投影 + fp32 embed/norm。
+
+## dtype 路由（真模型才暴露的坑）
+
+`QwenModel::mv()` 原先一律用 `quant_type_of(dtype_)`（文件级 master dtype）。
+GPTQ MoE 模型里 **router（`mlp.gate.weight`）与非 tied 的 `lm_head` 是 fp32，
+而 master 是 kGPTQ4** —— fp32 数据被当 GPTQ in-band 块解析，router logits 全错
+→ 选错专家 → 输出完全乱码，**且不报任何错**。
+
+修法：新增 `mv_typed(w, x, y, out_dim, in_dim, dtype, group_size)`，绑定时记录
+张量自身 dtype（`moe_router_dtype_` / `lm_head_dtype_`），forward 用它路由。
+注意 `lm_head_is_f32_/f16_/i4_` 那组标志**只在 tied 分支设置**（`lm_head_ = embed_`
+时按 embed dtype 路由），非 tied 会落到 `mv()` —— 这是同一类 bug 的第二处。
+
+**为什么 fake 模型测不出**：fake 生成器把 router 也做成了 GPTQ
+（`add_quant(p + "mlp.gate.weight", ...)`），恰好掩盖。而
+`align_fake_qwen35_moe_model.py` 只比 **resident vs SSD（两边都是 C++）**，从不
+与独立参考比 —— 所以 MoE FFN 的数值正确性此前从未被验证过。
+
+## 真模型验证（独立参考对齐）
+
+fake 模型只能证明"两条 C++ 路径一致"，证不了"算对了"。真模型对齐必须比**独立
+参考实现**。技巧：**单 token + pos=0** 让参考前向退化成极简形式——
+
+- RoPE 是恒等变换（pos=0）
+- attention 只有一个位置，softmax 权重必为 1，输出 = `v[0]`
+- 于是只需 rmsnorm + 一次 GPTQ dequant matvec + topk + 专家 FFN + lm_head
+
+```bash
+# 导 1 层调试模型，跑 C++ 拿 logits
+./build/runtime/tinyqwen --model /tmp/moe_1l.tqwen --tokens 9707 \
+  --max-new-tokens 0 --max-seq-len 8 --moe-ssd --moe-expert-cache-slots 8 \
+  --dump-logits /tmp/c1.bin
+# numpy 参考前向逐位比（见 tools/validate_gptq_numeric.py 同款 dequant 逻辑）
+```
+
+结果：ref argmax 4182 == C++ argmax 4182，**CosSim = 1.00000012**，
+max|diff| = 3.81e-06（fp32 舍入量级）。
+
+48 层端到端生成验证：
+
+```bash
+./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4.tqwen \
+  --tokens 9707,11,358,1229 --max-new-tokens 16 --max-seq-len 64 \
+  --moe-ssd --moe-expert-cache-slots 16
+# generated_ids: 13 358 2776 4460 311 11625 419 3491 25 362 220 16 15 15 15 20972
+# decode: 'Hello, Ining' → ". I'm trying to solve this problem: A 1000 kg"
+```
+
+> **读 GPTQ 张量的坑**：`safetensors.torch.load_file` 后 `.float()` 会把 int32
+> 的 `qweight/qzeros/g_idx` 转成 float32，再 `.view(np.uint32)` 就是把浮点位模式
+> 当整数读 → 全是垃圾（qzeros 本该恒为 7，算出 mean=13.88）。必须用
+> `safe_open(framework='numpy')` 保留 dtype。
 
 ## 验证（正确性锚点：resident vs SSD 逐位一致）
 
@@ -135,20 +193,129 @@ fake 模型：文件 70144 B → resident 39424 B，96 个专家 tensor / 25344 
 运行结束 stderr 输出 `[moe] expert cache: hits=.. misses=.. evictions=.. bytes_read=..`；
 启动时输出 `[init] weights: resident .. offloaded ..`。
 
-## 性能现实（本机 4.8GB / 4 核）
+## 性能现实（真模型实测，M4 / 16GB）
 
-35B-Int4 ~17.5GB 装不进内存 → SSD 流式是唯一可行方式。预期 decode 受 I/O 主导
-（每 token 各 MoE 层读 k 个专家，最坏全 miss 数百 MB/token → NVMe 下数百 ms/token
-量级）。这是"研究 SSD 卸载机制本身"，非交互式速度。fake 模型极小，I/O 不可测；
-真实 I/O 归因需在真模型 + `bench_expert_store`（Phase B，见下）。
+**原预测被证伪。** 本文档早期版本推测"decode 受 I/O 主导，最坏全 miss 数百
+MB/token → NVMe 下数百 ms/token"。真模型实测推翻了它——见下表。教训同
+AGENTS.md 坑 #11：**不能从理论倒推组件占比，必须隔离测量**。
 
-## 已交付（Phase A）与后续（Phase B/C）
+模型：Qwen3-30B-A3B-GPTQ-Int4（48 层 / 128 专家 / top-8 / 17.16 GB 文件）。
+负载：prompt 7 tok + decode 8 tok，`--profile-out` 归因，单遍。
 
-- ✅ Phase A：格式 v3 + GPTQ dequant + topk_softmax + ExpertStore（pread+LRU）
-  + MoE forward + fake 模型 + 对齐（resident vs SSD 逐位一致）+ **稀疏加载**
-  （专家字节真不进 RAM，内存归因与单测护栏）。
-- ⏳ Phase B：异步预取 overlap（router 选完 top-k → 入队预取，CPU 同时算 shared/
-  下一层 attention）；`benchmarks/bench_expert_store`（cache hit/miss + cold-load
-  延迟 + pread 吞吐，带离散度列）；cache 抖动归因。
-- ⏳ Phase C（明确推迟）：真 35B GPTQ 导出器；GPTQ 优化 kernel（marlin/sdot 风格）；
-  MoE 批量 prefill（同批 token 路由到不同专家的 gather/scatter GEMM）；多线程专家并行。
+### 内存边界（命题成立）
+
+```
+[init] weights: resident 2883.98 MB, offloaded 18432 tensors / 14688.14 MB on disk
+                (file 17573.10 MB)
+```
+
+| | |
+|---|---|
+| 文件大小 | 17573 MB |
+| **resident（真进 RAM）** | **2884 MB（16.4%）** |
+| offloaded（永留 SSD） | 14688 MB（83.6%）/ 18432 tensors |
+| 物理内存 | 16 GB → **17.16 GB 文件装不下，不开稀疏加载无法运行** |
+
+命题成立：只有 attention / router / embed / norm / lm_head 常驻，18432 个
+专家张量的字节一个都没进 RAM。
+
+### I/O 不是瓶颈（关键反直觉结论）
+
+同场 A/B，其余参数完全相同，只改 LRU 槽数：
+
+| 配置 | total | expert_load（I/O） | bytes_read |
+|---|---|---|---|
+| `slots=0`（每次访问都 pread） | 132.2 s | **9.0 s（6.8%）** | 13.48 GB |
+| `slots=4096`（首轮后全命中） | 140.2 s | **4.0 s（2.9%）** | 5.05 GB |
+
+少读 **8.43 GB** 反而**更慢 8 s**。消除全部 I/O 换来的收益是零（甚至负）。
+
+profiler 归因（slots=0）：
+
+| op | 耗时 | 占比 | 类别 |
+|---|---|---|---|
+| `expert_ffn` | 77.4 s | **58.5%** | 计算 |
+| `qkv_proj` | 23.6 s | 17.8% | 计算 |
+| `o_proj` | 18.9 s | 14.3% | 计算 |
+| `expert_load` | 9.0 s | **6.8%** | **I/O** |
+| `lm_head` | 3.1 s | 2.3% | 计算 |
+| `moe_router` | 0.2 s | 0.2% | 计算 |
+
+**计算占 90.6%，I/O 占 6.8%。** 瓶颈是标量 GPTQ matvec，不是磁盘。
+
+### Roofline 与瓶颈定位
+
+每 token MAC 数（hidden=2048, moe_inter=768, 48 层, top-8, vocab=151936）：
+
+| 段 | GMAC/token | 占比 |
+|---|---|---|
+| MoE FFN | 1.812 | 70.3% |
+| attention | 0.453 | 17.6% |
+| lm_head | 0.311 | 12.1% |
+| **合计** | **2.576** | |
+
+实测 decode = 9.40 s/tok → **274 MMAC/s = 0.548 GFLOPS**。
+
+M4 10 核 NEON fp32 上限 ≈ 270 GFLOPS，即**当前只用 0.20%**。根因：
+`kernels/matvec/` 下 GPTQ 变体族**只有一个实现** `matvec_gptq_ref`（标量参考）。
+AGENTS.md 坑 #1 的 `sdot4_mt` 是给 HQQ/i4 interleaved 打包用的，**不适用于
+GPTQ 列主序布局**——`--matvec-impl` 的可用列表里没有 GPTQ 优化变体。
+
+标量 GPTQ 每个 MAC 要做：nibble 提取（移位+掩码）→ 减零点 → 乘 scale → FMA，
+约 5 op/MAC 且无 SIMD 无多线程。
+
+### 预估（用仓库已实测 kernel 锚定，非理论上限）
+
+锚点：Qwen3.5-4B i4 实测 3.74 GMAC/token @ 36.5 ms/tok = **102.5 GMAC/s
+（205 GFLOPS，NEON 上限的 76%）**。
+
+| 假设 | 吞吐 | decode | 加速 |
+|---|---|---|---|
+| 乐观（同 4B 吞吐） | 102.5 GMAC/s | 25.1 ms/tok | 374× |
+| 保守（打 3 折） | 30.7 GMAC/s | 83.8 ms/tok | 112× |
+| 悲观（打 1 折） | 10.2 GMAC/s | 251.4 ms/tok | 37× |
+| **现状** | **0.274 GMAC/s** | **9400 ms/tok** | 1× |
+
+MoE 的专家矩阵小（`[768,2048]`=0.8 MB），比 4B 的大矩阵更难喂饱 10 核，且每
+token 384 次独立 dispatch，真实值大概率落在**保守～悲观区间**。
+
+**结论：GPTQ NEON+MT kernel 是唯一的数量级优化机会，覆盖 90.6% 的运行时。**
+异步预取（Phase B）在当前瓶颈下收益 <4%，优先级应下调。
+
+### TTFT
+
+prefill 7 tok = 66.4 s（≈9.4 s/tok）。MoE 走**逐 token** prefill（批量 GEMM
+的 gather/scatter 未实现，Phase C）。长 prompt 会线性放大。
+
+## 已交付与后续
+
+### ✅ Phase A：机制（fake 模型验证）
+格式 v3 + GPTQ dequant + topk_softmax + ExpertStore（pread+LRU）+ MoE forward
++ fake 模型 + 对齐（resident vs SSD 逐位一致）+ **稀疏加载**（专家字节真不进
+RAM，内存归因与单测护栏）。
+
+### ✅ Phase A+：真模型端到端（本轮完成）
+- `tools/export_qwen_moe_to_tiny.py`：真 MoE GPTQ 导出器，支持 dense-attention
+  MoE（无共享专家）+ AutoGPTQ 张量 repack（qzeros int4 解包 + zp+1）。
+  48 层全量导出 18867 tensors / 17.16 GB。
+- `kQwen3MoE` 架构支持 + 共享专家可选 + prefill 分支顺序修正 +
+  `full_layer_cache_index()` 除零守卫。
+- **matvec 按张量自身 dtype 路由**（见下「dtype 路由」）。
+- 正确性验收：单 token pos=0 logits **CosSim = 1.00000012**（max|diff| 3.81e-06），
+  48 层生成连贯文本。
+
+### ⏳ Phase B：I/O 优化 —— **优先级已下调**
+异步预取 overlap、`bench_expert_store`、cache 抖动归因。
+
+**下调理由**：实测 I/O 只占 6.8%，消除 8.43 GB 读取换来零收益（见「性能现实」）。
+异步预取的收益上限 <4%。除非未来专家矩阵变大或改用更快的计算 kernel
+（届时 I/O 占比会相对上升），否则不值得投入。
+
+### ⏳ Phase C：**GPTQ 优化 kernel（当前唯一数量级机会）**
+覆盖 90.6% 运行时，预估 37–374× 加速。具体：
+1. **GPTQ NEON+MT matvec**（最高优先级）：GPTQ 变体族现在只有 `matvec_gptq_ref`
+   标量实现。可参考 HQQ 侧的 `sdot4_mt` 阶梯（work-stealing + 内联组头硬件
+   FCVT + 128 位解包），但须适配 AutoGPTQ 列主序布局。
+2. **MoE 批量 prefill**：同批 token 路由到不同专家的 gather/scatter GEMM，
+   解决 TTFT 66.4 s / 7 tok 的线性放大。
+3. **多线程专家并行**：top-8 专家的 FFN 彼此独立，天然可并行。

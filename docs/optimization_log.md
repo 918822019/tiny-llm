@@ -3410,6 +3410,84 @@ MPS f16，慢 13–17%；但 **lm_head 的 N=1 GEMV（M=151936）快 2.92×**。
 
 ---
 
+### MoE SSD 卸载：真模型端到端跑通 + 瓶颈归因（2026-09-07）
+
+- **优化栈**：fp32-baseline + kernel 分发层 + VQ2/INT4 + 批量 prefill + fp16 KV
+  + CUDA/Metal engine + **MoE 动态路由 + ExpertStore + 稀疏加载**
+- **是什么**：把 MoE 从 fake 模型验证推进到真模型端到端。六轮提交：
+  GPTQ 数值验证与格式契约修正 → 导出器 GPTQ repack → dense-attention MoE 支持 →
+  `is_qwen35` 判据统一 → 真 MoE 导出器 → **matvec 按张量自身 dtype 路由**。
+  模型 Qwen3-30B-A3B-GPTQ-Int4（48 层 / 128 专家 / top-8 / 17.16 GB）。
+- **假设**：MoE 命题是"未激活专家不进 RAM"，所以预期 decode 受 **I/O 主导**
+  （每 token 读 top-8 专家 × 48 层，最坏全 miss 数百 MB/token）。
+- **结果**：内存命题**成立**，但 I/O 假设**被证伪**。
+
+  | | |
+  |---|---|
+  | 文件 17573 MB → resident | **2884 MB（16.4%）** |
+  | offloaded（永留 SSD） | 14688 MB（83.6%）/ 18432 tensors |
+  | decode | **9400 ms/tok** |
+  | TTFT（prefill 7 tok） | 66.4 s |
+  | 吞吐 | 274 MMAC/s = **0.548 GFLOPS** |
+
+- **验证**：单 token pos=0 独立参考对齐 **CosSim = 1.00000012**（max|diff|
+  3.81e-06）；48 层生成连贯文本 `'Hello, Ining'` → `". I'm trying to solve this
+  problem: A 1000 kg"`；181 单测全过；三条 fake 对齐无回归。
+- **瓶颈转移**：同场 A/B（slots=0 vs slots=4096）——
+
+  | 配置 | total | expert_load | bytes_read |
+  |---|---|---|---|
+  | slots=0（全 pread） | 132.2 s | 9.0 s（6.8%） | 13.48 GB |
+  | slots=4096（全命中） | 140.2 s | 4.0 s（2.9%） | 5.05 GB |
+
+  少读 8.43 GB **反而慢 8 s**。profiler：`expert_ffn` 58.5% + `qkv_proj` 17.8%
+  + `o_proj` 14.3% = **计算 90.6%**，`expert_load` **I/O 6.8%**。
+  → **下一刀砍 GPTQ kernel，不是 I/O。**
+- **意外 / 教训**（本轮最值钱的部分）：
+  1. **不能从理论倒推组件占比**（同坑 #11）。原预测"I/O 主导"错了一个数量级。
+     消除全部 I/O 的收益上限只有 6.8%，异步预取（Phase B）优先级应下调。
+  2. **matvec 必须按张量自身 dtype 路由**（AGENTS.md 坑 #19）。GPTQ MoE 里
+     router 与非 tied lm_head 是 fp32 而 master 是 kGPTQ4，被当 GPTQ 块解析 →
+     router logits 全错 → 选错专家 → 输出乱码**且不报错**。fake 模型测不出
+     （生成器把 router 也做成 GPTQ）；`align_fake_qwen35_moe_model.py` 只比
+     resident vs SSD（两边都是 C++），从不与独立参考比 —— MoE FFN 数值正确性
+     此前从未被验证过。
+  3. **GPTQ 变体族只有一个标量实现**。`--matvec-impl` 可用列表里没有 GPTQ 优化
+     变体；坑 #1 的 `sdot4_mt` 是 HQQ/i4 interleaved 打包专用，不适用于 GPTQ
+     列主序。标量每 MAC 要做 nibble 提取 + 减零点 + 乘 scale + FMA（~5 op/MAC，
+     无 SIMD 无多线程）。
+- **预估下一刀**（用仓库已实测 kernel 锚定，非理论上限）：锚点 Qwen3.5-4B i4
+  = 3.74 GMAC/token @ 36.5 ms/tok = **102.5 GMAC/s（205 GFLOPS，NEON 上限 76%）**。
+
+  | 假设 | decode | 加速 |
+  |---|---|---|
+  | 乐观（同 4B） | 25.1 ms/tok | 374× |
+  | 保守（3 折） | 83.8 ms/tok | 112× |
+  | 悲观（1 折） | 251.4 ms/tok | 37× |
+
+  专家矩阵小（`[768,2048]`=0.8 MB）比 4B 大矩阵更难喂饱 10 核，每 token 384 次
+  独立 dispatch，真实值大概率落在**保守～悲观区间**。
+- **复现**：
+  ```bash
+  # 内存归因
+  ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4.tqwen --tokens 9707 \
+    --max-new-tokens 0 --max-seq-len 4 --moe-ssd --moe-expert-cache-slots 0
+  # [init] weights: resident 2883.98 MB, offloaded 18432 tensors / 14688.14 MB
+
+  # 瓶颈归因（同场 A/B，只改槽数）
+  for s in 0 4096; do
+    ./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4.tqwen \
+      --tokens 9707,11,358,1229,9826,105129,12 --max-new-tokens 8 --max-seq-len 32 \
+      --moe-ssd --moe-expert-cache-slots $s --profile-out /tmp/prof_s$s.json
+  done
+  # 对比 op_totals 里 expert_load vs expert_ffn
+
+  # 正确性：单 token pos=0 对齐（技巧见 docs/moe_offload.md「真模型验证」）
+  ./scripts/verify.sh
+  ```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

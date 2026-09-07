@@ -1,0 +1,69 @@
+architecture: qwen3_moe
+benchmark:
+  macos_m4:
+    commit: f4a57b6
+    device: Mac16,10（Apple M4，4P+6E，16GB）
+    note: >-
+      GPTQ matvec 只有标量实现 matvec_gptq_ref，无优化 kernel——9400 ms/tok 是标量
+      吞吐的真实反映，不是配置错误。同场 A/B 证明 I/O 不是瓶颈（见
+      docs/optimization_log.md 与 docs/moe_offload.md「性能现实」）：
+      消除 8.43 GB 读取换来零收益。
+    topt_ms: 9400
+    mac_per_token: 2.576e9
+    throughput_gflops: 0.548
+    roofline_utilization_pct: 0.2
+    io_share_pct: 6.8
+    compute_share_pct: 90.6
+    ttft_7tok_ms: 66400
+    expert_ffn_share_pct: 58.5
+    resident_mb: 2884
+    offloaded_mb: 14688
+    offloaded_tensors: 18432
+    estimated_speedup_with_optimized_kernel: 37-374x
+    estimated_decode_with_optimized_kernel_ms: 25-251
+dtype: gptq4
+file: model_qwen3_30b_moe_i4.tqwen
+moe:
+  num_experts: 128
+  num_experts_per_tok: 8
+  moe_intermediate_size: 768
+  shared_experts: 0
+  ssd_offload: true
+  expert_cache_slots_default: 4
+name: model_qwen3_30b_moe_i4
+params:
+  full_attention_interval: 0
+  head_dim: 128
+  hidden_size: 2048
+  intermediate_size: 0
+  model_type: qwen3_moe
+  n_heads: 32
+  n_kv_heads: 4
+  n_layers: 48
+  tied_embeddings: false
+  vocab_size: 151936
+quantization:
+  group_size: 128
+  method: gptq
+  sym: true
+  note: >-
+    AutoGPTQ Int4（qweight/qzeros/scales/g_idx 列主序），导出时 repack 成 in-band
+    块。router（mlp.gate.weight）与 lm_head 是 fp32，master dtype 是 kGPTQ4——
+    matvec 必须按张量自身 dtype 路由（mv_typed），否则 router logits 全错、
+    选错专家、输出乱码且不报错。见 AGENTS.md 坑 #19。
+recipe:
+  matvec_impl: ref
+  ops_impl: ref
+  note: >-
+    GPTQ 变体族只有 matvec_gptq_ref（标量）。--matvec-impl 可用列表里没有 GPTQ
+    优化变体；坑 #1 的 sdot4_mt 是 HQQ/i4 interleaved 打包专用，不适用于 GPTQ
+    列主序布局。写 GPTQ NEON+MT kernel 是当前唯一的数量级优化机会（覆盖 90.6%
+    运行时，预估 37–374×）。
+known_limitations:
+  - decode 9400 ms/tok：标量 GPTQ matvec，非交互式速度
+  - TTFT 66.4 s / 7 tok：MoE 走逐 token prefill，批量 GEMM 的 gather/scatter 未实现
+  - 稀疏加载不开则无法运行：文件 17.16 GB > 物理内存 16 GB
+  - align_fake_qwen35_moe_model.py 只比 resident vs SSD（两边都是 C++），从不与
+    独立参考比——同类 dtype bug 仍可能漏网，需补 numpy 参考前向
+size_mb: 17573.1
+source: Qwen/Qwen3-30B-A3B-GPTQ-Int4
