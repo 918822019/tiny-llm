@@ -547,6 +547,10 @@ namespace tinyqwen {
                 const std::string g = p + "linear_attn.";
                 if (!bind_mat((g + "in_proj_qkv.weight").c_str(), {gdn_conv, hidden},
                               &w.gdn_in_qkv)) return false;
+                // 记录 GDN 投影真实 dtype。真 checkpoint 的 GDN 投影是 bf16/fp16
+                // （不是 GPTQ），而模型级 dtype_ 是 kGPTQ4。forward 必须用
+                // mv_typed 按此 dtype 路由，否则 fp16 数据被当 GPTQ 解析 → 乱码。
+                w.gdn_dtype = file.get((g + "in_proj_qkv.weight").c_str())->dtype;
                 if (!bind_mat((g + "in_proj_z.weight").c_str(), {gdn_v, hidden}, &w.gdn_in_z))
                     return false;
                 if (!bind_mat((g + "in_proj_b.weight").c_str(), {n_v_heads, hidden},

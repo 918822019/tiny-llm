@@ -202,14 +202,18 @@ namespace tinyqwen {
                 // 2b. 投影：混合 qkv + 门控 z + 标量 b/a（共用同一个 normed 输入）
                 {
                     ScopedTimer t(prof, scope("layer_%d.gdn_proj", i));
+                    // GDN 投影按自身 dtype 路由（真 checkpoint 是 fp16，不是 GPTQ）。
+                    // 用 mv()（模型级 dtype kGPTQ4）会把 fp16 当 GPTQ 解析 → 乱码。
+                    const Dtype gd = w.gdn_dtype;
+                    const int ggs = (gd == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
                     // in_proj_qkv：同时投影 q、k、v（拼接为 conv_dim 维）
-                    mv(w.gdn_in_qkv, normed_.data(), mixed, gdn_conv_dim_, hidden);
+                    mv_typed(w.gdn_in_qkv, normed_.data(), mixed, gdn_conv_dim_, hidden, gd, ggs);
                     // in_proj_z：门控信号 z（用于 silu 门控）
-                    mv(w.gdn_in_z, normed_.data(), z_.data(), gdn_value_dim_, hidden);
+                    mv_typed(w.gdn_in_z, normed_.data(), z_.data(), gdn_value_dim_, hidden, gd, ggs);
                     // in_proj_b：标量 b（用于 sigmoid 门控 beta）
-                    mv(w.gdn_in_b, normed_.data(), b_.data(), n_v_heads, hidden);
+                    mv_typed(w.gdn_in_b, normed_.data(), b_.data(), n_v_heads, hidden, gd, ggs);
                     // in_proj_a：标量 a（用于衰减因子 g）
-                    mv(w.gdn_in_a, normed_.data(), a_.data(), n_v_heads, hidden);
+                    mv_typed(w.gdn_in_a, normed_.data(), a_.data(), n_v_heads, hidden, gd, ggs);
                 }
 
                 // 2c. causal conv1d 单步更新（就地；conv 后接 silu；状态推进）
@@ -272,7 +276,10 @@ namespace tinyqwen {
                 // 2g. 输出投影 + 残差
                 {
                     ScopedTimer t(prof, scope("layer_%d.gdn_out_proj", i));
-                    mv(w.gdn_out_proj, gdn_out_.data(), o_.data(), hidden, gdn_value_dim_);
+                    const Dtype gd = w.gdn_dtype;
+                    const int ggs = (gd == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
+                    mv_typed(w.gdn_out_proj, gdn_out_.data(), o_.data(), hidden,
+                             gdn_value_dim_, gd, ggs);
                 }
                 {
                     ScopedTimer t(prof, scope("layer_%d.residual_attn", i));

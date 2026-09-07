@@ -365,6 +365,10 @@ namespace tinyqwen {
             const void *gdn_in_b = nullptr;     // beta 投影 [num_v_heads, hidden]
             const void *gdn_in_a = nullptr;     // a（dt）投影 [num_v_heads, hidden]
             const void *gdn_out_proj = nullptr; // 输出投影 [hidden, value_dim]
+            // GDN 投影的真实 dtype。真 checkpoint 的 GDN 投影是 bf16/fp16（不是
+            // GPTQ），而模型级 dtype_ 是 kGPTQ4。若用 mv()（按模型级 dtype）会把
+            // fp16 数据当 GPTQ 解析 → 垃圾 → 输出乱码（AGENTS.md 坑 #19 同类）。
+            Dtype gdn_dtype = Dtype::kF16;
             const float *gdn_conv_w = nullptr;  // causal conv1d 权重 [conv_dim, kernel]
             const float *gdn_a_log = nullptr;   // 每个 v head 的 a 对数 [num_v_heads]
             const float *gdn_dt_bias = nullptr; // 每个 v head 的 dt bias [num_v_heads]
