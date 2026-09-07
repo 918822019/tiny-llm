@@ -201,7 +201,15 @@ def repack_gptq_from_hf(qweight, qzeros, scales, g_idx, group_size: int) -> byte
         raise ValueError(f"qzeros shape {qz.shape} != "
                          f"({in_dim // group_size}, {out_dim // GPTQ_PACK})")
     nib = np.stack([(qz >> (k * 4)) & 0xF for k in range(GPTQ_PACK)], axis=2)
-    z_true = nib.reshape(qz.shape[0], out_dim).astype(np.float32) + 1.0
+    packed = nib.reshape(qz.shape[0], out_dim).astype(np.float32)
+    # 零点归一化。sym 量化的零点定义上恒为 8（uint4 范围 0..15 的中点），但不同
+    # GPTQ 实现的打包约定不同：AutoGPTQ 存 zero-1（packed=7），GPTQModel 直接存
+    # zero（packed=8）。无条件 +1 对后者会多加 1，让解量化权重带上 rank-1 型偏置
+    # ——同一 group 内沿 in_dim 恒定，正是奇异值谱尖锐化的来源。实测 Qwen3.5-35B
+    # 的 gate_proj 顶奇异值从 0.98（正确）涨到 4.14（错误）、顶/第二从 1.10× 变
+    # 4.65×，逐层正反馈把残差流推到 5×10⁵，输出退化成与输入无关的单一 token。
+    # 归一规则：packed 恒为 7 = AutoGPTQ 约定，补 +1；否则原样使用。
+    z_true = packed + 1.0 if np.all(packed == 7.0) else packed
 
     # g_idx：contiguous（= col//group_size）时省略，flags bit0=0
     has_g_idx = False
