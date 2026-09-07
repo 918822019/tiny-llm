@@ -150,8 +150,7 @@ namespace tinyqwen {
         //   - Qwen3.5 full 层  ：full attention（无 bias、QK-norm、partial RoPE、
         //                        sigmoid 输出门，gate 从 q_proj 后半取出）
         //   - Qwen3.5 linear 层：Gated DeltaNet（conv1d + delta rule 递归，O(1) 状态）
-        const bool is_qwen35 = (cfg_.model_type == ModelType::kQwen35) ||
-                               (cfg_.model_type == ModelType::kQwen35MoE);
+        const bool is_qwen35 = cfg_.uses_qwen35_attention();
         for (uint32_t i = 0; i < cfg_.n_layers; ++i) {
             const LayerWeights &w = layers_[i];
 

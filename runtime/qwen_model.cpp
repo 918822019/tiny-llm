@@ -349,7 +349,7 @@ namespace tinyqwen {
         // Qwen3.5 混合架构：预计算 GDN 和 partial RoPE 的派生维度
         // MoE 与 dense 共用同一套 attention（GDN+full 混合），故 attention 形
         // 状校验与 workspace 对两者都适用。
-        const bool is_qwen35 = (cfg.model_type == ModelType::kQwen35) || cfg.is_moe();
+        const bool is_qwen35 = cfg.uses_qwen35_attention();
         if (is_qwen35) {
             // GDN linear attention 的维度
             m->gdn_qk_dim_ = static_cast<int>(cfg.linear_num_qk_heads * cfg.linear_qk_head_dim);

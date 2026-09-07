@@ -84,8 +84,7 @@ namespace tinyqwen {
         const int n_kv_heads = static_cast<int>(cfg_.n_kv_heads);
         const int head_dim = static_cast<int>(cfg_.head_dim);
         const int base_pos = kv_.seq_len(); // 当前 KV cache 中已存储的序列长度
-        const bool is_qwen35 = (cfg_.model_type == ModelType::kQwen35) ||
-                               (cfg_.model_type == ModelType::kQwen35MoE);
+        const bool is_qwen35 = cfg_.uses_qwen35_attention();
 
         // MoE 暂不支持批量 prefill GEMM 路径（专家 gather/scatter 未实现），
         // 一律强制逐 token（forward_token 已支持 MoE FFN）。这个分支必须在

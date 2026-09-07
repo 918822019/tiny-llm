@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
 
     // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作
     tinyqwen::Profiler profiler(!args.profile_out.empty());
-    const bool is_qwen35 = file.config().model_type == tinyqwen::ModelType::kQwen35;
+    const bool is_qwen35 = file.config().uses_qwen35_attention();
     profiler.set_meta(is_qwen35 ? "qwen3.5-hybrid" : "qwen2.5-like", "cpu_ref",
                       is_f16 ? "f16w_fp32a" : "fp32");
 
