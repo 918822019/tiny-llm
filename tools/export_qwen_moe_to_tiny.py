@@ -27,7 +27,7 @@ from safetensors import safe_open
 
 from export_qwen_to_tiny import (
     ALIGN, DTYPE_F16, DTYPE_F32, HEADER_FMT, MAGIC, align_up, pack_v2_ext,
-    quant_rtn_to_gptq_inband, repack_gptq_from_hf, _squeeze_conv,
+    quant_rtn_to_gptq_inband, repack_gptq_from_hf, _fold_one, _squeeze_conv,
 )
 
 FORMAT_VERSION = 3
@@ -148,14 +148,20 @@ def main() -> int:
         if cfg.get("quantization_config"):
             text_cfg["quantization_config"] = cfg["quantization_config"]
         # Qwen3.5 的 config 键名与 runtime 期望的不同，需归一化：
-        #   rope_parameters(dict) → rope_theta
+        #   rope_parameters(dict) → rope_theta / partial_rotary_factor
         #   linear_key_head_dim   → linear_qk_head_dim
         #   linear_num_key_heads  → linear_num_qk_heads
         #   linear_value_head_dim → linear_v_head_dim
         #   linear_num_value_heads→ linear_num_v_heads
         rp = text_cfg.get("rope_parameters")
-        if isinstance(rp, dict) and "rope_theta" not in text_cfg:
-            text_cfg["rope_theta"] = float(rp.get("rope_theta", rp.get("theta", 10000.0)))
+        if isinstance(rp, dict):
+            if "rope_theta" not in text_cfg:
+                text_cfg["rope_theta"] = float(rp.get("rope_theta", rp.get("theta", 10000.0)))
+            # partial_rotary_factor 同样嵌在 rope_parameters 里。漏取会让下游按
+            # 默认 1.0 走 rotary_dim = head_dim 全量旋转，而真实值 0.25 表示只
+            # 旋转每头前 64 维 —— full attention 层的 RoPE 会整体算错。
+            if "partial_rotary_factor" not in text_cfg:
+                text_cfg["partial_rotary_factor"] = float(rp.get("partial_rotary_factor", 1.0))
         for src_k, dst_k in (("linear_key_head_dim", "linear_qk_head_dim"),
                              ("linear_num_key_heads", "linear_num_qk_heads"),
                              ("linear_value_head_dim", "linear_v_head_dim"),
@@ -403,6 +409,24 @@ def main() -> int:
                 # [out,kernel]，需 squeeze（与 export_qwen_to_tiny 同款处理）。
                 if n.endswith("linear_attn.conv1d.weight"):
                     arr = _squeeze_conv(arr)
+                # Qwen3.5-MoE 的 RMSNorm 是 zero-centered：HF 的有效权重是
+                # (1 + weight)，权重初始化为 0。runtime 用的是标准 RMSNorm，所以
+                # 必须把 +1 折进权重，否则每层的有效权重都偏小 ~5×（实测 normed_
+                # 范数 8.6 vs 应有的 41），残差流逐层失控增长到 4×10⁴ 而输出与
+                # 输入无关。折叠清单与 export_qwen_to_tiny 严格一致：
+                # input/post_attention layernorm、q_norm、k_norm、final norm 折，
+                # 而 linear_attn.norm.weight 是 RMSNormGated（HF 直接用 weight，
+                # 初始化为 1）不折。
+                # Qwen3-MoE 用标准 RMSNorm（非 zero-centered），故不折 —— 折叠
+                # 条件就是 is_multimodal（= Qwen3.5-MoE）。
+                if is_multimodal and (
+                    n.endswith("input_layernorm.weight")
+                    or n.endswith("post_attention_layernorm.weight")
+                    or n.endswith("self_attn.q_norm.weight")
+                    or n.endswith("self_attn.k_norm.weight")
+                    or n == "model.norm.weight"
+                ):
+                    arr = _fold_one(arr)
                 # 用规划阶段定的 dtype_code，不能用 arr.dtype——get_tensor 已把
                 # bf16 转成 fp32 numpy，arr.dtype 恒为 float32，会误判成 fp32。
                 target = np.float16 if e[6] == DTYPE_F16 else np.float32
