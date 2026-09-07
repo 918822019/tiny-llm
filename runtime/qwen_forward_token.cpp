@@ -300,8 +300,11 @@ namespace tinyqwen {
                 //     按 head 交错：每头前 head_dim 是 query，后 head_dim 是输出门
                 {
                     ScopedTimer t(prof, scope("layer_%d.qkv_proj", i));
+                    // attention 投影按自身 dtype 路由（真 checkpoint 是 fp16，不是 GPTQ）
+                    const Dtype ad = w.attn_dtype;
+                    const int ags = (ad == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
                     // 一次投影得到 [query | gate]
-                    mv(w.q_proj, normed_.data(), q_full_.data(), 2 * q_dim_, hidden);
+                    mv_typed(w.q_proj, normed_.data(), q_full_.data(), 2 * q_dim_, hidden, ad, ags);
                     // 按 head 交错分解：前半是 q，后半是 gate
                     for (int h = 0; h < n_heads; ++h) {
                         const float *src = q_full_.data() + h * 2 * head_dim;
@@ -315,8 +318,8 @@ namespace tinyqwen {
                         mv_pair(w.k_proj, w.v_proj, normed_.data(), k_.data(), v_.data(),
                                 kv_dim_, hidden);
                     } else {
-                        mv(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden);
-                        mv(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden);
+                        mv_typed(w.k_proj, normed_.data(), k_.data(), kv_dim_, hidden, ad, ags);
+                        mv_typed(w.v_proj, normed_.data(), v_.data(), kv_dim_, hidden, ad, ags);
                     }
                 }
 
@@ -360,7 +363,9 @@ namespace tinyqwen {
                 // 2g. o_proj + 残差
                 {
                     ScopedTimer t(prof, scope("layer_%d.o_proj", i));
-                    mv(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_);
+                    const Dtype ad = w.attn_dtype;
+                    const int ags = (ad == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
+                    mv_typed(w.o_proj, attn_.data(), o_.data(), hidden, q_dim_, ad, ags);
                 }
                 {
                     ScopedTimer t(prof, scope("layer_%d.residual_attn", i));

@@ -572,6 +572,9 @@ namespace tinyqwen {
                 // q_proj 形状 [2*q_dim, hidden]：前半是 query，后半是输出门
                 if (!bind_mat((s + "q_proj.weight").c_str(), {2 * qd, hidden}, &w.q_proj))
                     return false;
+                // 记录 attention 投影真实 dtype。真 checkpoint 的 attention 投影是
+                // bf16/fp16（不是 GPTQ），forward 必须用 mv_typed 按此 dtype 路由。
+                w.attn_dtype = file.get((s + "q_proj.weight").c_str())->dtype;
                 if (!bind_mat((s + "k_proj.weight").c_str(), {kvd, hidden}, &w.k_proj))
                     return false;
                 if (!bind_mat((s + "v_proj.weight").c_str(), {kvd, hidden}, &w.v_proj))

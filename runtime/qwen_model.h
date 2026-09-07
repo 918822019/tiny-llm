@@ -329,6 +329,10 @@ namespace tinyqwen {
 
             // ---- attention 输出投影 ----
             const void *o_proj = nullptr;  // 输出投影 [hidden, q_dim]（dtype 随模型）
+            // attention 投影的真实 dtype。真 checkpoint 的 attention 投影是
+            // bf16/fp16（不是 GPTQ），而模型级 dtype_ 是 kGPTQ4。若用 mv()
+            // （按模型级 dtype）会把 fp16 当 GPTQ 解析 → 垃圾 → 乱码（坑 #19 同类）。
+            Dtype attn_dtype = Dtype::kF16;
 
             // ---- FFN 前的 RMSNorm 权重 ----
             const float *post_ln = nullptr;  // post-attention RMSNorm（恒 fp32）
