@@ -416,6 +416,13 @@ namespace tinyqwen {
             return (dtype_ == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_;
         }
 
+        // 按张量**自身** dtype 做 matvec。mv() 用的是模型级 dtype_，对 dtype 与
+        // master 不一致的张量会读错：GPTQ MoE 模型里 router（mlp.gate.weight）
+        // 与非 tied 的 lm_head 是 fp32，若按 master=kGPTQ4 解读会把 fp32 数据当
+        // GPTQ 块解析，router logits 全错 → 选错专家 → 输出全错且不报错。
+        void mv_typed(const void *w, const float *x, float *y, int out_dim, int in_dim,
+                      Dtype d, int group_size) const;
+
         // 旋转感知 matvec: 若 rot 有效，先对 x 施加 BiIP 配对旋转（进 rot_buf_），
         // 再做 matvec；rot.sign==nullptr 时等价于普通 mv（非旋转模型零开销分支）。
         void mv_rot(const void *w, const float *x, float *y, int out_dim, int in_dim,
@@ -471,6 +478,11 @@ namespace tinyqwen {
         // embed 张量的真实 dtype（可与文件级 dtype_ 不同，如 vq2 文件里 embed 存 f16）。
         // embed 查表与 tied-lm_head 投影都按它路由，而不是按文件级 dtype_。
         Dtype embed_dtype_ = Dtype::kF32;
+
+        // router 与非 tied lm_head 的真实 dtype。GPTQ MoE 模型里这两个是 fp32
+        // 而 master dtype 是 kGPTQ4，matvec 必须按它们各自的 dtype 路由。
+        Dtype moe_router_dtype_ = Dtype::kF32;
+        Dtype lm_head_dtype_ = Dtype::kF32;
 
         // 旋转量化标志：模型权重在旋转空间量化，推理需对激活做 BiIP 配对旋转。
         // 由是否存在 *.rot_sign 张量决定（见 create）。

@@ -210,6 +210,12 @@ namespace tinyqwen {
         backend_->matvec(wt, x, y, out_dim, in_dim);
     }
 
+    void QwenModel::mv_typed(const void *w, const float *x, float *y, int out_dim, int in_dim,
+                             Dtype d, int group_size) const {
+        WeightTensor wt{w, quant_type_of(d), out_dim, in_dim, group_size};
+        backend_->matvec(wt, x, y, out_dim, in_dim);
+    }
+
     // =========================================================================
     // QwenModel::mv_rot() — 旋转感知 matvec
     // =========================================================================
@@ -431,6 +437,7 @@ namespace tinyqwen {
         } else {
             // 非 tied embeddings：lm_head 必须独立存在
             if (!bind_mat("lm_head.weight", {vocab, hidden}, &m->lm_head_)) return false;
+            m->lm_head_dtype_ = file.get("lm_head.weight")->dtype;
         }
 
         // 每层权重。tensor 名字沿用 HuggingFace 约定（qwen35 的 linear_attn
@@ -458,6 +465,8 @@ namespace tinyqwen {
                 const uint64_t n_exp = cfg.n_routed_experts;
                 if (!bind_mat((p + "mlp.gate.weight").c_str(), {n_exp, hidden}, &w.moe_router))
                     return false;
+                // router 常是 fp32 而 master dtype 可能是 kGPTQ4，须记自身 dtype
+                if (i == 0) m->moe_router_dtype_ = file.get((p + "mlp.gate.weight").c_str())->dtype;
                 // 共享专家可选：Qwen3-MoE 没有这组权重，文件里不存在这些 tensor，
                 // 无条件绑定会报 "missing tensor"。
                 if (cfg.has_shared_expert()) {

@@ -435,8 +435,10 @@ namespace tinyqwen {
                 // 路由门（resident，[n_experts, hidden]）
                 {
                     ScopedTimer t(prof, scope("layer_%d.moe_router", i));
-                    mv(w.moe_router, normed_.data(), moe_gate_logits_.data(),
-                       n_experts_, hidden);
+                    mv_typed(w.moe_router, normed_.data(), moe_gate_logits_.data(),
+                             n_experts_, hidden, moe_router_dtype_,
+                             (moe_router_dtype_ == Dtype::kGPTQ4) ? gptq_group_size_
+                                                                  : group_size_);
                 }
                 // top-k 选择 + softmax 归一
                 {
@@ -566,8 +568,11 @@ namespace tinyqwen {
                     matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
                               logits_.data(), vocab, hidden, group_size_);
                 } else {
-                    // 正常路径：通过 backend 的 matvec
-                    mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+                    // 非 tied lm_head：按张量自身 dtype 路由（GPTQ MoE 里它是 fp32，
+                    // 而 master dtype 是 kGPTQ4，用 mv() 会读错）
+                    mv_typed(lm_head_, normed_.data(), logits_.data(), vocab, hidden,
+                             lm_head_dtype_,
+                             (lm_head_dtype_ == Dtype::kGPTQ4) ? gptq_group_size_ : group_size_);
                 }
             }
 
