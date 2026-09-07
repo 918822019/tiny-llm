@@ -106,11 +106,22 @@ namespace tinyqwen {
             uint64_t up_off, up_nbytes;
             uint64_t down_off, down_nbytes;
             int inter, hidden, group_size;
+            // 三块在文件内连续时可合并成 1 次 pread（B-1 优化）。exporter 按
+            // gate_proj → up_proj → down_proj 顺序写入同一专家，且卸载张量保留
+            // 原始文件偏移，故三者连续（块间仅 64B 对齐填充）。
+            // contiguous 为真时 span_nbytes = down_off+down_nbytes - gate_off，
+            // up_rel/down_rel 是 up/down 在跨度内的相对偏移。
+            bool contiguous = false;
+            uint64_t span_nbytes = 0;
+            uint64_t up_rel = 0, down_rel = 0;
         };
         struct Slot {
             int64_t key = -1;     // (layer, expert) 编码；-1 = 空槽
             uint64_t tick = 0;    // LRU 时戳
             std::vector<uint8_t> gate, up, down;
+            // 三块连续时用单一缓冲一次 pread（B-1）；此时 gate/up/down 为空，
+            // ExpertWeights 的三个指针指向 span 内的不同偏移。
+            std::vector<uint8_t> span;
             ExpertWeights w;
         };
 

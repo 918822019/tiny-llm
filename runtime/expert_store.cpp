@@ -42,6 +42,20 @@ namespace tinyqwen {
         L.up_off = up_off;         L.up_nbytes = up_nbytes;
         L.down_off = down_off;     L.down_nbytes = down_nbytes;
         L.inter = inter;          L.hidden = hidden;   L.group_size = group_size;
+        // 检测三块是否在文件内连续（允许块间 64B 对齐填充）。连续则 get() 可
+        // 合并成 1 次 pread：syscall 从 3 次降到 1 次，且单次大顺序读更容易打满
+        // NVMe 带宽（实测 4.45 GB/s = 峰值 74%，仍有提升空间）。
+        // 判据：up 紧跟 gate、down 紧跟 up，间隙不超过 64 字节对齐填充。
+        const uint64_t gate_end = gate_off + gate_nbytes;
+        const uint64_t up_end = up_off + up_nbytes;
+        const bool ordered = up_off >= gate_end && down_off >= up_end &&
+                             (up_off - gate_end) <= 64 && (down_off - up_end) <= 64;
+        if (ordered) {
+            L.contiguous = true;
+            L.span_nbytes = (down_off + down_nbytes) - gate_off;
+            L.up_rel = up_off - gate_off;
+            L.down_rel = down_off - gate_off;
+        }
         layout_map_[make_key(layer, expert)] = L;
         // 首个注册专家决定单专家字节数（同模型所有专家同形状）。字节预算要靠它
         // 把"预算 MB"换算成"槽数"，所以必须在 register_expert 之后才能设预算。
@@ -145,7 +159,13 @@ namespace tinyqwen {
         if (slots_.empty()) {
             // max_slots_ == 0：每次都现读现返，无缓存。用一个临时静态缓冲。
             // 注意：返回的指针在下一次 get 调用前有效（单线程 decode 内安全）。
-            static thread_local std::vector<uint8_t> t_gate, t_up, t_down;
+            static thread_local std::vector<uint8_t> t_gate, t_up, t_down, t_span;
+            if (L.contiguous) {
+                if (!pread_all(L.gate_off, L.span_nbytes, t_span)) std::abort();
+                stats_.bytes_read += L.span_nbytes;
+                return ExpertWeights{t_span.data(), t_span.data() + L.up_rel,
+                                     t_span.data() + L.down_rel};
+            }
             if (!pread_all(L.gate_off, L.gate_nbytes, t_gate) ||
                 !pread_all(L.up_off, L.up_nbytes, t_up) ||
                 !pread_all(L.down_off, L.down_nbytes, t_down)) {
@@ -168,18 +188,29 @@ namespace tinyqwen {
             slot_index_.erase(s.key);
             ++stats_.evictions;
         }
-        // 读三块进槽
-        if (!pread_all(L.gate_off, L.gate_nbytes, s.gate) ||
-            !pread_all(L.up_off, L.up_nbytes, s.up) ||
-            !pread_all(L.down_off, L.down_nbytes, s.down)) {
-            std::abort();
+        // 读三块进槽。连续时合并成 1 次 pread（B-1）：syscall 3→1，且单次大
+        // 顺序读更容易打满 NVMe 带宽。
+        if (L.contiguous) {
+            if (!pread_all(L.gate_off, L.span_nbytes, s.span)) std::abort();
+            s.gate.clear(); s.up.clear(); s.down.clear();
+            stats_.bytes_read += L.span_nbytes;
+            s.w.gate = s.span.data();
+            s.w.up = s.span.data() + L.up_rel;
+            s.w.down = s.span.data() + L.down_rel;
+        } else {
+            if (!pread_all(L.gate_off, L.gate_nbytes, s.gate) ||
+                !pread_all(L.up_off, L.up_nbytes, s.up) ||
+                !pread_all(L.down_off, L.down_nbytes, s.down)) {
+                std::abort();
+            }
+            s.span.clear();
+            stats_.bytes_read += L.gate_nbytes + L.up_nbytes + L.down_nbytes;
+            s.w.gate = s.gate.data();
+            s.w.up = s.up.data();
+            s.w.down = s.down.data();
         }
-        stats_.bytes_read += L.gate_nbytes + L.up_nbytes + L.down_nbytes;
         s.key = key;
         s.tick = ++tick_;
-        s.w.gate = s.gate.data();
-        s.w.up = s.up.data();
-        s.w.down = s.down.data();
         slot_index_[key] = slot_idx;
         return s.w;
     }
