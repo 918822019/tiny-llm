@@ -313,13 +313,22 @@ int main(int argc, char **argv) {
     if (impl_name.empty()) impl_name = config.get("matvec_impl", "ref");
 
     // ---- 加载权重文件并校验 ----
+    // --moe-ssd 时走稀疏加载：路由专家权重一字节都不读进 RAM，只记 offset
+    // 交给 ExpertStore 按需 pread。这是 SSD 卸载真正省内存的前提。
     tinyqwen::ModelFile file;
     std::string err;
-    if (!file.load(args.model, &err)) {
+    if (!file.load(args.model, &err, args.moe_ssd)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
     if (args.verbose) file.print_summary();
+    if (file.offloaded_count() > 0) {
+        const double mb = 1024.0 * 1024.0;
+        std::fprintf(stderr, "[init] weights: resident %.2f MB, offloaded %zu tensors / %.2f MB "
+                             "on disk (file %.2f MB)\n",
+                     file.resident_bytes() / mb, file.offloaded_count(),
+                     file.offloaded_bytes() / mb, file.file_bytes() / mb);
+    }
 
     // ---- 解析停止符 eos：CLI 显式值 > 模型文件头（v2）> Qwen2.5 默认 ----
     if (args.eos == -2) {

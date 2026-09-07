@@ -60,11 +60,17 @@ namespace tinyqwen {
 
         // 指向数据起始位置的只读指针
         // 注意: 内存所有权属于 ModelFile，本视图不负责释放
+        // SSD 卸载模式下被卸载的 tensor 为 nullptr（字节不在内存）
         const uint8_t *data = nullptr;
 
         // 数据总字节数 = 元素个数 * 每元素字节数
         // 用于校验和内存边界检查
         uint64_t nbytes = 0;
+
+        // .tqwen 文件中的绝对偏移。稀疏加载把 resident tensor 紧凑重排进
+        // data_，(data - base) 不再等于文件偏移，故必须显式记录；
+        // ExpertStore 的 pread 靠它定位被卸载专家。
+        uint64_t file_offset = 0;
 
         // ---------------------------------------------------------------------
         // numel: 计算张量中元素的总个数

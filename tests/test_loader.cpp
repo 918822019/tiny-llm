@@ -482,3 +482,125 @@ TEST (loader_v2_rejects_bad_interval) {
                 err.find("divisible") != std::string::npos);
     std::remove(path.c_str());
 }
+namespace {
+    // 构造一个"像 MoE"的文件：路由门 + 共享专家（必须常驻）+ 若干路由专家
+    // （可卸载，占大头，撑出明显的内存差）
+    std::vector<T> moe_like_tensors() {
+        std::vector<T> v;
+        v.push_back({"model.layers.0.mlp.gate.weight", {4, 4}, std::vector<float>(16, 1.0f)});
+        v.push_back({"model.layers.0.mlp.shared_experts.gate_proj.weight",
+                     {8, 4}, std::vector<float>(32, 2.0f)});
+        for (int e = 0; e < 4; ++e) {
+            const std::string pe = "model.layers.0.mlp.experts." + std::to_string(e) + ".";
+            v.push_back({pe + "gate_proj.weight", {64, 8}, std::vector<float>(512, 3.0f + e)});
+            v.push_back({pe + "up_proj.weight", {64, 8}, std::vector<float>(512, 4.0f + e)});
+        }
+        return v;
+    }
+
+    // 与 write_file 同款算式，算出每个 tensor 的文件偏移，用于核对 file_offset
+    std::vector<uint64_t> expected_offsets(const std::vector<T> &tensors) {
+        const uint64_t data_off =
+            align_up(sizeof(TinyHeader) + tensors.size() * sizeof(TensorEntry));
+        std::vector<uint64_t> offs;
+        uint64_t off = data_off;
+        for (const T &t: tensors) {
+            offs.push_back(off);
+            off = align_up(off + t.data.size() * 4);
+        }
+        return offs;
+    }
+} // namespace
+
+// =============================================================================
+// loader_sparse_offloads_experts — 稀疏加载把路由专家留盘不读
+// =============================================================================
+// 核心命题：offload_experts=true 时名字含 ".mlp.experts." 的 tensor 一个字节
+// 都不进 RAM（data==nullptr），只记 file_offset/nbytes；路由门与共享专家仍常驻。
+TEST (loader_sparse_offloads_experts) {
+    const std::string path = "/tmp/tq_sparse.tqwen";
+    const std::vector<T> tensors = moe_like_tensors();
+    write_file(path, tensors);
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(file.load(path, &err, true));
+    if (!err.empty()) std::printf("err=%s\n", err.c_str());
+
+    // 专家 tensor：留盘，无内存指针，但 offset/nbytes 必须正确
+    const std::vector<uint64_t> offs = expected_offsets(tensors);
+    size_t n_offloaded = 0;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const TensorView *t = file.get(tensors[i].name);
+        EXPECT_TRUE(t != nullptr);
+        EXPECT_EQ(t->file_offset, offs[i]);
+        EXPECT_EQ(t->nbytes, tensors[i].data.size() * 4);
+        const bool is_expert = tensors[i].name.find(".mlp.experts.") != std::string::npos;
+        if (is_expert) {
+            EXPECT_TRUE(t->data == nullptr);
+            ++n_offloaded;
+        } else {
+            EXPECT_TRUE(t->data != nullptr);
+        }
+    }
+    // 8 个路由专家 tensor（4 专家 × gate/up）被卸载；路由门 + 共享专家常驻
+    EXPECT_EQ(n_offloaded, (size_t) 8);
+    EXPECT_EQ(file.offloaded_count(), (size_t) 8);
+    EXPECT_TRUE(file.offloaded_bytes() > 0);
+    // 内存占用必须显著小于文件（专家占大头）
+    EXPECT_TRUE(file.resident_bytes() < file.file_bytes());
+    EXPECT_TRUE(file.offloaded_bytes() > file.file_bytes() / 2);
+    // 常驻 tensor 仍须 64B 对齐（紧凑重排不能丢对齐）
+    const TensorView *r = file.get("model.layers.0.mlp.gate.weight");
+    EXPECT_TRUE(static_cast<uintptr_t>(r->data - file.base()) % kAlignment == 0);
+
+    std::remove(path.c_str());
+}
+
+// =============================================================================
+// loader_sparse_resident_bytes_identical — 稀疏与全量读到的字节必须一致
+// =============================================================================
+// 紧凑重排只是换了落点，内容不能变。逐字节比对两种加载方式的同名 tensor。
+TEST (loader_sparse_resident_bytes_identical) {
+    const std::string path = "/tmp/tq_sparse_eq.tqwen";
+    const std::vector<T> tensors = moe_like_tensors();
+    write_file(path, tensors);
+
+    ModelFile full, sparse;
+    std::string err;
+    EXPECT_TRUE(full.load(path, &err, false));
+    EXPECT_TRUE(sparse.load(path, &err, true));
+
+    for (const T &src: tensors) {
+        const TensorView *f = full.get(src.name);
+        const TensorView *s = sparse.get(src.name);
+        EXPECT_TRUE(f != nullptr && s != nullptr);
+        EXPECT_EQ(f->nbytes, s->nbytes);
+        if (s->data == nullptr) continue;  // 卸载的不比（全量侧才有数据）
+        EXPECT_EQ(std::memcmp(f->data, s->data, s->nbytes), 0);
+    }
+    std::remove(path.c_str());
+}
+
+// =============================================================================
+// loader_full_keeps_entire_file — 全量路径回归：默认行为不变
+// =============================================================================
+// offload_experts=false 时必须整文件驻留，没有任何 tensor 被卸载。这是保证
+// 非 MoE 模型与 MoE resident 正确性锚点不受影响的回归护栏。
+TEST (loader_full_keeps_entire_file) {
+    const std::string path = "/tmp/tq_full.tqwen";
+    const std::vector<T> tensors = moe_like_tensors();
+    write_file(path, tensors);
+
+    ModelFile file;
+    std::string err;
+    EXPECT_TRUE(file.load(path, &err));  // 默认 offload_experts=false
+    EXPECT_EQ(file.resident_bytes(), file.file_bytes());
+    EXPECT_EQ(file.offloaded_count(), (size_t) 0);
+    EXPECT_EQ(file.offloaded_bytes(), (size_t) 0);
+    for (const T &src: tensors) {
+        const TensorView *t = file.get(src.name);
+        EXPECT_TRUE(t != nullptr && t->data != nullptr);
+    }
+    std::remove(path.c_str());
+}

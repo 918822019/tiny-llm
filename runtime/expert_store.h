@@ -15,10 +15,12 @@
 //   - 共享专家 / 路由门 / attention 等不在本 store（resident，在 ModelFile）。
 //
 // 与 ModelFile 的关系：
-//   ModelFile 仍加载 header + tensor 表（含专家 tensor 的元信息），但其
-//   "data_ 整文件缓冲"对专家 tensor 不被 forward 直接引用——forward 只经
-//   ExpertStore::get() 取专家权重。offset/nbytes 在 create() 时由
-//   view.data - file.base() 反推（与 print_summary 同款指针算式）注册。
+//   --moe-ssd 时 ModelFile 走稀疏加载：data_ 只含 header + tensor 表 + resident
+//   tensor，路由专家的字节**一整个不进 RAM**（其 TensorView.data 为 nullptr）。
+//   forward 只经 ExpertStore::get() 取专家权重。offset/nbytes 在 create() 时
+//   直接取 TensorView::file_offset 注册——稀疏紧凑重排后 (view.data - base())
+//   不再等于文件内偏移，指针算式会算错。
+//   不开 --moe-ssd 时 ModelFile 仍整文件读入，专家走 resident 指针（正确性锚点）。
 //
 // 生命周期：返回的 ExpertWeights 指针指向缓存槽内部缓冲，**仅在当前 forward
 //   步内有效**（下一 token 可能淘汰该槽）。同步 get() 下不跨 token 持有。

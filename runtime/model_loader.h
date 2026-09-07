@@ -195,8 +195,16 @@ namespace tinyqwen {
         //   - tensor 表和数据区偏移是否在文件范围内
         //   - 每个 tensor 的 offset + nbytes 是否在文件范围内
         //   - tensor 的 shape 和 dtype 是否合法
+        //
+        // offload_experts:
+        //   false（默认）= 整文件读进 data_，行为与历史版本逐字节一致。
+        //   true  = 稀疏加载：只把 resident tensor 紧凑打包进 data_，名字含
+        //           ".mlp.experts." 的路由专家 tensor 一个字节都不读，只记
+        //           file_offset/nbytes（其 TensorView.data 为 nullptr），
+        //           由 ExpertStore 按需 pread。这是 MoE SSD 卸载真正省内存的
+        //           前提——不开这个开关，专家权重照样全量驻留 RAM。
         // ---------------------------------------------------------------------
-        bool load(const std::string &path, std::string *err);
+        bool load(const std::string &path, std::string *err, bool offload_experts = false);
 
         // ---- 状态查询 ----
 
@@ -204,7 +212,22 @@ namespace tinyqwen {
         bool loaded() const { return !data_.empty(); }
 
         // 文件数据在内存中的起始地址（用于计算 tensor 的绝对地址）
+        // 稀疏加载下这是紧凑缓冲的起点，不等于文件起点
         const uint8_t *base() const { return data_.data(); }
+
+        // ---- 内存归因（稀疏加载才区分 resident / offloaded）----
+
+        // 磁盘上 .tqwen 的真实总字节数
+        size_t file_bytes() const { return file_bytes_; }
+
+        // 实际驻留 RAM 的字节数（data_ 的大小）
+        size_t resident_bytes() const { return data_.size(); }
+
+        // 留盘未读的专家权重字节数（稀疏加载下 > 0；全量加载恒为 0）
+        size_t offloaded_bytes() const { return offloaded_bytes_; }
+
+        // 被卸载的 tensor 个数
+        size_t offloaded_count() const { return offloaded_count_; }
 
         // 获取文件头（包含魔数、版本、配置等）
         const TinyHeader &header() const { return header_; }
@@ -248,6 +271,7 @@ namespace tinyqwen {
 
     private:
         // 整个文件的内容（我们拥有的唯一一份内存，所有 TensorView 的 data 都指向这里）
+        // 稀疏加载时只含 header+表+resident tensor
         std::vector<uint8_t> data_;
 
         // 文件头（192 字节），包含魔数、版本、模型配置等
@@ -261,5 +285,12 @@ namespace tinyqwen {
 
         // 按文件内顺序记录 tensor 名字，供 print_summary() 按序打印
         std::vector<std::string> order_;
+
+        // 磁盘文件真实大小（稀疏加载下 data_.size() < file_bytes_）
+        size_t file_bytes_ = 0;
+
+        // 留盘未读的专家权重字节数与 tensor 个数
+        size_t offloaded_bytes_ = 0;
+        size_t offloaded_count_ = 0;
     };
 } // namespace tinyqwen

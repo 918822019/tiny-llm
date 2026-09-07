@@ -28,6 +28,9 @@
 #include <cerrno>    // errno（strerror 获取错误描述）
 #include <cstdio>    // 标准输入输出（fopen, fread, fseek, ftell, fclose）
 #include <cstring>   // 内存操作（memcmp, memcpy）
+#include <fcntl.h>   // open, O_RDONLY（稀疏加载按需 pread）
+#include <unistd.h>  // pread, close
+#include <sys/stat.h> // stat（稀疏加载量文件真实大小）
 
 namespace tinyqwen {
     namespace {
@@ -39,6 +42,59 @@ namespace tinyqwen {
         //   msg — 错误信息字符串
         void fail(std::string *err, const std::string &msg) {
             if (err) *err = msg;
+        }
+
+        // =====================================================================
+        // is_offloadable() — 该 tensor 是否可留盘不读
+        // =====================================================================
+        // 只有路由专家权重可以卸载。判据是 HF 命名约定里的 ".mlp.experts."
+        // 子串：路由专家叫 model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight，
+        // 而路由门是 mlp.gate.weight、共享专家是 mlp.shared_experts.*，都不含
+        // 这个子串，因此天然区分开。attention / norm / embed / lm_head 同理。
+        bool is_offloadable(const std::string &name) {
+            return name.find(".mlp.experts.") != std::string::npos;
+        }
+
+        // =====================================================================
+        // align_up() — 向上取整到 kAlignment（64B）
+        // =====================================================================
+        // 稀疏紧凑打包时每个 resident tensor 的起点仍须 64B 对齐：kernel 里有
+        // 按 16B/64B 对齐选路的分支（如 matvec_f32_neon_mt_kv_nt 的 LDNP 路径），
+        // 丢掉对齐会静默走慢路甚至读错。
+        uint64_t align_up(uint64_t x) { return (x + kAlignment - 1) / kAlignment * kAlignment; }
+
+        // =====================================================================
+        // FdGuard — RAII 关闭 fd
+        // =====================================================================
+        // load() 有十几条 early-return 校验路径，手动 close 必漏。
+        struct FdGuard {
+            int fd = -1;
+
+            ~FdGuard() { if (fd >= 0) ::close(fd); }
+        };
+
+        // =====================================================================
+        // pread_exact() — 从 fd 在 offset 处读满 nbytes（处理短读）
+        // =====================================================================
+        bool pread_exact(int fd, uint64_t offset, size_t nbytes, uint8_t *dst,
+                         const std::string &path, std::string *err) {
+            size_t done = 0;
+            while (done < nbytes) {
+                ssize_t r = ::pread(fd, dst + done, nbytes - done,
+                                    static_cast<off_t>(offset + done));
+                if (r < 0) {
+                    fail(err, "pread failed at offset " + std::to_string(offset + done) +
+                              ": " + path + " (" + std::strerror(errno) + ")");
+                    return false;
+                }
+                if (r == 0) {
+                    fail(err, "short read (EOF) at offset " + std::to_string(offset + done) +
+                              ": " + path);
+                    return false;
+                }
+                done += static_cast<size_t>(r);
+            }
+            return true;
         }
 
         // =====================================================================
@@ -121,16 +177,40 @@ namespace tinyqwen {
     // 返回值：成功返回 true，失败返回 false
     // 说明：这是核心加载函数，分为 5 个阶段，每个阶段做严格的校验。
     //       任何校验失败立即返回 false，不给后面的计算留下脏数据。
-    bool ModelFile::load(const std::string &path, std::string *err) {
+    bool ModelFile::load(const std::string &path, std::string *err, bool offload_experts) {
         // 重置内部状态
         data_.clear();
         tensors_.clear();
         order_.clear();
         header_ = TinyHeader{};
         config_ = ModelConfig{};
+        file_bytes_ = 0;
+        offloaded_bytes_ = 0;
+        offloaded_count_ = 0;
 
-        // 读取整个文件到内存
-        if (!read_entire_file(path, &data_, err)) return false;
+        // 稀疏加载全程持 fd 按需 pread（FdGuard 保证任何 return 路径都关）
+        FdGuard guard;
+        if (offload_experts) {
+            struct stat st{};
+            if (::stat(path.c_str(), &st) != 0) {
+                fail(err, "cannot stat file: " + path + " (" + std::strerror(errno) + ")");
+                return false;
+            }
+            file_bytes_ = static_cast<size_t>(st.st_size);
+            guard.fd = ::open(path.c_str(), O_RDONLY);
+            if (guard.fd < 0) {
+                fail(err, "cannot open file: " + path + " (" + std::strerror(errno) + ")");
+                return false;
+            }
+            data_.resize(sizeof(TinyHeader));
+            if (!pread_exact(guard.fd, 0, sizeof(TinyHeader), data_.data(), path, err)) {
+                return false;
+            }
+        } else {
+            // 读取整个文件到内存
+            if (!read_entire_file(path, &data_, err)) return false;
+            file_bytes_ = data_.size();
+        }
 
         // ---- 阶段 1：校验文件头（这是不是一个合法、完整、我们认识的文件）----
 
@@ -163,10 +243,11 @@ namespace tinyqwen {
             fail(err, "loader supports dtype f32/f16/i4/vq2/gptq4, got " + std::to_string(header_.dtype));
             return false;
         }
-        // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了
-        if (header_.total_bytes != data_.size()) {
+        // 头里记录的文件大小必须和磁盘上真实大小一致，否则文件被截断了。
+        // 稀疏加载下 data_ 只含前置区，上界必须用 file_bytes_（stat 得到）。
+        if (header_.total_bytes != file_bytes_) {
             fail(err, "total_bytes mismatch: header=" + std::to_string(header_.total_bytes) +
-                      " actual=" + std::to_string(data_.size()));
+                      " actual=" + std::to_string(file_bytes_));
             return false;
         }
         // tensor 表偏移必须是 TinyHeader 大小（v1 格式约定）
@@ -181,14 +262,25 @@ namespace tinyqwen {
         }
         // tensor 表不能越出文件末尾
         const uint64_t table_bytes = header_.tensor_count * sizeof(TensorEntry);
-        if (header_.tensor_table_offset + table_bytes > data_.size()) {
+        if (header_.tensor_table_offset + table_bytes > file_bytes_) {
             fail(err, "tensor table runs past end of file");
             return false;
         }
-        // 数据偏移必须 64B 对齐，且大于头大小
-        if (header_.data_offset % kAlignment != 0 || header_.data_offset < sizeof(TinyHeader)) {
+        // 数据偏移必须 64B 对齐、大于头大小、且不越出文件末尾
+        if (header_.data_offset % kAlignment != 0 || header_.data_offset < sizeof(TinyHeader) ||
+            header_.data_offset > file_bytes_) {
             fail(err, "bad data_offset: " + std::to_string(header_.data_offset));
             return false;
+        }
+        // 稀疏加载：data_offset 通过校验后才可信，此时才能安全地读满前置区
+        // （header + tensor 表）。这段必须常驻，表解析全靠它。
+        if (offload_experts && data_.size() < header_.data_offset) {
+            const size_t already = data_.size();
+            data_.resize(header_.data_offset);
+            if (!pread_exact(guard.fd, already, header_.data_offset - already,
+                             data_.data() + already, path, err)) {
+                return false;
+            }
         }
 
         // 模型配置本身的合理性：这些值接下来要拿来建模，必须能用
@@ -211,6 +303,10 @@ namespace tinyqwen {
         }
 
         // ---- 阶段 2：逐条校验 tensor 表，并建立"名字 -> 视图"索引 ----
+        // 稀疏加载下 resident tensor 在紧凑 data_ 里的落点游标 + 待读清单
+        size_t compact_cursor = header_.data_offset;
+        struct Pending { std::string name; uint64_t file_off; uint64_t nbytes; size_t slot; };
+        std::vector<Pending> pending;
         for (uint64_t i = 0; i < header_.tensor_count; ++i) {
             // 从数据区中读取第 i 个 tensor 的条目
             TensorEntry e;
@@ -292,8 +388,8 @@ namespace tinyqwen {
                 fail(err, "tensor #" + std::to_string(i) + ": unaligned / bad offset");
                 return false;
             }
-            // 数据不能越出文件末尾
-            if (e.offset + e.nbytes > data_.size()) {
+            // 数据不能越出文件末尾（稀疏加载下 data_ 只含前置区，上界用 file_bytes_）
+            if (e.offset + e.nbytes > file_bytes_) {
                 fail(err, "tensor #" + std::to_string(i) + ": payload runs past end of file");
                 return false;
             }
@@ -310,17 +406,44 @@ namespace tinyqwen {
                 return false;
             }
 
-            // 这一条合法：构造一个指向文件内存的视图并存进索引
-            // 注意 data 指针 = 文件内存起点 + 该 tensor 的偏移，零拷贝
+            // 这一条合法：构造视图并存进索引。
+            // 全量加载：data 直接指向文件内存（零拷贝）。
+            // 稀疏加载：专家 tensor 留盘（data=nullptr）；resident tensor 的落点
+            //           此刻只算好游标，真正 pread 与指针绑定留到表解析完之后
+            //           （那时才知道 data_ 最终多大，resize 会使指针失效）。
             TensorView view;
             view.name = name;
             view.dtype = static_cast<Dtype>(e.dtype);
             view.ndim = static_cast<int>(e.ndim);
             for (int d = 0; d < 4; ++d) view.shape[d] = e.shape[d];
-            view.data = data_.data() + e.offset; // 零拷贝：直接指向文件内存
             view.nbytes = e.nbytes;
+            view.file_offset = e.offset;
+            if (!offload_experts) {
+                view.data = data_.data() + e.offset;
+            } else if (is_offloadable(name)) {
+                view.data = nullptr;
+                offloaded_bytes_ += e.nbytes;
+                ++offloaded_count_;
+            } else {
+                pending.push_back({name, e.offset, e.nbytes, compact_cursor});
+                compact_cursor = align_up(compact_cursor + e.nbytes);
+            }
             tensors_.emplace(name, std::move(view)); // 存入 map
             order_.push_back(std::move(name));       // 记录插入顺序（用于 print_summary）
+        }
+
+        // ---- 阶段 2b：稀疏加载——把 resident tensor 真正读进紧凑缓冲 ----
+        // 必须在表解析完之后：data_ 的最终大小此刻才确定，先 resize 再绑指针，
+        // 否则循环里绑的指针会被 resize 失效。专家 tensor 全程未被读。
+        if (offload_experts) {
+            data_.resize(compact_cursor);
+            for (const Pending &p: pending) {
+                if (!pread_exact(guard.fd, p.file_off, static_cast<size_t>(p.nbytes),
+                                 data_.data() + p.slot, path, err)) {
+                    return false;
+                }
+                tensors_.at(p.name).data = data_.data() + p.slot;
+            }
         }
 
         // ---- 阶段 3：把配置导出成 ModelConfig 供建模使用 ----
@@ -534,9 +657,18 @@ namespace tinyqwen {
                     fail(err, "tensor '" + kv.first + "': gptq block too small for header");
                     return false;
                 }
-                // in-band magic（数据在 data_ 内，可读；fake 模型全文件已加载）
+                // in-band magic。稀疏加载下被卸载的专家 data==nullptr，改为只
+                // pread 前 4 字节：既保住 fail fast，又不把整个专家读进内存。
                 uint32_t magic = 0;
-                std::memcpy(&magic, t.data, 4);
+                if (t.data != nullptr) {
+                    std::memcpy(&magic, t.data, 4);
+                } else {
+                    uint8_t hdr4[4];
+                    if (!pread_exact(guard.fd, t.file_offset, 4, hdr4, path, err)) {
+                        return false;
+                    }
+                    std::memcpy(&magic, hdr4, 4);
+                }
                 if (magic != kGptqMagic) {
                     fail(err, "tensor '" + kv.first + "': gptq magic mismatch");
                     return false;
@@ -589,14 +721,19 @@ namespace tinyqwen {
         std::printf("%-56s %-18s %-5s %12s %14s\n", "name", "shape", "dtype", "offset", "nbytes");
         for (const std::string &name: order_) {
             const TensorView &t = tensors_.at(name);
-            // TensorView 没单独存 offset，这里用"指针 - 文件起点"反推出来
-            uint64_t offset = static_cast<uint64_t>(t.data - data_.data());
-            std::printf("%-56s %-18s %-5s %12llu %14llu\n", name.c_str(), shape_str(t).c_str(),
-                        dtype_name(t.dtype), (unsigned long long) offset,
-                        (unsigned long long) t.nbytes);
+            std::printf("%-56s %-18s %-5s %12llu %14llu%s\n", name.c_str(), shape_str(t).c_str(),
+                        dtype_name(t.dtype), (unsigned long long) t.file_offset,
+                        (unsigned long long) t.nbytes, t.data ? "" : "  [SSD offloaded]");
         }
-        // 打印文件总大小
-        std::printf("file size: %llu bytes (%.2f MB)\n", (unsigned long long) data_.size(),
-                    (double) data_.size() / (1024.0 * 1024.0));
+        // 打印文件总大小与内存归因（稀疏加载下 resident 远小于 file）
+        std::printf("file size: %llu bytes (%.2f MB)\n", (unsigned long long) file_bytes_,
+                    (double) file_bytes_ / (1024.0 * 1024.0));
+        if (offloaded_count_ > 0) {
+            std::printf("resident: %llu bytes (%.2f MB); offloaded: %zu tensors / %llu bytes "
+                        "(%.2f MB) 留盘\n",
+                        (unsigned long long) data_.size(), (double) data_.size() / (1024.0 * 1024.0),
+                        offloaded_count_, (unsigned long long) offloaded_bytes_,
+                        (double) offloaded_bytes_ / (1024.0 * 1024.0));
+        }
     }
 } // namespace tinyqwen

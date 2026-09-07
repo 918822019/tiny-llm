@@ -143,6 +143,17 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    `full_attention_interval = 0`（v1 格式）时 `(idx+1)/interval` 除零，返回值变垃圾。
    `n_full_layers()` 与 `is_linear_layer()` 都有 `<= 1` 守卫，但这个函数没有 ——
    **同一结构体里三个函数的守卫不一致**，混合架构代码里用它之前先确认 interval。
+17. **MoE SSD 卸载不开稀疏加载等于没卸载**。`ModelFile::load()` 历史上整文件读进
+   `data_`，所以即便走 ExpertStore 的 pread 路径，专家权重照样全量常驻 RAM ——
+   pread 只是演示机制。必须 `load(path, err, offload_experts=true)`（`--moe-ssd`
+   自动传），判据是名字含 `.mlp.experts.`（路由门 `mlp.gate.weight`、共享专家
+   `mlp.shared_experts.*` 都不含，别把判据放宽到 `.mlp.` 否则误伤常驻部分）。
+   两个连带坑：**(a) `(view.data - file.base())` 不再是文件偏移**——稀疏把 resident
+   tensor 紧凑重排了，一律改用 `TensorView::file_offset`；**(b) 卸载 tensor 的
+   `data` 是 `nullptr`**，任何无条件解引用它的校验都会段错误（GPTQ in-band magic
+   校验就中招过，改成只 pread 前 4 字节）。紧凑打包时每个 tensor 起点仍须 64B 对齐
+   （kernel 有按对齐选路的分支）。内存是否真降看启动行 `[init] weights: resident ..
+   offloaded ..`，logits 逐位一致只证明算对了、不证明内存省了。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

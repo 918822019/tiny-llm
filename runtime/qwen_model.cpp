@@ -464,10 +464,9 @@ namespace tinyqwen {
                               {shared_inter, hidden}, &w.moe_shared_up)) return false;
                 if (!bind_mat((p + "mlp.shared_experts.down_proj.weight").c_str(),
                               {hidden, shared_inter}, &w.moe_shared_down)) return false;
-                // 路由专家：resident 指针绑定（fake 模型 data_ 内全有）+
-                // 向 ExpertStore 注册文件 offset（SSD 模式 pread 用）
+                // 路由专家：resident 模式绑定内存指针；稀疏加载下 data==nullptr，
+                // 只注册文件 offset 给 ExpertStore 按需 pread。
                 w.moe_experts.resize(n_exp);
-                const uint8_t *base = file.base();
                 for (uint32_t e = 0; e < n_exp; ++e) {
                     const std::string pe = p + "mlp.experts." + std::to_string(e) + ".";
                     const TensorView *tg = m->require_view(file, pe + "gate_proj.weight",
@@ -479,14 +478,24 @@ namespace tinyqwen {
                     const TensorView *td = m->require_view(file, pe + "down_proj.weight",
                                                            {hidden, moe_inter}, err);
                     if (!td) return false;
+                    // 专家被卸载（留盘）时必须有 ExpertStore 兜住。放行 nullptr
+                    // 进 forward 会段错误或静默算错，这里 fail fast。
+                    if (tg->data == nullptr && !expert_store) {
+                        if (err) *err = "expert weights are SSD-offloaded but no ExpertStore "
+                                        "given; load the model with offload_experts only when "
+                                        "an ExpertStore is wired up";
+                        return false;
+                    }
                     w.moe_experts[e] = {tg->data, tu->data, td->data};
                     m->expert_dtype_ = tg->dtype;  // 推断（fake = kGPTQ4）
                     if (expert_store) {
+                        // offset 一律取 TensorView::file_offset：稀疏紧凑重排后
+                        // (data - base) 不再是文件内偏移，指针算式会算错。
                         expert_store->register_expert(
                             static_cast<int>(i), static_cast<int>(e),
-                            static_cast<uint64_t>(tg->data - base), tg->nbytes,
-                            static_cast<uint64_t>(tu->data - base), tu->nbytes,
-                            static_cast<uint64_t>(td->data - base), td->nbytes,
+                            tg->file_offset, tg->nbytes,
+                            tu->file_offset, tu->nbytes,
+                            td->file_offset, td->nbytes,
                             static_cast<int>(moe_inter), static_cast<int>(hidden),
                             m->gptq_group_size_);
                     }
