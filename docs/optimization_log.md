@@ -4073,6 +4073,36 @@ for T in 1 2 4 7 8; do for i in 1 2 3 4 5; do
 done; done
 ```
 
+### 内存预算预检 fail-fast（2026-09-08，commit 0870edc）
+
+- **是什么**：`main.cpp` 在 `ModelFile::load()` 之前调用 `estimate_resident_bytes()`
+  算出模型常驻内存需求，与 `available_memory_bytes()`（free+inactive+purgeable）
+  的 90% 比较，超了就拒绝加载。覆盖**所有**模型（不只 MoE）。
+- **为什么**：此前非 MoE 模型（如 4B i4 4.91 GB）完全没有内存校验，加载时直接换页
+  且零警告。MoE 的 `--moe-ssd` 有校验但放错位置（load 之后才检查，权重已进 RAM）。
+  swap 是**写操作**、消耗 SSD 寿命，所以宁可 fail-fast。
+- **实现**：`estimate_resident_bytes` 只读 header（192 字节）+ tensor 表，**一个数据区
+  字节都不读**，所以能在 load() 之前把需求算准。稀疏加载下复现 load() 的紧凑打包
+  游标。`available_memory_bytes` 用 `host_statistics64`（macOS）/ `_SC_AVPHYS_PAGES`
+  （Linux），判据是**可用**内存而非物理总量（wired 已占大半，按总量校验会宽松数倍）。
+- **错误信息**：给出具体数字（需求 MB vs 上限 MB）+ 四条修复建议（关进程 / `--moe-ssd`
+  / 换小量化 / 缩小专家缓存预算）。
+- **非优化**：不改变性能，纯可靠性改进。
+
+### bench_clean.sh 干净环境测速脚本（2026-09-08，commit 9993c2d）
+
+- **是什么**：重启后专用测速脚本 `scripts/bench_clean.sh`，替代 `bench.sh` 在脏环境下
+  计时不可信的问题。
+- **门禁**：测前检查 load（≤4）/ swap used（≤5 GB）/ 可用内存（≥2 GB），超阈值
+  exit 1 拒绝。`FORCE=1` 可跳过。
+- **统计**：取 min 而非中位数（坑 #7 污染是加性的，min 比 median 稳）；离散度
+  max/min >1.5 的行标注「不可用于归因」（M4 MPS JIT 波动 + 热降频）。
+- **测后复查**：检查 swap 增量，超 500 MB 打警告。
+- **带宽对照**：可选 `BYTES_PER_TOKEN` 环境变量，反推有效带宽对照本机墙（M4 NVMe
+  ~6.5 GB/s，unified memory ~114 GB/s）。
+- **vm_stat 取值**：用 `$NF`（最后字段）规避 macOS vm_stat 输出格式差异，12 项逐项核对。
+- **非优化**：测量工具，不改变性能数字。
+
 ---
 
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->

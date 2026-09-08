@@ -42,8 +42,8 @@
 | `total_ms`         | 所有 token latency 之和（不含加载模型；批量 prefill 计入整批那条记录）                                                         |
 | `first_token_ms`   | TTFT：prefill 记录耗时之和。批量 prefill（默认 CPU 路径）= 整批记录的耗时；逐 token 路径（verbose / GPU engine）= 各 prefill token 之和 |
 | `decode_avg_ms`    | decode 阶段平均每 token 耗时                                                                                   |
-| `tokens[].ops`     | 该 token 内按执行顺序记录的 op 耗时；op 命名如 `layer_3.q_proj`、`lm_head`                                               |
-| `op_totals`        | 跨 token 聚合，用于看 op 占比                                                                                    |
+| `tokens[].ops`     | 该 token 内按执行顺序记录的 op 耗时。**同一 token 内同名 op 先按名合并求和再写入**（如 MoE 每层多次调用的 `expert_load`/`expert_ffn`），避免 JSON 重名键被 `json.load` 静默丢弃（8d7ad38 修复，见 AGENTS.md 坑 #34） |
+| `op_totals`        | 跨 token 聚合（profiler 内部逐记录累加，不受重名影响），用于看 op 占比                                                      |
 
 注意事项：
 

@@ -22,7 +22,15 @@
   fp16→fp32 转换抵消读带宽减半——是内存特性不是提速，见优化日志
   `fp16_kv_fused`）；fp16-KV 仅 CPU（CUDA 后端调用即 abort）；
 - 超出 max_seq_len / KV 溢出直接 abort（fail loud）；
-- speculative rollback / KV truncate 未实现。
+- speculative rollback / KV truncate 未实现；
+- **i4 稠密 decode 段错误（已知未修，见 AGENTS.md 坑 #35）**：`model_qwen35_i4.tqwen`
+  在 `--matvec-impl sdot4_mt --ops-impl neon` 下 prefill 正常、第一个 decode token
+  崩溃（exit 139）。f16 同命令正常。预存在 bug，回归区间 cefae4b..5d8c6b4（MoE/GPTQ
+  大重构期）。199 单测 + verify.sh 不覆盖真模型稠密 i4 decode，是已知测试缺口；
+- **MoE ExpertStore LRU 对 decode 结构性失效（已知未修，见 AGENTS.md 坑 #34）**：
+  `cache_slots` 是全局槽池，每 token 顺序扫全部层 × top-k 专家，LRU 留下的恰好
+  是后半段层，下一 token 又从层 0 开始 → **hits=0 且与槽数无关**。要提升命中率需
+  实现 pin（免淘汰）机制，判据见 `tools/analyze_moe_expert_freq.py`。
 
 ## 后端与硬件
 

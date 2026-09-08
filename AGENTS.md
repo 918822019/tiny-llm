@@ -302,7 +302,7 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     JSON object 键就产生重名，Python `json.load` **只保留最后一条**，这两个 op
     被少算 8×。曾据此得出"MoE decode 有 62% 时间未归因（219 ms/tok）"，
     投入一轮定位（加 `all_layers` + 逐层 `layer_total` 护栏），结论全部作废；
-    真值是 **100.2% 闭合、缝隙 -0.2%**。已修（同一 token 内先按名合并求和）。
+    真值是 **100.2% 闭合、缝隙 -0.2%**。已修（8d7ad38；同一 token 内先按名合并求和）。
     **"未归因时间"出现时先怀疑解析器，再怀疑代码。** 三条独立证据交叉最快：
     ① 数原始 JSON 文本里该 op 名的出现次数；② 用 `op_totals`（profiler 内部
     逐记录累加，不受重名影响）对账；③ `sample <pid> 3` 抓调用栈（坑 #27 同源，
@@ -315,6 +315,16 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     下一 token 又从层 0 开始 → **hits=0 且与槽数无关**（实测 slots=4/192/768 全是
     hits=0）。这解释了坑 #20 为何测出"slots=4 最优"：槽数从不提升命中率，只增大
     常驻集。要提升命中率得用 **pin（免淘汰）**，判据见 `tools/analyze_moe_expert_freq.py`。
+35. **i4 稠密 decode 段错误是预存在 bug（cefae4b..5d8c6b4 区间）**。
+    `model_qwen35_i4.tqwen` + `--matvec-impl sdot4_mt --ops-impl neon` prefill
+    完成后第一个 decode token 段错误（exit 139），`scripts/bench.sh` 同样崩，
+    f16 同命令正常。bisect 锁定为预存在回归：`5d8c6b4`（38 个提交之前）已崩，
+    `cefae4b` 正常。引入区间是 MoE/GPTQ/ExpertStore 大重构时期（4271 行插入）。
+    **教训：bisect 基准必须选直接父提交，不能拿 N 个提交之前的版本当基线** ——
+    曾因此误归因于自己提交并做了不必要的 revert（`be0b3df`，后 reset 丢弃）。
+    **AGENTS.md 坑 #1 记录的 i4 配方（8.1 ms/tok）当前对 `model_qwen35_i4.tqwen`
+    不可用**。199 单测 + `verify.sh` 全过（无真模型时第 3 步跳过）—— 测试未覆盖
+    真模型稠密 i4 decode 路径，是覆盖缺口。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 
