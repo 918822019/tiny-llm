@@ -296,6 +296,25 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     的验证，只能证明自洽、不能证明正确。
     **可用的独立判据**：解量化权重的奇异值谱（顶/第二比值，健康模型 ≈1，
     病态 ≈5）、残差流范数随层的变化（应与已验证模型同量级）。
+34. **profile JSON 的 op 名会重名，`json.load` 静默丢数据**。`Profiler::leave()`
+    对**每次调用**都 push 一条 `OpRecord`，而 MoE decode 每层对
+    `expert_load`/`expert_ffn` 各调用 top-k 次（8 次）—— `write_json` 逐条写成
+    JSON object 键就产生重名，Python `json.load` **只保留最后一条**，这两个 op
+    被少算 8×。曾据此得出"MoE decode 有 62% 时间未归因（219 ms/tok）"，
+    投入一轮定位（加 `all_layers` + 逐层 `layer_total` 护栏），结论全部作废；
+    真值是 **100.2% 闭合、缝隙 -0.2%**。已修（同一 token 内先按名合并求和）。
+    **"未归因时间"出现时先怀疑解析器，再怀疑代码。** 三条独立证据交叉最快：
+    ① 数原始 JSON 文本里该 op 名的出现次数；② 用 `op_totals`（profiler 内部
+    逐记录累加，不受重名影响）对账；③ `sample <pid> 3` 抓调用栈（坑 #27 同源，
+    本次 39% 样本停在 `pread`，与 `op_totals` 吻合、与 per-token dict 差 6×）。
+    **连带修正坑 #29**：`expert_load` 90.69 ms/tok ÷ 918 MB/token = **10.19 GB/s**，
+    超 NVMe 峰值 6.5 GB/s 的 157% —— 物理上不可能是磁盘读，热专家实际走
+    **OS page cache（内存带宽）**。所以"已达 NVMe 带宽下限"的判断对热专家不成立。
+    另：**ExpertStore 的 LRU 对 MoE decode 结构性失效**，`cache_slots` 是全局槽池
+    而每 token 顺序扫 48 层 × top-8 = 384 次访问，LRU 留下的恰好是层 24–47 的专家，
+    下一 token 又从层 0 开始 → **hits=0 且与槽数无关**（实测 slots=4/192/768 全是
+    hits=0）。这解释了坑 #20 为何测出"slots=4 最优"：槽数从不提升命中率，只增大
+    常驻集。要提升命中率得用 **pin（免淘汰）**，判据见 `tools/analyze_moe_expert_freq.py`。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

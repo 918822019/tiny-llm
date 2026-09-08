@@ -27,6 +27,7 @@
 // ============================================================================
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -93,18 +94,37 @@ namespace tinyqwen {
         // 归因访问器：当前缓存占用的字节上限与推算出的槽数
         uint64_t cache_budget_bytes() const { return cache_budget_bytes_; }
         uint64_t per_expert_bytes() const { return per_expert_bytes_; }
+        // load_expert_direct 所需的 staging 字节数（连续布局为跨度，含对齐填充，
+        // 比 per_expert_bytes 大）。分配直读缓冲必须用这个，不能用前者。
+        uint64_t expert_staging_bytes() const { return expert_staging_bytes_; }
 
         // 取一个专家的三块权重：命中缓存则零拷贝返回；未命中淘汰 LRU + pread。
         // 返回的指针指向缓存槽内部，仅在下次淘汰前有效。
         const ExpertWeights get(int layer, int expert);
 
-        ExpertStoreStats stats() const { return stats_; }
+        // 并行直读路径不经 stats_（裸 size_t，并发累加不安全），改用独立原子计数，
+        // 读时并入 bytes_read。否则并行模式下 hits/misses/bytes_read 全为 0，
+        // 有效带宽归因（docs 里那套 GB/s 反推法）会失效。
+        ExpertStoreStats stats() const {
+            ExpertStoreStats s = stats_;
+            s.bytes_read += direct_bytes_read_.load(std::memory_order_relaxed);
+            return s;
+        }
 
         // 从 .tqwen 在 offset 处读 nbytes 字节到 out（调用方分配）。
         // 供 embed_tokens 卸载后按需读单行用：embed 是查表，每 token 只读 1 行
         // （hidden*4 = 8 KB），却占 1187 MB fp32（本模型 resident 的 41%）。
         // 复用本 store 已持有的 fd，不必再开一个。
         bool read_bytes(uint64_t offset, size_t nbytes, void *out);
+
+        // 绕过 LRU，直接 pread 一个专家到调用方缓冲。**线程安全**：::pread 无文件
+        // 偏移状态，layout_map_ 在 register_expert 后只读，各调用方写自己的缓冲。
+        // 供专家级并行用——get() 返回的指针指向 LRU 槽，会被后续淘汰覆盖，无法同时
+        // 持有 top-k 个专家；而实测 LRU 对 MoE decode 的顺序扫描 hits=0（坑 #34），
+        // 绕过它不损失任何命中率。contiguous 时合并成 1 次 pread（同 B-1）。
+        // 不更新 stats_：并发累加不安全，且这条路径不走缓存。
+        bool load_expert_direct(int layer, int expert, uint8_t *buf, size_t buf_nbytes,
+                                ExpertWeights *out);
 
         // ---- B-2：异步预取 ----
         // 设计要点：预取用**独立缓冲池**，不复用 LRU 槽。这同时规避两个风险：
@@ -175,7 +195,9 @@ namespace tinyqwen {
         uint64_t tick_ = 0;
         uint64_t cache_budget_bytes_ = 0;  // 0 = 未设预算（按槽数限界）
         uint64_t per_expert_bytes_ = 0;    // gate+up+down 三块之和（首个注册专家）
+        uint64_t expert_staging_bytes_ = 0; // 直读所需字节数（连续布局取跨度）
         ExpertStoreStats stats_;
+        std::atomic<uint64_t> direct_bytes_read_{0};  // 并行直读路径的 pread 字节
 
         // ---- B-2 预取状态（仅预取线程与主线程经 mutex 访问）----
         struct PrefetchSlot {

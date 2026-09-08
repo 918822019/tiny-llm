@@ -66,6 +66,12 @@ namespace tinyqwen {
         // 把"预算 MB"换算成"槽数"，所以必须在 register_expert 之后才能设预算。
         if (per_expert_bytes_ == 0) {
             per_expert_bytes_ = gate_nbytes + up_nbytes + down_nbytes;
+            // 直读所需字节数与三块之和不同：连续布局下一次 pread 读的是跨度，
+            // 跨度含块间 64B 对齐填充，比三块之和大。LRU 槽数换算用之和，
+            // staging 分配必须用跨度 —— 混用会 fail-fast「缓冲不足」。
+            expert_staging_bytes_ = L.contiguous
+                                        ? L.span_nbytes
+                                        : per_expert_bytes_;
         }
     }
 
@@ -137,6 +143,46 @@ namespace tinyqwen {
             done += static_cast<size_t>(r);
         }
         return done == nbytes;
+    }
+
+    bool ExpertStore::load_expert_direct(int layer, int expert, uint8_t *buf,
+                                         size_t buf_nbytes, ExpertWeights *out) {
+        const int64_t key = make_key(layer, expert);
+        auto lit = layout_map_.find(key);
+        if (lit == layout_map_.end()) {
+            std::fprintf(stderr, "tinyqwen: ExpertStore: expert (layer=%d,expert=%d) 未注册\n",
+                         layer, expert);
+            return false;
+        }
+        const ExpertLayout &L = lit->second;
+        const size_t need = L.contiguous
+                                ? static_cast<size_t>(L.span_nbytes)
+                                : static_cast<size_t>(L.gate_nbytes + L.up_nbytes + L.down_nbytes);
+        if (buf == nullptr || buf_nbytes < need) {
+            std::fprintf(stderr,
+                         "tinyqwen: ExpertStore load_expert_direct 缓冲不足 need=%zu got=%zu\n",
+                         need, buf_nbytes);
+            return false;
+        }
+        if (L.contiguous) {
+            if (!read_bytes(L.gate_off, L.span_nbytes, buf)) return false;
+            direct_bytes_read_.fetch_add(L.span_nbytes, std::memory_order_relaxed);
+            out->gate = buf;
+            out->up = buf + L.up_rel;
+            out->down = buf + L.down_rel;
+            return true;
+        }
+        uint8_t *p = buf + L.gate_nbytes;
+        uint8_t *q = p + L.up_nbytes;
+        if (!read_bytes(L.gate_off, L.gate_nbytes, buf)) return false;
+        if (!read_bytes(L.up_off, L.up_nbytes, p)) return false;
+        if (!read_bytes(L.down_off, L.down_nbytes, q)) return false;
+        direct_bytes_read_.fetch_add(L.gate_nbytes + L.up_nbytes + L.down_nbytes,
+                                     std::memory_order_relaxed);
+        out->gate = buf;
+        out->up = p;
+        out->down = q;
+        return true;
     }
 
     // =========================================================================

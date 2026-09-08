@@ -244,9 +244,15 @@ namespace tinyqwen {
             std::fprintf(f, "    {\"index\": %d, \"pos\": %d, \"is_prefill\": %s, "
                          "\"latency_ms\": %.4f, \"ops\": {",
                          t.index, t.pos, t.is_prefill ? "true" : "false", t.latency_ms);
-            for (size_t j = 0; j < t.ops.size(); ++j) {
-                std::fprintf(f, "%s\"%s\": %.4f", j ? ", " : "", json_escape(t.ops[j].name).c_str(),
-                             t.ops[j].latency_ms);
+            // 同名 op 必须先合并求和再写。JSON object 不允许重名键，而 MoE decode
+            // 每层对 expert_load/expert_ffn 各调用 top-k 次（8 次），t.ops 里就是
+            // 8 条同名记录。不合并的话 Python json.load 只保留最后一条，这两个 op
+            // 被少算 8×。曾据此误判 decode 有 62% 时间"未归因"，实测真值是 -1.5%。
+            std::map<std::string, double> merged;
+            for (const OpRecord &r: t.ops) merged[r.name] += r.latency_ms;
+            size_t j = 0;
+            for (const auto &[name, ms]: merged) {
+                std::fprintf(f, "%s\"%s\": %.4f", j++ ? ", " : "", json_escape(name).c_str(), ms);
             }
             std::fprintf(f, "}}%s\n", i + 1 < tokens_.size() ? "," : ""); // 最后一条不加逗号
         }

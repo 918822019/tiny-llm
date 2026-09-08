@@ -158,9 +158,9 @@ def write_tqwen_moe(path, header_cfg, tensors, ext_v2, ext_v3):
     return total
 
 
-def build(seed=42, shared_expert=True):
+def build(seed=42, shared_expert=True, overrides=None):
     rng = np.random.default_rng(seed)
-    C = FAKE_CFG
+    C = dict(FAKE_CFG, **(overrides or {}))
     H = C["hidden_size"]
     nL = C["num_hidden_layers"]
     vocab = C["vocab_size"]
@@ -249,7 +249,7 @@ def build(seed=42, shared_expert=True):
                   shared_expert_intermediate_size=shared_inter if shared_expert else 0,
                   n_shared_experts=C["n_shared_experts"] if shared_expert else 0,
                   moe_topk_norm=1, gptq_group_size=gs)
-    return FAKE_CFG, tensors, ext_v2, ext_v3
+    return C, tensors, ext_v2, ext_v3
 
 
 def main():
@@ -257,8 +257,43 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-shared-expert", action="store_true",
                     help="omit the shared expert (Qwen3-MoE topology)")
+    # 维度放大选项：默认全部为 None = 沿用 FAKE_CFG 的 tiny 拓扑，
+    # 既有对齐脚本的行为完全不变。放大只为测专家级并行的计算扩展性。
+    ap.add_argument("--hidden", type=int, default=None)
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--experts", type=int, default=None)
+    ap.add_argument("--per-tok", type=int, default=None)
+    ap.add_argument("--moe-inter", type=int, default=None)
+    ap.add_argument("--heads", type=int, default=None)
+    ap.add_argument("--head-dim", type=int, default=None)
     args = ap.parse_args()
-    cfg, tensors, ext2, ext3 = build(shared_expert=not args.no_shared_expert)
+
+    ov = {}
+    if args.hidden is not None:
+        ov["hidden_size"] = args.hidden
+        ov["intermediate_size"] = args.hidden
+        ov["shared_expert_intermediate_size"] = args.hidden
+    if args.layers is not None:
+        ov["num_hidden_layers"] = args.layers
+    if args.experts is not None:
+        ov["n_routed_experts"] = args.experts
+    if args.per_tok is not None:
+        ov["num_experts_per_tok"] = args.per_tok
+    if args.moe_inter is not None:
+        ov["moe_intermediate_size"] = args.moe_inter
+    if args.heads is not None:
+        ov["num_attention_heads"] = args.heads
+    if args.head_dim is not None:
+        ov["head_dim"] = args.head_dim
+
+    gs = FAKE_CFG["gptq_group_size"]
+    for name, val in (("hidden", args.hidden), ("moe-inter", args.moe_inter)):
+        if val is not None and (val % gs or val % GPTQ_PACK):
+            ap.error(f"--{name} {val} 必须同时被 gptq_group_size({gs}) 与 "
+                     f"GPTQ_PACK({GPTQ_PACK}) 整除")
+
+    cfg, tensors, ext2, ext3 = build(shared_expert=not args.no_shared_expert,
+                                     overrides=ov)
     total = write_tqwen_moe(args.out, cfg, tensors, ext2, ext3)
     sys.stderr.write(
         f"[fake-moe] wrote {args.out}: {total} bytes, {len(tensors)} tensors, "

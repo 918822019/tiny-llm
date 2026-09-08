@@ -729,6 +729,43 @@ namespace tinyqwen {
         backend_->matmul(wt, x, y, M, K, N);
     }
 
+    void QwenModel::set_moe_expert_threads(int n) {
+        if (n <= 0 || experts_per_tok_ <= 0) {
+            moe_expert_threads_ = 0;
+            moe_expert_pool_.reset();
+            moe_expert_stage_.clear();
+            moe_expert_gate_buf_.clear();
+            moe_expert_up_buf_.clear();
+            moe_expert_out_buf_.clear();
+            return;
+        }
+        moe_expert_threads_ = n;
+        moe_expert_pool_ = std::make_unique<ExpertPool>(n);
+
+        const int k = experts_per_tok_;
+        const int hidden = static_cast<int>(cfg_.hidden_size);
+        // 非 SSD 模式专家权重是 resident 指针，不需要 staging
+        const size_t stage_bytes =
+            (moe_ssd_ && expert_store_) ? expert_store_->expert_staging_bytes() : 0;
+
+        moe_expert_stage_.assign(static_cast<size_t>(k), std::vector<uint8_t>(stage_bytes));
+        moe_expert_gate_buf_.assign(static_cast<size_t>(k),
+                                    std::vector<float>(static_cast<size_t>(moe_inter_)));
+        moe_expert_up_buf_.assign(static_cast<size_t>(k),
+                                  std::vector<float>(static_cast<size_t>(moe_inter_)));
+        moe_expert_out_buf_.assign(static_cast<size_t>(k),
+                                   std::vector<float>(static_cast<size_t>(hidden)));
+    }
+
+    uint64_t QwenModel::moe_expert_parallel_bytes() const {
+        uint64_t b = 0;
+        for (const auto &v : moe_expert_stage_) b += v.size();
+        for (const auto &v : moe_expert_gate_buf_) b += v.size() * sizeof(float);
+        for (const auto &v : moe_expert_up_buf_) b += v.size() * sizeof(float);
+        for (const auto &v : moe_expert_out_buf_) b += v.size() * sizeof(float);
+        return b;
+    }
+
     // =========================================================================
     // QwenModel::attention_kv() — attention 统一分发（按 KV cache 精度）
     // =========================================================================

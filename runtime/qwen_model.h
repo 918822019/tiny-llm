@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "backend.h"
+#include "expert_pool.h"
 #include "expert_store.h"
 #include "gdn_state.h"
 #include "kv_cache.h"
@@ -251,6 +252,13 @@ namespace tinyqwen {
         ExpertStoreStats moe_stats() const {
             return expert_store_ ? expert_store_->stats() : ExpertStoreStats{};
         }
+
+        // 专家级并行开关（0 = 串行，走原路径）。必须在 create() 之后调用：
+        // staging/workspace 按 experts_per_tok_ 与 per_expert_bytes 分配。
+        void set_moe_expert_threads(int n);
+        int moe_expert_threads() const { return moe_expert_threads_; }
+        // staging 占用的字节数（供启动内存预算归因）
+        uint64_t moe_expert_parallel_bytes() const;
 
         // ---- 属性访问器 ----
 
@@ -632,5 +640,16 @@ namespace tinyqwen {
         std::vector<float> moe_shared_out_;     // 共享专家 down 输出 [hidden]
         std::vector<int> moe_topk_idx_;         // 选中专家下标 [k]
         std::vector<float> moe_topk_w_;          // 归一化路由权重 [k]
+
+        // 专家级并行 workspace（仅 --moe-expert-threads > 0 时分配）。
+        // 串行路径复用上面单份 moe_expert_gate_/up_/out_；并行时 top-k 个专家
+        // 同时写各自缓冲，共享一份会互相覆盖。staging 是绕开 LRU 的直读目标
+        // （get() 的槽指针会被后续淘汰覆盖，无法同时持有 top-k 个专家）。
+        int moe_expert_threads_ = 0;
+        std::unique_ptr<ExpertPool> moe_expert_pool_;
+        std::vector<std::vector<uint8_t>> moe_expert_stage_;   // [k][per_expert_bytes]
+        std::vector<std::vector<float>> moe_expert_gate_buf_;  // [k][moe_inter]
+        std::vector<std::vector<float>> moe_expert_up_buf_;    // [k][moe_inter]
+        std::vector<std::vector<float>> moe_expert_out_buf_;   // [k][hidden]
     };
 } // namespace tinyqwen

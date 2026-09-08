@@ -3870,6 +3870,211 @@ cat benchmarks/machine_ceiling/m4_ceiling.md
 
 ---
 
+### profiler JSON 重名键修正：MoE decode 归因从「62% 未归因」变成 100% 闭合（2026-09-08，macOS M4）
+
+- **优化栈**：B-2 预取 + 批量 prefill（无性能变化，本条是**归因修正**不是提速）
+- **是什么**：`Profiler::write_json()` 原先把 `t.ops` 逐条写成 JSON object 键。
+  MoE decode 每层对 `expert_load`/`expert_ffn` 各调用 top-k 次（8 次），
+  `t.ops` 里就有 8 条同名记录 → JSON 出现重名键。改为同一 token 内先按名
+  合并求和再写。
+- **症状**：`json.load` 遇重名键只保留**最后一条**，于是这两个 op 被少算 8×。
+  据此算出 MoE SSD 路径「Σop 只占 latency 的 38%，219 ms/tok 未归因」，
+  并进一步误判「瓶颈不在 I/O 而在某处未计时代码」，投入一轮定位（加
+  `all_layers` + 逐层 `layer_total` 护栏），结论全部作废。
+- **定位手段**：三条证据交叉——
+  ① 数原始 JSON 文本里 `"layer_0.expert_load"` 的出现次数 = **273**（34 token × 8），
+  而 `"layer_0.qkv_proj"` = 35（每 token 1 次）；
+  ② `op_totals` 是 profiler 内部逐记录累加，**不受重名影响**，用它算出的
+  `expert_load` 比 per-token dict 大 8×；
+  ③ `sample <pid> 3` 抓调用栈：877/2224 样本（39%）停在 `pread`，与
+  `op_totals` 吻合、与 per-token dict 相差 6×。
+- **结果**：修正后归因**闭合到 100.2%**，缝隙 -0.2%（嵌套计时器舍入）。
+  清洁机器基线 **320.9 ms/tok**（注册表记 308，吻合）：
+
+  | op | ms/tok | 占 latency |
+  |---|---|---|
+  | `expert_ffn` | 129.73 | 40.4% |
+  | `expert_load` | 90.69 | 28.3% |
+  | `o_proj` | 45.77 | 14.3% |
+  | `qkv_proj` | 44.56 | 13.9% |
+  | `lm_head` | 6.67 | 2.1% |
+  | `attention` | 2.14 | 0.7% |
+
+- **验证**：`196 tests, 0 failed`；修正后每个 op 恰好出现 35 次（35 token）。
+- **教训（两条，都可复用）**：
+  ① **JSON object 键必须唯一**——任何「一条记录一次调用」的 trace 格式，
+  在循环内调用同一 op 时都会产生重名。写 JSON 前先合并。
+  ② **「未归因时间」出现时先怀疑解析器，再怀疑代码**。本次三条独立证据
+  （文本计数 / `op_totals` / `sample` 调用栈）都指向解析，指向代码的那条
+  （逐层护栏）反而绕了一大圈。`sample` 抓栈是最快的一招（坑 #27 同源）。
+
+---
+
+### ExpertStore LRU 对 MoE decode 结构性失效：hits=0 与槽数无关（2026-09-08，macOS M4）
+
+- **是什么**：测量而非改动。`Qwen3-30B-A3B-GPTQ-Int4` decode 每 token 顺序扫
+  48 层 × top-8 = **384 次专家访问**，而 `cache_slots` 是**全局**槽池。
+- **实测**：
+
+  | slots | 常驻 | hits | misses | decode ms/tok |
+  |---|---|---|---|---|
+  | 4（默认） | 10 MB | **0** | 13056 | **307.0** |
+  | 192 | 459 MB | **0** | 13056 | 325.1 |
+  | 768 | 1836 MB | 0 | 13056 | 316.4 |
+
+- **原因**：LRU 只保留最后访问的 N 个专家。每 token 从层 0 扫到层 47，
+  N 个槽留下的恰好是**层 24–47 的专家**；下一个 token 又从层 0 开始，
+  需要的正好是被挤出的那批。**命中率恒为 0，与槽数无关。**
+- **这解释了坑 #20 为何测出「slots=4 最优」**：槽数增大从不提升命中率，
+  只会让常驻集变大，所以最小工作集赢。清洁机器上复测，相对结论依然成立
+  （307.0 vs 325.1 vs 316.4），但绝对数字此前被内存压力污染过
+  （当时 616 ms/tok，现在 307）。
+- **真正起作用的是 OS page cache**：`expert_load` 90.69 ms/tok ÷ 918 MB/token
+  = **10.19 GB/s**，超 NVMe 峰值（6.5 GB/s）157% —— 物理上不可能是磁盘读，
+  是 page cache memcpy。坑 #29「已达 NVMe 带宽下限」的判断需要修正：
+  热专家实际走的是内存带宽，不是磁盘带宽。
+- **下一步方向（pin 而非 LRU）**：真实 decode 数据的专家选择高度偏斜——
+  每层激活 30–73 / 128 个专家，top1 占 6.5–12.1%，top8 累积 34–60%，
+  第 40–47 层极偏斜（仅 15–30 个专家，top8 覆盖 65–80%）。
+  按热度常驻的覆盖曲线（`tools/analyze_moe_expert_freq.py`，per-expert 2.39 MB）：
+
+  | 每层常驻 | 累积覆盖 | 新增常驻内存 |
+  |---|---|---|
+  | 8 | 52.1% | 918 MB |
+  | 16 | 72.6% | 1836 MB |
+  | 24 | 84.0% | 2753 MB |
+
+  **pin 恰好绕开 LRU 的结构性问题**（免淘汰），且 slots 扫描显示清洁机器上
+  「大常驻集拖慢 CPU cache」的代价只有 ~3%（不是坑 #20 的 1.8×，那是内存压力
+  造成的），所以 pin 8/层 的预期收益（省 ~48 ms/tok ≈ 15%）风险可控。
+  另一条更值钱的路：`expert_ffn`（40.4%）目前是单线程，top-8 彼此独立，
+  坑 #22 已指出「要并行得在专家层并行」，上限 ~34%。
+- **复现**：
+
+```bash
+# 归因（profile JSON；修重名键后普通 json.load 即可用）
+./build/runtime/tinyqwen --model model_qwen3_30b_moe_i4_fp16.tqwen \
+  --tokens 105538,59975,100132 --max-new-tokens 32 --max-seq-len 64 \
+  --moe-ssd --moe-expert-cache-slots 4 --matvec-impl neon --profile-out /tmp/p.json
+
+# 专家选择频率（先抓 topk_idx dump，再分析；参数是 30B MoE 的真实架构值）
+TINYQWEN_DUMP_MOE=/tmp/moe_dump.bin ./build/runtime/tinyqwen \
+  --model model_qwen3_30b_moe_i4_fp16.tqwen \
+  --tokens 105538,59975,100132 --max-new-tokens 64 --max-seq-len 96 \
+  --moe-ssd --moe-expert-cache-slots 4 --matvec-impl neon
+.venv/bin/python tools/analyze_moe_expert_freq.py /tmp/moe_dump.bin \
+  --hidden 2048 --n-experts 128 --topk 8 --n-layers 48 \
+  --per-expert-mb 2.39 --io-share-pct 28.3
+```
+
+---
+
+### MoE 专家级并行 `--moe-expert-threads`（2026-09-08）
+
+- **优化栈**：MoE SSD 卸载基线（串行 `expert_ffn`）+ 专家级并行
+- **是什么**：top-k 个路由专家改为在常驻线程池（`runtime/expert_pool.{h,cpp}`）上并行
+  计算，每个专家有独立 staging/workspace；SSD 权重经 `ExpertStore::load_expert_direct()`
+  绕开 LRU 直读。累加**保持串行且顺序不变**。同步用 spin + 原子计数器而非
+  condition_variable（避坑 #27(a) 的互等死锁）。
+- **假设**：坑 #22 指出 kernel 级 MT 对 MoE 无效（每 token 1152 次 fork-join，
+  同步开销压过收益），「要并行得在专家层并行」；专家级并行每 token 只有
+  n_layers 次 fork-join，top-k 任务彼此完全独立，预期接近线性。
+- **结果**：中等 fake MoE（hidden=192 / 16 层 / 128 专家 / top-8 / GPTQ i4，
+  resident 模式零磁盘 I/O）。8 线程 decode **24.50 ms/tok**（5 次取 min），
+  专家阶段 **13.04 ms/tok**。线程扫描：
+
+  | 线程 | 专家 ms/tok | 专家加速 | 端到端加速 |
+  |---|---|---|---|
+  | 1 | 28.36 | 1.00× | 1.00× |
+  | 2 | 16.42 | 1.72× | 1.44× |
+  | 串行 | 28.25 | 1.00× | 1.00× |
+  | 4 | 16.14 | 1.75× | 1.37× |
+  | 7 | 15.07 | 1.87× | 1.33× |
+  | **8** | **13.04** | **2.17×** | **1.46×** |
+
+  串行/4/8 在干净条件下采样（load ~3.5、swap <1 GB）；1/2/7 采样时机器已被推入
+  重度换页（swap used 7.0 GB），按坑 #20 判据这三行**仅供参考**。
+  专家阶段占 decode **79%**。
+- **vs 上一配置**：专家阶段 **2.17×**，端到端 **1.46×**
+- **验证**：串行/并行 × resident/SSD **四路 logits 逐位一致**；线程数
+  1/2/4/8/16/32 扫描全部逐位一致（覆盖 n<p / n=p / n>p 三种任务切分）；
+  196 tests 0 failed；`align_fake_qwen35_moe_model.py` 的 resident↔SSD
+  逐位一致契约未破坏。另有一条独立交叉验证：串行与并行的
+  `stats.bytes_read` 同为 79552，证明两条路径读的字节数一致。
+- **瓶颈转移**：非专家段从 7.47 → **11.46 ms/tok**（慢 4 ms），即 16 层
+  × 每层 1 次 fork-join 的同步开销，占 decode 的 **11%**。下一刀砍 barrier 成本，
+  而不是继续加线程数。
+- **意外 / 教训**：
+  - **Amdahl 预期 1.74× 实测只有 1.46×**（1/(0.21+0.79/2.17)）。差值全部来自
+    上述同步开销——并行化收益被 barrier 吃掉约三分之一。
+  - **重复踩坑 #7，且得出完全相反的结论**：第一轮采样 load 6.43（我自己的测速
+    进程在抢 CPU），得出「4 线程最优」；负载回落后用 5 次配对复测，配对差全为正
+    （2.54–5.63 ms），实际是「8 线程一直更快」。铁证：8 线程两轮都稳定
+    （13.52 / 13.04–13.60），4 线程剧烈波动（12.52 → 16.14–19.14），
+    第一轮那个 12.52 是被污染的侥幸值。**测速前后都要查 `uptime` 与
+    `sysctl vm.swapusage`，且必须做配对比较。**
+  - **空文件假通过**：中途一轮「logits IDENTICAL、线程 1/2/4/8 全部 IDENTICAL」
+    是假的——模型当时已崩溃，`cmp -s` 比的是两个 0 字节文件。此后所有逐位比对
+    都显式检查文件非零尺寸。
+  - **staging 尺寸口径**：按 `per_expert_bytes()`（gate+up+down **三块之和**）
+    分配会让并行 SSD 路径直接 abort（`need=904 got=792`）——`load_expert_direct`
+    在连续布局下读的是**跨度**，跨度含块间 64B 对齐填充，比三块之和大。
+    新增 `expert_staging_bytes()` 区分两种口径。坑 #17(b)/#24 同类陷阱。
+  - **并行模式绕开 LRU 导致预算幻影**：并行不调 `get()`，LRU 槽缓冲懒分配永不
+    增长，但预算校验仍计入 `slots × per_expert_bytes`，大预算下足以误触发
+    fail-fast。已在并行模式下不计入。
+  - **`make_fake_qwen35_moe_model.py` 的 `return FAKE_CFG` 应为 `return C`**：
+    此前 header 永远写 tiny 维度而 tensor 用 override 后的维度，放大模型必然
+    shape mismatch。修后 tiny 默认拓扑逐位未回归。
+- **已知遗留（与本优化无关）**：`--hidden 64` / `--hidden 256` 的 fake MoE 模型
+  **SIGSEGV**（32/128/192 正常），栈在 `QwenModel::forward_token`、访问野地址
+  `0x3bbedbd73e950aed`，**串行原路径也崩**。非单调阈值说明是特定尺寸触发。
+  本次用 hidden=192 绕开。
+- **真模型 SSD/I/O 场景（后补实测，2026-09-08）**：`model_qwen3_30b_moe_i4_fp16.tqwen`
+  （file 16361.70 MB，`--moe-ssd` 下 resident 仅 **1079.07 MB** / offloaded 18433
+  tensors）。**此前判断"真模型超物理内存跑不了"是错的**——开 `--moe-ssd` 后专家
+  字节留在磁盘走 pread，resident 只有 1 GB，完全装得下。标准负载（prompt 3 tok +
+  decode 32 tok，`tools/bench.py`，3 遍取中位）：
+
+  | 配置 | TTFT | TOPT | forward 总耗时 | 加速 |
+  |---|---|---|---|---|
+  | 串行 | 1252.95 ms | 334.47 ms/tok | 11500.2 ms | 1.00× |
+  | **并行 8** | **711.44 ms** | **223.33 ms/tok** | **7800.8 ms** | TOPT **1.50×** / TTFT **1.76×** |
+
+  **这判定了坑 #28 vs #34 的争论：并行读确实有效。** 支持坑 #34（热专家走
+  OS page cache、按内存带宽走、可随核数扩展），而非坑 #28（设备带宽受限、
+  并行 pread 只是切分同一带宽）。注意 TTFT 收益（1.76×）大于 TOPT（1.50×），
+  因为 prefill 的批量路径 I/O 占比更高。
+  正确性：串行 vs 并行 logits **逐位一致**（3,646,464 字节，显式检查非零尺寸），
+  `generated_ids` 完全一致。**真模型的逐位契约此前只在 fake 模型上验过，这是
+  首次真模型验证。**
+  串行 334.47 比注册表基线 308 慢 8.6%（测速时 load ~2.5），但 MoE decode 是
+  I/O 受限而非 CPU 受限，对机器竞争的敏感度远低于稠密模型（稠密同期慢 1.5–1.6×）。
+- **复现**：
+
+```bash
+# 生成中等规模 fake MoE（resident，零 I/O，隔离纯计算扩展性）
+.venv/bin/python tools/make_fake_qwen35_moe_model.py --out /tmp/mid2.tqwen \
+  --hidden 192 --layers 16 --experts 128 --per-tok 8 --moe-inter 128
+
+# 逐位一致验证（必须检查文件非零尺寸，防空文件假通过）
+./build/runtime/tinyqwen --model /tmp/mid2.tqwen --tokens 3,7,11,2 \
+  --max-new-tokens 6 --max-seq-len 32 --eos -1 --topk 5 --dump-logits /tmp/A.bin
+./build/runtime/tinyqwen --model /tmp/mid2.tqwen --tokens 3,7,11,2 \
+  --max-new-tokens 6 --max-seq-len 32 --eos -1 --topk 5 --dump-logits /tmp/B.bin \
+  --moe-expert-threads 8
+ls -l /tmp/A.bin /tmp/B.bin && cmp /tmp/A.bin /tmp/B.bin
+
+# 线程扫描（每次 5 轮取 min；测前后查 uptime 与 vm.swapusage）
+for T in 1 2 4 7 8; do for i in 1 2 3 4 5; do
+  ./build/runtime/tinyqwen --model /tmp/mid2.tqwen --tokens 3,7,11,2 \
+    --max-new-tokens 4 --max-seq-len 32 --eos -1 --moe-expert-threads $T \
+    --profile-out /tmp/r${T}_$i.json
+done; done
+```
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

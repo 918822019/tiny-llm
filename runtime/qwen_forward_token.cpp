@@ -536,35 +536,77 @@ namespace tinyqwen {
                     }
                 }
 
-                // 路由专家：按 top-k 权重加权累加。权重走 resident 指针或
-                // ExpertStore SSD 卸载（pread + LRU）——两者须逐位一致。
-                for (int t = 0; t < experts_per_tok_; ++t) {
-                    const int e = moe_topk_idx_[t];
-                    const uint8_t *eg, *eu, *ed;
+                if (moe_expert_threads_ > 0 && moe_expert_pool_) {
+                    // 专家级并行：top-k 个专家彼此独立，每个写自己的 workspace。
+                    // SSD 权重经 load_expert_direct 直读到 per-expert staging ——
+                    // get() 的槽指针会被后续淘汰覆盖，无法同时持有 k 个专家。
                     {
-                        ScopedTimer tl(prof, scope("layer_%d.expert_load", i));
-                        if (moe_ssd_) {
-                            const ExpertWeights ew = expert_store_->get(
-                                static_cast<int>(i), e);
-                            eg = ew.gate; eu = ew.up; ed = ew.down;
-                        } else {
-                            eg = static_cast<const uint8_t *>(w.moe_experts[e].gate);
-                            eu = static_cast<const uint8_t *>(w.moe_experts[e].up);
-                            ed = static_cast<const uint8_t *>(w.moe_experts[e].down);
+                        ScopedTimer tp(prof, scope("layer_%d.expert_parallel", i));
+                        moe_expert_pool_->run([&](int t) {
+                            const int e = moe_topk_idx_[t];
+                            const uint8_t *eg, *eu, *ed;
+                            if (moe_ssd_) {
+                                ExpertWeights ew;
+                                if (!expert_store_->load_expert_direct(
+                                        static_cast<int>(i), e, moe_expert_stage_[t].data(),
+                                        moe_expert_stage_[t].size(), &ew)) {
+                                    std::abort();
+                                }
+                                eg = ew.gate; eu = ew.up; ed = ew.down;
+                            } else {
+                                eg = static_cast<const uint8_t *>(w.moe_experts[e].gate);
+                                eu = static_cast<const uint8_t *>(w.moe_experts[e].up);
+                                ed = static_cast<const uint8_t *>(w.moe_experts[e].down);
+                            }
+                            mv_pair(eg, eu, normed_.data(), moe_expert_gate_buf_[t].data(),
+                                    moe_expert_up_buf_[t].data(), moe_inter_, hidden);
+                            backend_->swiglu(moe_expert_gate_buf_[t].data(),
+                                             moe_expert_up_buf_[t].data(), moe_inter_);
+                            mv(ed, moe_expert_gate_buf_[t].data(),
+                               moe_expert_out_buf_[t].data(), hidden, moe_inter_);
+                        }, experts_per_tok_);
+                    }
+                    // 累加必须严格串行且保持 t = 0..k-1 顺序：浮点求和顺序改变会
+                    // 破坏 resident 与 SSD 路径的逐位一致契约（坑 #17/#18）。
+                    {
+                        ScopedTimer ta(prof, scope("layer_%d.expert_accum", i));
+                        for (int t = 0; t < experts_per_tok_; ++t) {
+                            const float wt = moe_topk_w_[t];
+                            const float *src = moe_expert_out_buf_[t].data();
+                            for (int j = 0; j < hidden; ++j) moe_ffn_acc_[j] += wt * src[j];
                         }
                     }
-                    {
-                        ScopedTimer tf(prof, scope("layer_%d.expert_ffn", i));
-                        mv_pair(eg, eu, normed_.data(), moe_expert_gate_.data(),
-                                moe_expert_up_.data(), moe_inter_, hidden);
-                        backend_->swiglu(moe_expert_gate_.data(), moe_expert_up_.data(),
-                                         moe_inter_);
-                        mv(ed, moe_expert_gate_.data(), moe_expert_out_.data(),
-                           hidden, moe_inter_);
+                } else {
+                    // 路由专家：按 top-k 权重加权累加。权重走 resident 指针或
+                    // ExpertStore SSD 卸载（pread + LRU）——两者须逐位一致。
+                    for (int t = 0; t < experts_per_tok_; ++t) {
+                        const int e = moe_topk_idx_[t];
+                        const uint8_t *eg, *eu, *ed;
+                        {
+                            ScopedTimer tl(prof, scope("layer_%d.expert_load", i));
+                            if (moe_ssd_) {
+                                const ExpertWeights ew = expert_store_->get(
+                                    static_cast<int>(i), e);
+                                eg = ew.gate; eu = ew.up; ed = ew.down;
+                            } else {
+                                eg = static_cast<const uint8_t *>(w.moe_experts[e].gate);
+                                eu = static_cast<const uint8_t *>(w.moe_experts[e].up);
+                                ed = static_cast<const uint8_t *>(w.moe_experts[e].down);
+                            }
+                        }
+                        {
+                            ScopedTimer tf(prof, scope("layer_%d.expert_ffn", i));
+                            mv_pair(eg, eu, normed_.data(), moe_expert_gate_.data(),
+                                    moe_expert_up_.data(), moe_inter_, hidden);
+                            backend_->swiglu(moe_expert_gate_.data(), moe_expert_up_.data(),
+                                             moe_inter_);
+                            mv(ed, moe_expert_gate_.data(), moe_expert_out_.data(),
+                               hidden, moe_inter_);
+                        }
+                        const float wt = moe_topk_w_[t];
+                        for (int j = 0; j < hidden; ++j)
+                            moe_ffn_acc_[j] += wt * moe_expert_out_[j];
                     }
-                    const float wt = moe_topk_w_[t];
-                    for (int j = 0; j < hidden; ++j)
-                        moe_ffn_acc_[j] += wt * moe_expert_out_[j];
                 }
                 // 调试插桩（env 门控）：TINYQWEN_DUMP_MOE=<path> 每层追加写
                 // normed_ / moe_ffn_acc_ / router logits / topk idx+w，供 Python
