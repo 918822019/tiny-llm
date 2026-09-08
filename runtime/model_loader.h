@@ -227,6 +227,31 @@ namespace tinyqwen {
         // ---------------------------------------------------------------------
         bool load(const std::string &path, std::string *err, bool offload_experts = false);
 
+        // ---------------------------------------------------------------------
+        // estimate_resident_bytes: 预检——算出 load() 之后会占多少常驻内存
+        //
+        // 为什么需要它：load() 会把权重真正读进 RAM。内存预算校验若放在 load()
+        // 之后，等校验失败时文件已经进内存了——先犯罪再审查，且换页已经发生。
+        // 这个函数只读 header（192 字节）+ tensor 表，**一个数据区字节都不读**，
+        // 因此能在 load() 之前就把内存需求算准，让调用方 fail-fast。
+        //
+        // 参数:
+        //   path:            .tqwen 文件路径
+        //   offload_experts: 与 load() 的同名参数语义一致
+        //                    false = 整文件进 RAM，返回值 == 文件大小
+        //                    true  = 稀疏加载，返回值 == 紧凑打包后的 data_ 大小
+        //   out_bytes:       输出参数，成功时写入字节数
+        //   err:             输出参数，失败时写入原因
+        //
+        // 返回值: 成功 true，失败 false
+        //
+        // 口径保证：返回值与随后真正调用 load(path, err, offload_experts) 得到的
+        // resident_bytes() **必须一致**。两处共用 is_offloadable() 与 align_up()，
+        // 判据是名字含 ".mlp.experts."（外加 tied 模型不可卸载 embed 的守卫）。
+        // ---------------------------------------------------------------------
+        static bool estimate_resident_bytes(const std::string &path, bool offload_experts,
+                                            uint64_t *out_bytes, std::string *err);
+
         // ---- 状态查询 ----
 
         // 是否已成功加载文件

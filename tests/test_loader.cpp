@@ -604,3 +604,74 @@ TEST (loader_full_keeps_entire_file) {
     }
     std::remove(path.c_str());
 }
+
+// =============================================================================
+// loader_estimate_matches_actual — 预检估算必须逐字节等于真实 load() 结果
+// =============================================================================
+// 这是 estimate_resident_bytes() 唯一的硬不变量：内存预算预检靠它决定放行还是
+// fail-fast。估算与实际不一致会让预检要么误放行（照样换页）要么误拒绝合法文件。
+// 两个口径都要锁死。
+TEST (loader_estimate_matches_actual) {
+    const std::string path = "/tmp/tq_estimate.tqwen";
+    const std::vector<T> tensors = moe_like_tensors();
+    write_file(path, tensors);
+
+    uint64_t est_full = 0, est_sparse = 0;
+    std::string err;
+    EXPECT_TRUE(ModelFile::estimate_resident_bytes(path, false, &est_full, &err));
+    EXPECT_TRUE(ModelFile::estimate_resident_bytes(path, true, &est_sparse, &err));
+
+    ModelFile full, sparse;
+    EXPECT_TRUE(full.load(path, &err, false));
+    EXPECT_TRUE(sparse.load(path, &err, true));
+
+    EXPECT_EQ(est_full, full.resident_bytes());
+    EXPECT_EQ(est_sparse, sparse.resident_bytes());
+
+    std::remove(path.c_str());
+}
+
+// =============================================================================
+// loader_estimate_two_regimes — 全量口径等于文件大小，稀疏口径严格更小
+// =============================================================================
+// 全量：data_ 就是整个文件，故估算 == file_bytes。
+// 稀疏：路由专家留盘，故估算 < file_bytes 且省下的正是专家字节。
+TEST (loader_estimate_two_regimes) {
+    const std::string path = "/tmp/tq_estimate2.tqwen";
+    const std::vector<T> tensors = moe_like_tensors();
+    write_file(path, tensors);
+
+    uint64_t est_full = 0, est_sparse = 0;
+    std::string err;
+    EXPECT_TRUE(ModelFile::estimate_resident_bytes(path, false, &est_full, &err));
+    EXPECT_TRUE(ModelFile::estimate_resident_bytes(path, true, &est_sparse, &err));
+
+    ModelFile file;
+    EXPECT_TRUE(file.load(path, &err, true));
+    EXPECT_EQ(est_full, file.file_bytes());
+    EXPECT_TRUE(est_sparse < est_full);
+    EXPECT_EQ(est_full - est_sparse, file.offloaded_bytes());
+
+    std::remove(path.c_str());
+}
+
+// =============================================================================
+// loader_estimate_rejects_bad_file — 预检的校验与 load() 同款
+// =============================================================================
+// 预检放行却在 load() 失败（或反之）会让 fail-fast 失去意义。非 .tqwen 文件
+// 必须在预检阶段就被拒。
+TEST (loader_estimate_rejects_bad_file) {
+    const std::string path = "/tmp/tq_estimate_bad.bin";
+    FILE *f = std::fopen(path.c_str(), "wb");
+    EXPECT_TRUE(f != nullptr);
+    const std::vector<uint8_t> junk(256, 0xAB);
+    std::fwrite(junk.data(), 1, junk.size(), f);
+    std::fclose(f);
+
+    uint64_t est = 0;
+    std::string err;
+    EXPECT_TRUE(!ModelFile::estimate_resident_bytes(path, false, &est, &err));
+    EXPECT_TRUE(!err.empty());
+
+    std::remove(path.c_str());
+}

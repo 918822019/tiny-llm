@@ -388,6 +388,47 @@ int main(int argc, char **argv) {
     std::string impl_name = args.matvec_impl;
     if (impl_name.empty()) impl_name = config.get("matvec_impl", "ref");
 
+    // ---- 内存预算预检（必须在 load 之前）----
+    // 为什么在 load() 之前：load() 会把权重真正读进 RAM。校验放在之后，等它失败时
+    // 文件已经进内存了——换页已经发生，fail-fast 失去意义。estimate_resident_bytes
+    // 只读 header + tensor 表、不碰数据区，所以零字节权重进内存就能算准需求。
+    // 覆盖**所有**模型，不只 MoE：非 MoE（如 4B i4 4.91 GB）此前完全没有校验，
+    // 加载时直接换页且零警告。
+    // 判据用 available_memory_bytes()（free+inactive+purgeable）而非物理总量：
+    // wired + 其他进程已占掉大半，按物理总量校验会宽松数倍，放行后照样换页。
+    // swap 是写操作、消耗 SSD 寿命，所以宁可 fail-fast。留 10% 余量给 KV cache /
+    // workspace / 栈等尚未计入的开销。
+    {
+        std::string err;
+        uint64_t need = 0;
+        if (!tinyqwen::ModelFile::estimate_resident_bytes(args.model, args.moe_ssd, &need, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        const uint64_t avail = available_memory_bytes();
+        const uint64_t budget = avail ? avail - avail / 10 : 0;  // 可用 × 90%
+        if (budget && need > budget) {
+            std::fprintf(stderr,
+                         "error: 模型常驻内存需求 %.0f MB 超过可用上限 %.0f MB\n"
+                         "       （当前可用 %.0f MB，留 10%% 余量）。加载会触发换页，\n"
+                         "       而 swap 是写操作、消耗 SSD 寿命，故拒绝加载。\n"
+                         "       可选修复：\n"
+                         "         · 关掉其他大内存进程后重试\n"
+                         "         · MoE 模型加 --moe-ssd（专家留盘，resident 大幅缩小）\n"
+                         "         · 换更小的量化版本（f16 → i4，常驻约减半）\n"
+                         "         · MoE 用 --moe-expert-cache-mb 缩小专家缓存预算\n"
+                         "       加 --force-over-memory-budget 可强制继续（不推荐）。\n",
+                         need / 1048576.0, budget / 1048576.0, avail / 1048576.0);
+            if (!args.force_over_mem_budget) return 1;
+            std::fprintf(stderr, "warn: 已按 --force-over-memory-budget 强制继续，"
+                                 "可能换页，计时与 SSD 寿命均需自行评估。\n");
+        } else {
+            std::fprintf(stderr, "[init] mem preflight: need %.0f MB / available %.0f MB "
+                                 "(上限 %.0f MB) —— 通过\n",
+                         need / 1048576.0, avail / 1048576.0, budget / 1048576.0);
+        }
+    }
+
     // ---- 加载权重文件并校验 ----
     // --moe-ssd 时走稀疏加载：路由专家权重一字节都不读进 RAM，只记 offset
     // 交给 ExpertStore 按需 pread。这是 SSD 卸载真正省内存的前提。

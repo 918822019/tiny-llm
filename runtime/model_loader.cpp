@@ -184,6 +184,86 @@ namespace tinyqwen {
     // 返回值：成功返回 true，失败返回 false
     // 说明：这是核心加载函数，分为 5 个阶段，每个阶段做严格的校验。
     //       任何校验失败立即返回 false，不给后面的计算留下脏数据。
+    // 预检：不读数据区，只读 header + tensor 表，算出 load() 后的常驻字节数。
+    // 校验项与 load() 阶段 1 保持一致——否则预检放行的文件会在 load() 里失败，
+    // 或者反过来预检拒绝一个合法文件。
+    bool ModelFile::estimate_resident_bytes(const std::string &path, bool offload_experts,
+                                            uint64_t *out_bytes, std::string *err) {
+        struct stat st{};
+        if (::stat(path.c_str(), &st) != 0) {
+            fail(err, "cannot stat file: " + path + " (" + std::strerror(errno) + ")");
+            return false;
+        }
+        const uint64_t file_bytes = static_cast<uint64_t>(st.st_size);
+
+        FdGuard guard;
+        guard.fd = ::open(path.c_str(), O_RDONLY);
+        if (guard.fd < 0) {
+            fail(err, "cannot open file: " + path + " (" + std::strerror(errno) + ")");
+            return false;
+        }
+
+        TinyHeader h{};
+        if (!pread_exact(guard.fd, 0, sizeof(TinyHeader),
+                         reinterpret_cast<uint8_t *>(&h), path, err)) {
+            return false;
+        }
+        if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0) {
+            fail(err, "bad magic (not a .tqwen file): " + path);
+            return false;
+        }
+        if (h.version < kFormatVersionMin || h.version > kFormatVersion) {
+            fail(err, "unsupported format version: " + std::to_string(h.version));
+            return false;
+        }
+        if (h.total_bytes != file_bytes) {
+            fail(err, "total_bytes mismatch: header=" + std::to_string(h.total_bytes) +
+                      " actual=" + std::to_string(file_bytes));
+            return false;
+        }
+        if (h.tensor_table_offset != sizeof(TinyHeader)) {
+            fail(err, "tensor_table_offset must be 192 in v1");
+            return false;
+        }
+        if (h.tensor_count == 0 || h.tensor_count > 100000) {
+            fail(err, "implausible tensor_count: " + std::to_string(h.tensor_count));
+            return false;
+        }
+        const uint64_t table_bytes = h.tensor_count * sizeof(TensorEntry);
+        if (h.tensor_table_offset + table_bytes > file_bytes) {
+            fail(err, "tensor table runs past end of file");
+            return false;
+        }
+        if (h.data_offset % kAlignment != 0 || h.data_offset < sizeof(TinyHeader) ||
+            h.data_offset > file_bytes) {
+            fail(err, "bad data_offset: " + std::to_string(h.data_offset));
+            return false;
+        }
+
+        // 全量加载：data_ 就是整个文件，常驻字节数 == 文件大小。不必读表。
+        if (!offload_experts) {
+            *out_bytes = file_bytes;
+            return true;
+        }
+
+        // 稀疏加载：复现 load() 的紧凑打包游标。只读 tensor 表，不碰数据区。
+        std::vector<TensorEntry> entries(static_cast<size_t>(h.tensor_count));
+        if (!pread_exact(guard.fd, h.tensor_table_offset, table_bytes,
+                         reinterpret_cast<uint8_t *>(entries.data()), path, err)) {
+            return false;
+        }
+        uint64_t cursor = h.data_offset;
+        for (uint64_t i = 0; i < h.tensor_count; ++i) {
+            const std::string name = entry_name(entries[static_cast<size_t>(i)]);
+            const bool tied_embed = (name == "model.embed_tokens.weight" &&
+                                     h.tied_embeddings != 0);
+            if (is_offloadable(name) && !tied_embed) continue;
+            cursor = align_up(cursor + entries[static_cast<size_t>(i)].nbytes);
+        }
+        *out_bytes = cursor;
+        return true;
+    }
+
     bool ModelFile::load(const std::string &path, std::string *err, bool offload_experts) {
         // 重置内部状态
         data_.clear();
