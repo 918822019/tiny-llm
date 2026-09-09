@@ -47,6 +47,17 @@ struct Pair {
   TensorRT* out;
 };
 
+// QNN convention: real = scale * (q + offset); q = round(real / scale) - offset
+static inline uint16_t quant16(float x, float s, int32_t o) {
+  float q = x / s - (float)o;
+  if (q < 0.0f) q = 0.0f;
+  if (q > 65535.0f) q = 65535.0f;
+  return (uint16_t)(q + 0.5f);
+}
+static inline float dequant16(uint16_t q, float s, int32_t o) {
+  return s * ((float)q + (float)o);
+}
+
 static QnnHtpDevice_PerfInfrastructure_t* g_perfInfra = nullptr;
 static uint32_t g_powerConfigId = 0;
 
@@ -111,6 +122,24 @@ static void teardownPerfVoting() {
   }
 }
 
+static void generateRoPE(uint16_t* cosBuf, uint16_t* sinBuf, int positions, int dim,
+                         float scale, int32_t offset, float theta) {
+  int halfDim = dim / 2;
+  std::vector<float> invFreq(halfDim);
+  for (int j = 0; j < halfDim; j++)
+    invFreq[j] = 1.0f / powf(theta, (float)(2 * j) / (float)dim);
+  for (int p = 0; p < positions; p++) {
+    for (int j = 0; j < halfDim; j++) {
+      float angle = (float)p * invFreq[j];
+      float c = cosf(angle), s = sinf(angle);
+      cosBuf[p * dim + 2 * j] = quant16(c, scale, offset);
+      cosBuf[p * dim + 2 * j + 1] = quant16(c, scale, offset);
+      sinBuf[p * dim + 2 * j] = quant16(s, scale, offset);
+      sinBuf[p * dim + 2 * j + 1] = quant16(s, scale, offset);
+    }
+  }
+}
+
 static void neonConvert(const uint16_t* src, uint16_t* dst, size_t n, float A, float B) {
 #ifdef __aarch64__
   float32x4_t va = vdupq_n_f32(A);
@@ -146,17 +175,6 @@ static void neonConvert(const uint16_t* src, uint16_t* dst, size_t n, float A, f
 #endif
 }
 
-// QNN convention: real = scale * (q + offset); q = round(real / scale) - offset
-static inline uint16_t quant16(float x, float s, int32_t o) {
-  float q = x / s - (float)o;
-  if (q < 0.0f) q = 0.0f;
-  if (q > 65535.0f) q = 65535.0f;
-  return (uint16_t)(q + 0.5f);
-}
-static inline float dequant16(uint16_t q, float s, int32_t o) {
-  return s * ((float)q + (float)o);
-}
-
 static bool readFile(const std::string& p, std::vector<uint8_t>& out) {
   FILE* f = fopen(p.c_str(), "rb");
   if (!f) return false;
@@ -170,8 +188,8 @@ static bool readFile(const std::string& p, std::vector<uint8_t>& out) {
 }
 
 int main(int argc, char** argv) {
-  int tokens = 50, warmup = 3, prefill = 0, vote = 0;
-  std::string ctxPath = "memcom_decode_w8a16.bin", inputsDir = "inputs";
+  int tokens = 50, warmup = 3, prefill = 0, vote = 0, chunkSize = 32;
+  std::string ctxPath = "memcom_decode_w8a16.bin", inputsDir = "inputs", prefillCtxPath;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--tokens" && i + 1 < argc) tokens = atoi(argv[++i]);
@@ -179,9 +197,14 @@ int main(int argc, char** argv) {
     else if (a == "--prefill" && i + 1 < argc) prefill = atoi(argv[++i]);
     else if (a == "--vote") vote = 1;
     else if (a == "--context" && i + 1 < argc) ctxPath = argv[++i];
+    else if (a == "--prefill-context" && i + 1 < argc) prefillCtxPath = argv[++i];
+    else if (a == "--chunk-size" && i + 1 < argc) chunkSize = atoi(argv[++i]);
     else if (a == "--inputs" && i + 1 < argc) inputsDir = argv[++i];
   }
-  if (prefill > 0) printf("prefill: %d tokens (zero-init state)\n", prefill);
+  if (prefill > 0 && !prefillCtxPath.empty())
+    printf("prefill: %d tokens via chunked graph (chunk=%d)\n", prefill, chunkSize);
+  else if (prefill > 0)
+    printf("prefill: %d tokens (serial decode graph)\n", prefill);
 
   // 1. dlopen HTP backend
   void* h = dlopen("libQnnHtp.so", RTLD_NOW | RTLD_LOCAL);
@@ -409,11 +432,291 @@ int main(int argc, char** argv) {
   fixup(outs);
   qsys.QNN_SYSTEM_INTERFACE_VER_NAME.systemContextFree(sysCtx);
 
+  // Chunked prefill: load and execute prefill context binary
+  Qnn_ContextHandle_t prefillCtx = nullptr;
+  Qnn_GraphHandle_t prefillGraph = nullptr;
+  std::vector<TensorRT> pfIns, pfOuts;
+  int chunkedPrefillDone = 0;
+  
+  if (!prefillCtxPath.empty() && prefill > 0) {
+    printf("\n=== CHUNKED PREFILL: %d tokens (chunk_size=%d) ===\n", prefill, chunkSize);
+    
+    // Read prefill binary
+    std::vector<uint8_t> pfBin;
+    if (!readFile(prefillCtxPath, pfBin)) {
+      fprintf(stderr, "failed to read prefill context %s\n", prefillCtxPath.c_str());
+      return 1;
+    }
+    printf("prefill binary: %.1f MB\n", pfBin.size() / 1e6);
+    
+    // Inspect prefill binary metadata
+    QnnSystemContext_Handle_t pfSysCtx = nullptr;
+    if (QNN_SUCCESS != qsys.QNN_SYSTEM_INTERFACE_VER_NAME.systemContextCreate(&pfSysCtx)) {
+      fprintf(stderr, "prefill: systemContextCreate failed\n");
+      return 1;
+    }
+    const QnnSystemContext_BinaryInfo_t* pfBi = nullptr;
+    Qnn_ContextBinarySize_t pfBiSize = 0;
+    if (QNN_SUCCESS != qsys.QNN_SYSTEM_INTERFACE_VER_NAME.systemContextGetBinaryInfo(
+                           pfSysCtx, pfBin.data(), (uint64_t)pfBin.size(), &pfBi, &pfBiSize)) {
+      fprintf(stderr, "prefill: systemContextGetBinaryInfo failed\n");
+      return 1;
+    }
+    
+    // Extract graph info from prefill binary
+    const QnnSystemContext_GraphInfo_t* pfGraphs = nullptr;
+    uint32_t pfNumGraphs = 0;
+    switch (pfBi->version) {
+      case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1:
+        pfGraphs = pfBi->contextBinaryInfoV1.graphs;
+        pfNumGraphs = pfBi->contextBinaryInfoV1.numGraphs;
+        break;
+      case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2:
+        pfGraphs = pfBi->contextBinaryInfoV2.graphs;
+        pfNumGraphs = pfBi->contextBinaryInfoV2.numGraphs;
+        break;
+      case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3:
+        pfGraphs = pfBi->contextBinaryInfoV3.graphs;
+        pfNumGraphs = pfBi->contextBinaryInfoV3.numGraphs;
+        break;
+      default:
+        fprintf(stderr, "prefill: unsupported binary info version %u\n", (unsigned)pfBi->version);
+        return 1;
+    }
+    if (pfNumGraphs != 1) {
+      fprintf(stderr, "prefill: expected 1 graph, got %u\n", pfNumGraphs);
+      return 1;
+    }
+    
+    std::string pfGraphName;
+    const Qnn_Tensor_t* pfTins = nullptr;
+    const Qnn_Tensor_t* pfTouts = nullptr;
+    uint32_t pfNIn = 0, pfNOut = 0;
+    const QnnSystemContext_GraphInfo_t& pfGinfo = pfGraphs[0];
+    switch (pfGinfo.version) {
+      case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1:
+        pfGraphName = pfGinfo.graphInfoV1.graphName;
+        pfTins = pfGinfo.graphInfoV1.graphInputs;
+        pfNIn = pfGinfo.graphInfoV1.numGraphInputs;
+        pfTouts = pfGinfo.graphInfoV1.graphOutputs;
+        pfNOut = pfGinfo.graphInfoV1.numGraphOutputs;
+        break;
+      case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_2:
+        pfGraphName = pfGinfo.graphInfoV2.graphName;
+        pfTins = pfGinfo.graphInfoV2.graphInputs;
+        pfNIn = pfGinfo.graphInfoV2.numGraphInputs;
+        pfTouts = pfGinfo.graphInfoV2.graphOutputs;
+        pfNOut = pfGinfo.graphInfoV2.numGraphOutputs;
+        break;
+      case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3:
+        pfGraphName = pfGinfo.graphInfoV3.graphName;
+        pfTins = pfGinfo.graphInfoV3.graphInputs;
+        pfNIn = pfGinfo.graphInfoV3.numGraphInputs;
+        pfTouts = pfGinfo.graphInfoV3.graphOutputs;
+        pfNOut = pfGinfo.graphInfoV3.numGraphOutputs;
+        break;
+      default:
+        fprintf(stderr, "prefill: unsupported graph info version %u\n", (unsigned)pfGinfo.version);
+        return 1;
+    }
+    printf("prefill graph: %s  inputs: %u  outputs: %u\n", pfGraphName.c_str(), pfNIn, pfNOut);
+    
+    // Create prefill context and retrieve graph
+    auto pfTb = std::chrono::steady_clock::now();
+    if (QNN_SUCCESS != qnn.QNN_INTERFACE_VER_NAME.contextCreateFromBinary(
+                           backend, nullptr, nullptr, pfBin.data(), pfBin.size(), &prefillCtx, nullptr)) {
+      fprintf(stderr, "prefill: contextCreateFromBinary failed\n");
+      return 1;
+    }
+    auto pfTd = std::chrono::steady_clock::now();
+    printf("prefill context load: %.1f ms\n", std::chrono::duration<double, std::milli>(pfTd - pfTb).count());
+    
+    if (QNN_SUCCESS != qnn.QNN_INTERFACE_VER_NAME.graphRetrieve(prefillCtx, pfGraphName.c_str(), &prefillGraph)) {
+      fprintf(stderr, "prefill: graphRetrieve(%s) failed\n", pfGraphName.c_str());
+      return 1;
+    }
+    
+    // Build prefill tensor storage
+    pfIns.reserve(pfNIn);
+    pfOuts.reserve(pfNOut);
+    auto pfAddTensor = [&](const Qnn_Tensor_t& src, bool isInput) -> bool {
+      TensorRT t{};
+      t.qt = src;
+      const char* nm;
+      uint32_t rank;
+      uint32_t* dimsArr;
+      Qnn_DataType_t dt;
+      if (src.version == QNN_TENSOR_VERSION_1) {
+        nm = src.v1.name;
+        rank = src.v1.rank;
+        dimsArr = src.v1.dimensions;
+        dt = src.v1.dataType;
+        t.scale = src.v1.quantizeParams.scaleOffsetEncoding.scale;
+        t.offset = src.v1.quantizeParams.scaleOffsetEncoding.offset;
+      } else if (src.version == QNN_TENSOR_VERSION_2) {
+        nm = src.v2.name;
+        rank = src.v2.rank;
+        dimsArr = src.v2.dimensions;
+        dt = src.v2.dataType;
+        t.scale = src.v2.quantizeParams.scaleOffsetEncoding.scale;
+        t.offset = src.v2.quantizeParams.scaleOffsetEncoding.offset;
+      } else {
+        fprintf(stderr, "prefill: unexpected tensor version %u\n", (unsigned)src.version);
+        return false;
+      }
+      t.name = nm;
+      t.dt = dt;
+      t.isInput = isInput;
+      t.nElems = 1;
+      for (uint32_t r = 0; r < rank; r++) {
+        t.dims.push_back(dimsArr[r]);
+        t.nElems *= dimsArr[r];
+      }
+      size_t elemSize;
+      if (dt == QNN_DATATYPE_UFIXED_POINT_16) elemSize = 2;
+      else if (dt == QNN_DATATYPE_INT_32) elemSize = 4;
+      else {
+        fprintf(stderr, "prefill: %s unsupported dtype %u\n", nm, (unsigned)dt);
+        return false;
+      }
+      t.buf.resize(t.nElems * elemSize, 0);
+      if (isInput) pfIns.push_back(std::move(t));
+      else pfOuts.push_back(std::move(t));
+      return true;
+    };
+    for (uint32_t i = 0; i < pfNIn; i++) {
+      if (!pfAddTensor(pfTins[i], true)) return 1;
+    }
+    for (uint32_t i = 0; i < pfNOut; i++) {
+      if (!pfAddTensor(pfTouts[i], false)) return 1;
+    }
+    
+    // Fixup prefill tensors
+    auto pfFixup = [&](std::vector<TensorRT>& v) {
+      for (TensorRT& t : v) {
+        if (t.qt.version == QNN_TENSOR_VERSION_1) {
+          t.qt.v1.name = t.name.c_str();
+          t.qt.v1.dimensions = t.dims.data();
+          t.qt.v1.memType = QNN_TENSORMEMTYPE_RAW;
+          t.qt.v1.clientBuf.data = t.buf.data();
+          t.qt.v1.clientBuf.dataSize = (uint32_t)t.buf.size();
+        } else {
+          t.qt.v2.name = t.name.c_str();
+          t.qt.v2.dimensions = t.dims.data();
+          t.qt.v2.memType = QNN_TENSORMEMTYPE_RAW;
+          t.qt.v2.clientBuf.data = t.buf.data();
+          t.qt.v2.clientBuf.dataSize = (uint32_t)t.buf.size();
+        }
+      }
+    };
+    pfFixup(pfIns);
+    pfFixup(pfOuts);
+    
+    // Seed prefill inputs
+    for (TensorRT& t : pfIns) {
+      if (t.name == "ids") {
+        // Read first 'prefill' tokens from ids.raw (pad with 0 if needed)
+        std::vector<uint8_t> raw;
+        if (!readFile(inputsDir + "/ids.raw", raw)) {
+          fprintf(stderr, "prefill: missing %s/ids.raw\n", inputsDir.c_str());
+          return 1;
+        }
+        size_t available = raw.size() / 4;
+        size_t toCopy = std::min(available, (size_t)prefill);
+        memcpy(t.buf.data(), raw.data(), toCopy * 4);
+        if (toCopy < (size_t)prefill) {
+          memset((uint8_t*)t.buf.data() + toCopy * 4, 0, (prefill - toCopy) * 4);
+        }
+      } else if (t.name == "cos" || t.name == "sin") {
+        // Generate RoPE for 'prefill' positions
+        uint16_t* buf = (uint16_t*)t.buf.data();
+        generateRoPE(buf, buf, prefill, 64, t.scale, t.offset, 1e4f);
+        if (t.name == "sin") {
+          // sin is offset by pi/2 from cos, regenerate with shift
+          std::vector<float> invFreq(32);
+          for (int j = 0; j < 32; j++)
+            invFreq[j] = 1.0f / powf(1e4f, (float)(2 * j) / 64.0f);
+          for (int p = 0; p < prefill; p++) {
+            for (int j = 0; j < 32; j++) {
+              float angle = (float)p * invFreq[j] + 3.14159265f / 2.0f;
+              float s = sinf(angle);
+              buf[p * 64 + 2 * j] = quant16(s, t.scale, t.offset);
+              buf[p * 64 + 2 * j + 1] = quant16(s, t.scale, t.offset);
+            }
+          }
+        }
+      } else {
+        // State tensors: zero-init
+        memset(t.buf.data(), 0, t.buf.size());
+      }
+    }
+    
+    // Execute prefill
+    std::vector<Qnn_Tensor_t> pfQinsArr, pfQoutsArr;
+    pfQinsArr.reserve(pfIns.size());
+    pfQoutsArr.reserve(pfOuts.size());
+    for (TensorRT& t : pfIns) pfQinsArr.push_back(t.qt);
+    for (TensorRT& t : pfOuts) pfQoutsArr.push_back(t.qt);
+    
+    auto pfExecT0 = std::chrono::steady_clock::now();
+    Qnn_ErrorHandle_t pfEs = qnn.QNN_INTERFACE_VER_NAME.graphExecute(
+        prefillGraph, pfQinsArr.data(), (uint32_t)pfQinsArr.size(), 
+        pfQoutsArr.data(), (uint32_t)pfQoutsArr.size(), nullptr, nullptr);
+    auto pfExecT1 = std::chrono::steady_clock::now();
+    double pfExecMs = std::chrono::duration<double, std::milli>(pfExecT1 - pfExecT0).count();
+    
+    if (QNN_SUCCESS != pfEs) {
+      fprintf(stderr, "prefill: graphExecute failed: %u\n", (unsigned)pfEs);
+      return 1;
+    }
+    printf("prefill execute: %.2f ms (%.2f tok/s)\n", pfExecMs, prefill / (pfExecMs / 1000.0));
+    
+    // Transfer state from prefill outputs to decode inputs
+    std::map<std::string, TensorRT*> pfOutByName;
+    for (TensorRT& t : pfOuts) pfOutByName[t.name] = &t;
+    
+    for (TensorRT& in : ins) {
+      std::string pfOutName;
+      if (in.name.size() > 1 && in.name[0] == 's' && isdigit((unsigned char)in.name[1]))
+        pfOutName = "s_out" + in.name.substr(1);
+      else if (in.name.rfind("kc", 0) == 0)
+        pfOutName = "kc_out" + in.name.substr(2);
+      else if (in.name.rfind("vc", 0) == 0)
+        pfOutName = "vc_out" + in.name.substr(2);
+      else continue;
+      
+      auto it = pfOutByName.find(pfOutName);
+      if (it == pfOutByName.end()) {
+        fprintf(stderr, "prefill: no output tensor %s for decode input %s\n", pfOutName.c_str(), in.name.c_str());
+        return 1;
+      }
+      TensorRT* pfOut = it->second;
+      
+      // Convert quantization if needed
+      if (in.scale == pfOut->scale && in.offset == pfOut->offset) {
+        memcpy(in.buf.data(), pfOut->buf.data(), in.buf.size());
+      } else {
+        float A = pfOut->scale / in.scale;
+        float B = pfOut->scale * (float)pfOut->offset / in.scale - (float)in.offset;
+        neonConvert((const uint16_t*)pfOut->buf.data(), (uint16_t*)in.buf.data(), in.nElems, A, B);
+      }
+    }
+    printf("prefill state transferred to decode context\n");
+    
+    // Mark chunked prefill as done
+    chunkedPrefillDone = prefill;
+    
+    // Clean up prefill context
+    qnn.QNN_INTERFACE_VER_NAME.contextFree(prefillCtx, nullptr);
+    qsys.QNN_SYSTEM_INTERFACE_VER_NAME.systemContextFree(pfSysCtx);
+  }
+
   // 7. seed inputs from float32 raw files (ids.raw is int32)
   //    In prefill mode: zero-init state tensors (s/kc/vc), only seed ids/cos/sin
   for (TensorRT& t : ins) {
     bool isState = (t.name.size() > 1 && t.name[0] == 's' && isdigit((unsigned char)t.name[1]))
                    || t.name.rfind("kc", 0) == 0 || t.name.rfind("vc", 0) == 0;
+    if (chunkedPrefillDone > 0 && isState) continue;
     if (prefill > 0 && isState) {
       memset(t.buf.data(), 0, t.buf.size());
       continue;
@@ -478,7 +781,8 @@ int main(int argc, char** argv) {
 
   // 9. main loop: prefill + warmup + decode
   std::vector<double> prefillTimes, decodeTimes;
-  int total = prefill + warmup + tokens;
+  int serialPrefill = (chunkedPrefillDone > 0) ? 0 : prefill;
+  int total = serialPrefill + warmup + tokens;
   for (int step = 0; step < total; step++) {
     auto t0 = std::chrono::steady_clock::now();
     Qnn_ErrorHandle_t es = qnn.QNN_INTERFACE_VER_NAME.graphExecute(
@@ -509,13 +813,13 @@ int main(int argc, char** argv) {
     }
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    if (step < prefill) {
+    if (step < serialPrefill) {
       prefillTimes.push_back(ms);
-      if (step % 10 == 0 || step == prefill - 1)
-        printf("prefill %3d/%d: %8.2f ms\n", step + 1, prefill, ms);
-    } else if (step >= prefill + warmup) {
+      if (step % 10 == 0 || step == serialPrefill - 1)
+        printf("prefill %3d/%d: %8.2f ms\n", step + 1, serialPrefill, ms);
+    } else if (step >= serialPrefill + warmup) {
       decodeTimes.push_back(ms);
-      printf("tok %2d: %8.2f ms  id=%5d  logit=%.3f\n", step - prefill - warmup, ms, bestIdx,
+      printf("tok %2d: %8.2f ms  id=%5d  logit=%.3f\n", step - serialPrefill - warmup, ms, bestIdx,
              dequant16(best, logitsOut->scale, logitsOut->offset));
     }
   }

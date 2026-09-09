@@ -87,8 +87,37 @@ graph-only 单步（qnn-net-run b2b）：W8A16 min 18.4ms / avg 21.1ms, W8A8 min
 
 6. **理论下限**：388.7 MB / 20 GB/s DDR = 19.4 ms/tok（51.5 tok/s）。当前最优 28.89 tok/s（decode），距下限 44%。差距来源：DVFS 降频 + graph execute 调度开销。
 
+## Chunked Parallel Prefill (架构验证)
+
+BMC 的 `S_new = g*S + i*(k⊗v)` 递推 = Gated Linear Attention 的 recurrent form。虽然状态维不可并行，但 chunk 内所有 matmul 的**权重可以共享读取一次**——把 batch=1 提升到 batch=C 就是纯 FLOP/byte 的提升。
+
+导出 `chunk_size=8` 的 prefill 变体图（`memcom_model_prefill.py` + `export_prefill.py` + `gen_prefill_calib.py`）：
+- BMC: batched projections + unrolled 8-step state scan
+- GQA: batched Q/K/V + causal-masked attention over 256 KV
+- W8A16 量化后 `.so` 476MB（等同 decode 图大小）
+
+`memcom_e2e --prefill-context prefill_context.bin --chunk-size 8` 加载 dual context，先跑 prefill graph 一次，把 state (s/kc/vc) 拷回 decode context 继续生成。
+
+### 实测（W8A16, SM8850, 8-token prefill + 20-token decode, 手机热态）
+
+| Prefill 模式 | Prefill 8 tokens | Prefill tok/s | Decode avg | Decode tok/s |
+|-|-|-|-|-|
+| Serial (8× decode graph) | 222.3 ms | 35.99 | 27.48 ms | 36.39 |
+| **Chunked (1× prefill graph)** | **34.68 ms** | **230.66** | **20.79 ms** | **48.11** |
+
+**Prefill 6.4× 加速 (222→35 ms), Decode 附带 1.32× 加速。**
+
+### 理论算术强度验证
+
+- Serial batch=1：4.6 FLOP/byte（DDR-bound，~22% roofline）
+- Chunked batch=8：36 FLOP/byte（仍 memory-bound 但 8× 减少权重读取）
+- 实测吞吐：serial 35.99 → chunked 230.66 = **6.4×** ≈ 理论 8× 中间的调度/激活损失
+
+**验证了"NPU 友好模型"论点**：架构本身可 batch 的 prefill 让 HMX 从 14% 利用率飙升。BMC 时间维不可并行不是障碍——权重共享才是决定性因素。
+
 ## 待主模型训完后
 
 - W8A8 量化：graph-only 预期 ~6% 提速（18.4→17.4ms）
-- 重新跑完整 e2e 基准对比
+- chunk_size=16/32 的 prefill 图（需更多手机 RAM）
+- 多 chunk 循环支持长 prompt (N > chunk_size)
 - 评估 W4 可行性（HTP V81 不支持 SFXP4，当前不可行）
