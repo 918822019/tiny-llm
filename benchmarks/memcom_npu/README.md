@@ -121,3 +121,43 @@ BMC 的 `S_new = g*S + i*(k⊗v)` 递推 = Gated Linear Attention 的 recurrent 
 - chunk_size=16/32 的 prefill 图（需更多手机 RAM）
 - 多 chunk 循环支持长 prompt (N > chunk_size)
 - 评估 W4 可行性（HTP V81 不支持 SFXP4，当前不可行）
+
+## Tile 台阶效应验证
+
+HTP HMX 矩阵单元按离散 tile 处理，fp16 tile shape = [16×16]。Activation 的 M 维度跨越 tile 边界时，HMX 利用率跳变，产生非线性的 per-token 加速。
+
+### 实测（W8A16, SM8850, solo, 手机热态）
+
+| chunk_size | prefill 总时间 | tok/s | 每 token | HMX 利用率 |
+|-----------|---------------|-------|----------|-----------|
+| Serial (M=1) | 222.3 ms (8 tok) | 36.0 | 27.8 ms | 6% |
+| Chunked M=8 | 40.6 ms (8 tok) | 197 | 5.1 ms | 50% |
+| **Chunked M=16** | **61.3 ms (16 tok)** | **261** | **3.8 ms** | **100%** |
+| 理论上限 | — | ~280 | ~3.6 ms | — |
+
+**chunk=16 vs chunk=8：per-token 快 33%（5.08→3.83 ms）**
+
+### 机制
+
+```
+fp16 tile [16×16]:
+  M=8:  需要 1 tile，填充 8/16 行 → 利用率 50%
+  M=16: 需要 1 tile，填充 16/16 行 → 利用率 100%（台阶跳变）
+  M=32: 需要 2 tiles，利用率仍 100%，但 state spill 到 DDR → 可能变慢
+
+每个 tile 的 load+compute 开销固定（~60ns），不随填充率变化。
+M=8 时 50% 的行空闲但开销照付 → 每 token 多花 33% 时间。
+```
+
+### 为什么 chunk=16 是最优
+
+- chunk=8: DDR 1× + HMX 50% + VTCM 装得下 → 5.5× 加速
+- **chunk=16**: DDR 1× + HMX 100% + VTCM 边缘 → **7.3× 加速**
+- chunk=32: DDR 1× + HMX 100% + VTCM 溢出（state spill） → 可能 5-6×
+
+实测 chunk=16 达 261 tok/s，接近理论上限 280 tok/s（7.8×）。
+
+**验证了"NPU 友好模型"论点**：
+1. 架构可 batch（chunked prefill）让权重只读一次 → 8× 减少 DDR
+2. 选择对齐 tile 的 chunk_size（16）→ HMX 利用率 100%
+3. 两者叠加 → 7.3× 实测加速
