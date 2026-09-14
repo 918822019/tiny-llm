@@ -22,7 +22,7 @@
 │  ├── CPUBackend (NEON/SDOT，主线)     │
 │  ├── CUDABackend (已实现，逐算子 A/B)   │
 │  ├── MetalBackend (未来)             │
-│  └── VulkanBackend (未来)            │
+│  └── VulkanBackend (Android FP16)    │
 └──────────────┬──────────────────────┘
                ↓ 每个后端支持多种量化
 ┌─────────────────────────────────────┐
@@ -42,6 +42,9 @@ tinyqwen/
 │   ├── backend.h              # IBackend 抽象接口 + WeightTensor
 │   ├── backend_cpu.h/cpp      # CPUBackend 实现（包装 dispatch，主线）
 │   ├── backend_cuda.h/cpp     # CUDABackend 实现（逐算子，需 CUDA 构建）
+│   ├── backend_vulkan.h/cpp   # Android Vulkan 逐算子 FP16 正确性后端
+│   ├── dflash_vulkan.h/cpp    # DFlash GPU 常驻整块执行器（性能路径）
+│   ├── vulkan/*.comp          # Vulkan compute shader（构建时嵌入二进制）
 │   ├── qwen_model.h           # QwenModel 接口
 │   ├── qwen_model.cpp         # create() + 公共逻辑
 │   ├── qwen_forward_token.cpp # forward_token（decode 路径）
@@ -137,7 +140,7 @@ TINYQWEN_MATVEC_VARIANT(matvec_f32_neon, "neon");
 - 可以按名字选择实现（`--matvec-impl neon`）
 - 未注册的变体自动兜底到 ref
 
-### 4. Backend ≠ Engine（三条 GPU 路径，易混淆）
+### 4. Backend ≠ Engine（GPU 路径，易混淆）
 
 三者管**不同阶段**，不要混为一谈：
 
@@ -156,6 +159,14 @@ TINYQWEN_MATVEC_VARIANT(matvec_f32_neon, "neon");
 K/V 写进 `KvCache` 并 `advance(n)`，CPU decode 才能从位置 n 接续。两者在 CLI 上互斥。
 
 CPU 主线没有这个区分：CPUBackend 就是唯一路径。
+
+Android 的 `--backend vulkan` 也有两种执行形态。普通 Qwen 走
+`VulkanBackend`：仅 FP16 matrix op 在 GPU 上，每次算子都同步回 CPU，定位是单算子
+正确性和 bring-up，不是性能路径。若同时传入 `--dflash-model`，CLI 会保留 CPU target，
+并改用 `DFlashVulkanEngine`：DFlare backbone、共享 target lm_head、顺序 Markov 修正和
+argmax 全部常驻 GPU，一个 speculative block 只提交一次 command buffer。该路径需要
+Vulkan 1.2、`shaderFloat16`、16-bit storage 和 compute clustered subgroup；当前块长上限
+为 8。目标 verify 尚未 GPU-resident，所以它仍是 CPU target + Vulkan drafter 的混合路径。
 
 ## 数据流
 

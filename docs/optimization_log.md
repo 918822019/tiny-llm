@@ -59,6 +59,7 @@
 | fp16_kv_fused（macOS M4，opt-in 长上下文） | 本次 | 52.23（4B-1360tok，vs fp32 48.56） | — | —（长上下文专项） | 融合 attention 把独立反量化开销消掉：4B-1360tok decode 75.1→52.2ms（1.44×）、TTFT 37.1→16.4s（2.26×） | `--kv-f16` opt-in：KV cache 存 fp16（内存减半 96→48MB），新增融合 attention `attention_decode_f16kv_neon`（读 fp16、寄存器内转 fp32、就地算），消灭"逐调用整段反量化"。**定位修正**：独立反量化版慢 1.56×（每调用反量化整段 [0,seq]）；融合后收窄到慢 1.08×。**本质是内存特性不是提速**——省一半 KV 内存、能塞 2× 长序列，但解码比 fp32 慢 ~8%（寄存器内 fp16→fp32 转换抵消了读带宽减半）。短上下文用 fp32，长上下文内存不够才用 `--kv-f16` |
 | sdot5_sym（macOS M4，对称量化） | 本次 | — | — | —（仅 0.8B 验证） | 0.8B decode **1.045×**（8.07→7.72 ms/tok） | sdot5：对称量化（zero=8）+ 无 zero 修正项 + 无前缀和，导出器加 `--symmetric`（--method rtn）。每 64 权重组省 ~7 条标量（zero 读/转/FSUB/C/xqsum×2/修正）。**部分证伪**：0.8B 只提 4.5%，远低于预期 1.5-2×——省下的标量指令大部分被 OoO 隐藏在内存加载延迟后，瓶颈是带宽/加载流水线不是标量。4B 对称导出未做（留作后续）。数值正确（对称单测 + 单测全过） |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
+| dflash-vulkan-f16（Android / Adreno 840） | 本次 | — | — | — | GPU draft 与 CPU 同量级（配对轮约 155–186 vs 161–166 ms） | Vulkan FP16 逐算子正确性后端 + DFlash GPU-resident 整块执行器；208 真机测试、真实输出逐 token 对齐。逐算子 2160 submit 的错误形态改为每 proposal block 一次 submit；端到端仍慢 16%–18%，target verify 尚在 CPU，属于功能落地而非提速结论 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ### dflash-qwen3-0.6b-markov（2026-09-14，Android 正确性与首轮性能）
@@ -4103,8 +4104,10 @@ done; done
   swap 是**写操作**、消耗 SSD 寿命，所以宁可 fail-fast。
 - **实现**：`estimate_resident_bytes` 只读 header（192 字节）+ tensor 表，**一个数据区
   字节都不读**，所以能在 load() 之前把需求算准。稀疏加载下复现 load() 的紧凑打包
-  游标。`available_memory_bytes` 用 `host_statistics64`（macOS）/ `_SC_AVPHYS_PAGES`
-  （Linux），判据是**可用**内存而非物理总量（wired 已占大半，按总量校验会宽松数倍）。
+  游标。`available_memory_bytes` 用 `host_statistics64`（macOS）/ `/proc/meminfo` 的
+  `MemAvailable`（Linux/Android；旧内核才回退 `_SC_AVPHYS_PAGES`），判据是**可用**
+  内存而非物理总量（wired 已占大半，按总量校验会宽松数倍）。Android/Bionic 的
+  `_SC_AVPHYS_PAGES` 只含完全空闲页，会漏掉可安全回收的 page cache，本次已修正。
 - **错误信息**：给出具体数字（需求 MB vs 上限 MB）+ 四条修复建议（关进程 / `--moe-ssd`
   / 换小量化 / 缩小专家缓存预算）。
 - **非优化**：不改变性能，纯可靠性改进。
@@ -4151,6 +4154,41 @@ done; done
   对 CPU 太贵”。线程扫描 4/6/8 中 4 明显更慢，6 略优于 8，但不足以转正。
 - **教训**：接受率、目标调用次数和 block=8 内核加速都不能替代端到端长生成结果；
   必须同时报告 `draft_ms`、`target_verify_ms` 与最终 decode。
+
+---
+
+### DFlash Android Vulkan FP16（2026-09-14）
+
+- **优化栈**：上一节 CPU FP16 小块 GEMM + Android Vulkan 1.2 + FP16 storage/compute
+  + clustered subgroup；目标仍为 ARM CPU batch verify。
+- **是什么**：新增通用 `VulkanBackend` FP16 matvec/matmul（单算子正确性桥）和专用
+  `DFlashVulkanEngine`。后者让 3 层 DFlare、target hidden fusion、context KV、
+  non-causal block attention、共享 lm_head、rank-128 Markov 与 argmax 全部常驻 GPU，
+  一个 speculative block 只做一次 submit/fence。GLSL 由 NDK glslc 编译为 SPIR-V
+  并嵌入单个 CLI binary。
+- **错误形态先证伪**：直接把 `IBackend` 换成 Vulkan 数值正确，但 8-token 生成需要
+  target 2160 + draft 142 次 dispatch；GPU draft 280.79 ms、target verify 836.30 ms，
+  明显慢于 CPU 的 38.86 / 113.23 ms。结论是逐算子 CPU↔GPU 同步不可作为性能后端。
+- **整块实现**：初版 shared-memory 归约，block=2 的 GPU draft 降到 75.30 ms（相对
+  逐算子 3.7×）；block=8 因 kernel barrier/标量 half load 为 579.26 ms。改为 `uint`
+  打包 FP16 + `unpackHalf2x16` + 16-lane `subgroupClusteredAdd` 后，最好轮降到
+  140.31 ms（相对初版整块 4.1×），所有 proposal/accept/rollback 保持一致。
+- **干净配对结果**：PLK110 / Adreno 840，43-token code prompt，生成 16 token，
+  block=8，6 CPU workers：CPU 两轮 draft 160.73 / 166.23 ms、decode 548.54 /
+  571.11 ms；Vulkan 两轮 draft 155.12 / 185.71 ms、decode 639.64 / 672.11 ms。
+  两边均为 5 blocks、32 proposed、10 accepted，16 个输出 token 逐字节一致。
+- **判定**：GPU draft 与优化后的 CPU draft 同量级，尚无稳定单侧收益；GPU 轮的 CPU
+  target verify 从 387.70–404.76 增到 484.37–486.25 ms，最终慢约 16%–18%。功能、
+  数值和“一块一次提交”已成立，但**不符合论文端到端加速预期**。
+- **验证**：host Release build + 206 tests；Android Release build + 208 tests（新增
+  Vulkan FP16 matvec、非 8 整除 row tail、`tokens > 8` chunk 门禁）均 0 failed；
+  通用 Vulkan 真 Qwen 前两 token 与 CPU 一致，专用 DFlash 两轮完整输出均 `cmp=0`。
+- **资源**：当前 checkpoint GPU 权重 473.0 MB、DFlash cache 6.0 MB
+  (`max_seq_len=256`)；CPU 模型文件不释放。内存预检同步修复为 Android
+  `MemAvailable`，不再把约 5.8 GB 可用内存误报成约 1 GB `MemFree`。
+- **下一步**：把 target verify 与 drafter 放进同一个 Vulkan device/allocator，复用
+  lm_head 并避免 GPU→CPU 阶段切换；同时用论文相同数据集/模板评估接受率。仅继续
+  优化通用逐算子 Vulkan submit 不会改变端到端结论。
 
 ---
 

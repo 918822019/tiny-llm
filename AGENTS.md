@@ -239,7 +239,10 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
    进程已占掉大半：实测 16 GB 机器 wired 就有 8 GB、可用只剩 1.5 GB。按物理
    总量校验会宽松 **7×**，放行后照样把机器推进换页（实测 swap used 11.3 GB /
    12 GB、pageouts 132 万）。**swap 是写操作、消耗 SSD 寿命**，所以宁可
-   fail-fast。macOS 用 `host_statistics64` 取 free+inactive+purgeable，留 10% 余量。
+   fail-fast。macOS 用 `host_statistics64` 取 free+inactive+purgeable，留 10% 余量；
+   Linux/Android 用 `/proc/meminfo` 的 `MemAvailable`。Bionic 的
+   `_SC_AVPHYS_PAGES` 只返回完全空闲页，会漏掉可无 swap 回收的 page cache，曾把
+   5.8 GB 可用误报成约 1 GB；它只能作为旧内核 fallback。
 27. **并发代码两条铁律（都是实测踩到的死锁）**。定位手段：后台跑 + `sample <pid> 1`
    抓调用栈，两个线程都停在 `__psynch_cvwait` 就是互等。
    **(a) 不同等待条件必须用不同 CV。** 主线程等"某 key 就绪"、worker 等"队列有活"，
@@ -332,6 +335,15 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     从约 1040 降到 435 ms，证明并行验证有效，但 Markov 链仍需逐位置读 W2。
     看 `--speculative-stats-out` 的 `draft_ms` / `target_verify_ms`，不能用接受率或
     target_calls 单独推断 speedup；短序列 2%–5% 的领先也要按噪声边界处理。
+37. **GPU 后端不能停在逐算子 submit，且“GPU 在跑”不等于端到端更快。**
+    Android Vulkan 逐算子桥接在 8-token DFlash 测试中产生 target 2160 + draft 142
+    次 dispatch，虽然数值正确，draft/verify 却慢到 280.8/836.3 ms。专用 DFlash
+    command stream 把三层 backbone、lm_head、Markov、argmax 合成每 block 一次
+    submit，并用 packed FP16 + 16-lane clustered subgroup 把最好 GPU draft 降到
+    140.3 ms；但干净配对里 GPU draft 155–186 ms 与 CPU 161–166 ms 同量级，CPU
+    target verify 又在 GPU 轮变慢，最终仍慢 16%–18%。后续 GPU 工作的门槛是
+    **target + draft 同 device 常驻、复用 lm_head、按整段计时**；继续打磨每算子
+    H2D/D2H 或只报 kernel 时间不能作为性能结论。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

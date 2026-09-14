@@ -24,9 +24,10 @@
 - 超出 max_seq_len / KV 溢出直接 abort（fail loud）；
 - speculative decoding 目前仅支持 greedy；两个模型必须使用同一 tokenizer，
   运行时只能自动校验 vocab/EOS 元数据，无法识别 vocab 大小相同但词表映射不同的模型；
-- DFlash 当前只支持 Qwen3 稠密目标、DFlare fusion、低秩 Markov chain、FP16 和 CPU；
-  未实现 tree/optmarkov、采样拒绝、Metal/CUDA。Android FP16 batched GEMM 尚缺，
-  真机虽能减少 target 调用但当前通常不比普通 greedy 快，实测见 `dflash.md`；
+- DFlash 当前只支持 Qwen3 稠密目标、DFlare fusion、低秩 Markov chain、FP16 和
+  greedy 单链；CPU 与 Android Vulkan drafter 已实现，tree/optmarkov、采样拒绝、
+  Metal/CUDA 仍未实现。Vulkan 路径仅把 drafter 常驻 GPU，target verify 仍走 CPU；
+  真机输出与 CPU 对齐，但当前通常不比普通 greedy 快，实测见 `dflash.md`；
 - Qwen2/3 dense 的 CPU verify 主体走批量 GEMM；带 GDN 的 Qwen3.5 和 MoE 在 CPU
   上为保证递归状态正确暂走逐 token verify。Metal 支持 continuation batch，拒绝时
   GDN 需要 checkpoint 恢复与已接受前缀重放；
@@ -73,7 +74,17 @@
     所以 K（草稿长度）越大越划算：L=128 时 K=4 是 10.46 ms/tok、K=16 是 3.31 ms/tok；
   - 数值口径与 CPU 同为 fp32，末位 logits `max_abs_err ≈ 3.2e-05`（CPU ref 的
     RMSNorm 用 fp64 累加，GPU 用 fp32，故略大于纯 CPU 路径间的差异）；
-- Vulkan 后端仅 IBackend 接口预留，无实现。
+- **Android Vulkan FP16 已实现，但覆盖有意收窄**：
+  - `VulkanBackend` 只加速 FP16 matvec/matmul，其他算子继承 CPU；每个 matrix op 都有
+    command submit + fence wait，适合正确性 A/B，不适合整模型性能；
+  - DFlash 使用独立 GPU-resident 整块执行器，每个 proposal block 一次提交；要求
+    Vulkan 1.2、`shaderFloat16`、`storageBuffer16BitAccess`、compute clustered subgroup，
+    且 `block_size <= 8`；不满足条件会明确报错；
+  - target 权重和 DFlash 文件仍保留在 CPU 内存，同时 GPU 额外常驻约 473 MB
+    （当前 Qwen3-0.6B checkpoint，包含共享 lm_head），统一内存压力高；
+  - PLK110 / Adreno 840 的 16-token block=8 配对中，GPU draft 约 155–186 ms、CPU
+    draft 约 161–166 ms，差异落在设备波动内；target CPU verify 在 GPU 轮变慢，最终
+    decode 为 GPU 640–672 ms、CPU 549–571 ms，因此尚无端到端加速结论。
 
 ## 格式
 

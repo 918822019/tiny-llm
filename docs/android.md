@@ -60,6 +60,9 @@ cmake --build build-android -j
 - 不引入第三方依赖；profiler 的 JSON 为手写输出，无需 JSON 库；
 - `libc++_shared.so` 相关问题：确认 NDK toolchain 默认 `ANDROID_STL=c++_static`
   （本项目无额外要求，保持默认）；
+- Vulkan 默认开启。CMake 同时找到系统 `libvulkan` 与 NDK `shader-tools/.../glslc`
+  时会打印“启用 Android Vulkan FP16 后端”；shader 在构建机编译成 SPIR-V 并嵌入
+  `tinyqwen`，手机上不需要额外推送 shader 文件。缺少任一项时自动构建 CPU stub；
 - Release 默认 `-O3`；FP32 reference 不额外开 fast-math，保证与 PyTorch 对齐。
 
 ## 3. 真机运行
@@ -113,9 +116,29 @@ Android 没有 Metal，目标验证走 CPU。Qwen2/3 dense 会批量验证；Qwe
 当前走逐 token 正确性路径。上线前先用同一目标模型、不带 `--draft-model` 跑一遍，
 确认两次 `generated_ids` 完全一致，再比较 `spec.json` 的接受率和总耗时。
 
-DFlash / DFlare + Markov 使用 `--dflash-model draft.tqwen`，详细导出命令、块长语义和
-PLK110 真机 A/B 见 `dflash.md`。当前 Android FP16 matmul 会回退为 N 次 matvec，
-所以“接受率大于零”不等于“端到端更快”；必须同时比较无 profiler 的 decode wall time。
+DFlash / DFlare + Markov 使用 `--dflash-model draft.tqwen`。加
+`--backend vulkan` 后，target 继续走已优化的 ARM FP16 batch，DFlash drafter 的三层
+backbone、共享 lm_head、Markov 修正和 argmax 则常驻 GPU；一个 proposal block 只做
+一次 queue submit / fence wait：
+
+```bash
+adb shell "cd /data/local/tmp/tinyqwen && \
+  TINYQWEN_MT_THREADS=6 ./tinyqwen \
+    --model target_f16.tqwen --dflash-model dflash_f16.tqwen \
+    --tokens-json tokens.json --speculative-tokens 8 --max-new-tokens 16 \
+    --matvec-impl neon_mt_kv_nt --ops-impl neon --kv-f16 \
+    --backend vulkan --speculative-stats-out spec-vulkan.json"
+```
+
+需要逐块诊断时设置 `TINYQWEN_VULKAN_TRACE=1`，stderr 会报告每块 GPU fence wall time；
+正常测速应关闭。设备至少需要 Vulkan 1.2、FP16 shader / 16-bit storage；DFlash 快路径
+还要求 compute clustered subgroup，且当前 checkpoint block 上限为 8。详细导出命令、
+块长语义和 PLK110 真机 A/B 见 `dflash.md`。
+
+`--backend vulkan` 不等于整条推理都上 GPU：普通 Qwen 的逐算子后端每个矩阵操作都
+同步一次，仅用于正确性 A/B；DFlash 专用路径虽把整段 drafter 合并成一次提交，target
+verify 仍在 CPU。必须同时比较 `draft_ms`、`target_verify_ms` 和最终 decode，不能用
+“接受率大于零”或“GPU 确实执行了”代替端到端加速结论。
 
 ## 5. 常见坑
 
@@ -124,6 +147,7 @@ PLK110 真机 A/B 见 `dflash.md`。当前 Android FP16 matmul 会回退为 N �
 | `CANNOT LINK EXECUTABLE` | 确认 ABI 与设备匹配（`adb shell getprop ro.product.cpu.abi`），用 `c++_static` |
 | push 后权限报错               | `adb shell chmod +x /data/local/tmp/tinyqwen/tinyqwen`              |
 | OOM / 被杀                 | 0.5B fp32 权重约 2GB + KV cache；先降 `--max-seq-len`，或等 INT8/INT4        |
+| Vulkan 创建失败              | 确认构建日志已启用 Vulkan；设备需支持 Vulkan 1.2、FP16 storage/compute；DFlash 还需 clustered subgroup |
 | 输出乱码 token id            | 确认 prompt 用了 chat template，且 eos 设置正确（默认 151645）                    |
 | 时延抖动大                    | 手机热降频/大小核迁移；v1 不绑核，解读 profile 时看 p50/p95 而不是单次值                     |
 

@@ -1,6 +1,6 @@
 # runtime/ 导读
 
-文件看着多，其实就 **9 个角色**，每个干一件清楚的事。runtime 的本质是一条
+文件看着多，其实就 **9 类角色**，每个干一件清楚的事。runtime 的本质是一条
 流水线："把权重读进来 → 备好内存 → 循环计算 → 输出结果"。
 
 ## 角色地图
@@ -11,10 +11,10 @@
 | ② 加载   | `tensor.*` + `model_loader.*`                 | 把文件读进内存、校验、按名字找到每块权重                     |
 | ③ 内存   | `kv_cache.*` + `gdn_state.*`                  | decode 的历史记忆：full attention 的 K/V 缓存 + Qwen3.5 GDN 的 O(1) 递归/conv 状态 |
 | ④ 计算   | `qwen_model.*` + `qwen_forward_*.cpp`         | 真正的前向：一个 token 进、下一个 token 出             |
-| ⑤ 后端   | `backend.h` + `backend_cpu.*` + `backend_cuda.*` | 算子抽象层：模型只调 IBackend，不关心 dtype/量化/硬件      |
+| ⑤ 后端   | `backend.h` + `backend_cpu.*` + `backend_cuda.*` + `backend_vulkan.*` | 算子抽象层：模型只调 IBackend，不关心 dtype/量化/硬件 |
 | ⑥ 测量   | `profiler.*`                                  | 记录每步耗时（可关，关了零开销）                         |
 | ⑦ 编排   | `main.cpp` + `speculative_decoder.*` + `dflash_model.*` | CLI、普通生成、AR 草稿与 DFlash verify/rollback |
-| ⑧ GPU prefill | `metal_prefill.*`（Apple only）          | `--engine metal`：整批 prompt 跑在 Apple GPU，绕过 IBackend |
+| ⑧ GPU 整段执行 | `metal_prefill.*` + `dflash_vulkan.*` | 绕过逐算子同步：Apple prefill / Android DFlash proposal block |
 | 配置     | `config.*`                                    | key=value 配置解析（供 ⑦ 用）                    |
 
 ## 数据怎么流过它们
@@ -47,7 +47,7 @@
   `qwen_forward_prefill.cpp`（批量 prefill，GEMM 路径）；`qwen_model.cpp` 只剩
   `create()`（权重绑定/校验/workspace 分配）和公共逻辑。
 
-## 三条 GPU 路径的区别（易混淆）
+## GPU 路径的区别（易混淆）
 
 三者管的是**不同阶段**，不要混为一谈：
 
@@ -79,6 +79,11 @@
   数字与归因见 `../docs/optimization_log.md`，测速用
   `../scripts/bench_metal_prefill.sh`（带离散度列，离散度 >1.5 的行不可用于归因）。
   改 `metal_prefill.mm` 后必须跑接续等价性：`../benchmarks/test_metal_continuation.cpp`。
+- `--backend vulkan`（Android）：普通 Qwen 使用 `backend_vulkan.*` 的逐算子 FP16
+  matrix 路径，每次都有 submit/fence，只用于正确性 A/B。与 `--dflash-model` 同时
+  使用时会自动改走 `dflash_vulkan.*`：DFlare、共享 lm_head、Markov 与 argmax 在
+  GPU 常驻，一个 proposal block 一次提交；target verify 仍走 CPU。设备要求与实测
+  结论见 `../docs/dflash.md`，当前尚未获得端到端加速。
 
 ## 投机解码状态约定
 

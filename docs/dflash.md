@@ -5,8 +5,9 @@
 DFlare 为每个草稿层学习目标层融合权重，DSpark Markov 头再把前一个草稿 token
 的信息按低秩残差加到下一个位置的 logits。
 
-当前范围刻意固定为：Qwen3 稠密目标、batch=1、greedy、单链、FP16 权重、CPU
-验证。树搜索和采样式 rejection sampling 尚未接入。
+当前范围刻意固定为：Qwen3 稠密目标、batch=1、greedy、单链、FP16 权重。目标
+验证当前走 CPU；草稿可走 CPU，或在 Android 上用 Vulkan GPU-resident 执行器。
+树搜索和采样式 rejection sampling 尚未接入。
 
 ## 1. 已验证 checkpoint
 
@@ -97,6 +98,10 @@ adb shell "cd /data/local/tmp/tinyqwen && ./tinyqwen \
   --speculative-tokens 2 --matvec-impl neon_mt_kv_nt --ops-impl neon --kv-f16"
 ```
 
+让 DFlash drafter 走 Vulkan，只需在同一命令追加 `--backend vulkan`。不要把它和
+普通 Qwen 的逐算子 Vulkan 路径混为一谈：DFlash 专用执行器把整个 proposal block
+录进一条 command buffer，权重和 KV 常驻 GPU，每块只等待一次 fence。
+
 首次部署应分别跑普通 greedy 与 DFlash，比较两行 `generated_ids` 必须完全相同。
 随后再看 `blocks`、`accepted`、`target_calls` 与 `decode`，不能只看接受率。
 
@@ -156,3 +161,56 @@ DFlare + rank-128 Markov drafter 在 CPU 上的额外权重读取。尤其 Marko
 另一个实测现象：中文“用一句话介绍自己”样本的 draft acceptance 为 0%，而英文
 问答/代码/数学样本为 19%–31%（block=8）。这说明单条 prompt 不能代表论文报告的
 多数据集均值；评估 drafter 质量应复现相同数据集和 prompt 模板。
+
+### 5.3 Android Vulkan FP16 drafter
+
+Vulkan 实现分成两层：
+
+1. `VulkanBackend` 提供通用 FP16 matvec/matmul，权重按 host 指针缓存到 GPU；其他
+   算子复用 CPUBackend。它每个 matrix op 都会 submit + wait，真模型上正确但很慢，
+   用于单算子测试和硬件 bring-up。
+2. `DFlashVulkanEngine` 是实际 DFlash 路径。三层 DFlare、target residual fusion、
+   context KV、非因果 block attention、共享 target lm_head、Markov bias 和 argmax
+   全部留在同一 Vulkan command buffer；CPU 每块只上传新增 target hidden，并读回
+   `block_size-1` 个 token id。
+
+矩阵 shader 以 `uint` 成对读取 FP16 权重，用 `unpackHalf2x16` 转 FP32，并使用
+16-lane `subgroupClusteredAdd` 做归约；一个 workgroup 同时计算 8 个输出行和最多 8 个
+token 列。Markov W2 也使用打包 FP16 读取，但相邻位置有真实 token 依赖，仍必须顺序
+执行。构建时 NDK `glslc` 把 shader 编译为 SPIR-V 并嵌入可执行文件。
+
+当前 checkpoint 的 GPU 常驻权重约 473 MB（包含共享 lm_head），DFlash FP32 KV 在
+`max_seq_len=256` 时约 6 MB。CPU 侧 target / draft 文件仍保留，所以这是额外内存而非
+替代内存。Android 内存门禁读取 `/proc/meminfo` 的 `MemAvailable`，避免 Bionic 的
+`_SC_AVPHYS_PAGES` 只统计完全空闲页而误拒绝可安全回收 page cache 的情况。
+
+PLK110 / Adreno 840、同一 43-token 提示、生成 16 token、block=8、6 个 CPU worker
+的相邻配对结果如下。所有路径输出完全相同的 16 个 token，接受统计也完全相同：
+5 blocks、32 proposed、10 accepted（31.25%）、4 rollback、1 bonus。
+
+| 路径 | draft | target verify | decode |
+|---|---:|---:|---:|
+| CPU DFlash，轮 1 | 160.73 ms | 387.70 ms | 548.54 ms |
+| Vulkan DFlash，轮 1 | 155.12 ms | 484.37 ms | 639.64 ms |
+| CPU DFlash，轮 2 | 166.23 ms | 404.76 ms | 571.11 ms |
+| Vulkan DFlash，轮 2 | 185.71 ms | 486.25 ms | 672.11 ms |
+
+GPU 确实执行并且一次块提交已生效；开发过程中的朴素 whole-block shader 在同一工作量
+上约 579 ms，打包读取 + subgroup 归约的最好轮为 140 ms。但与已经高度优化的 ARM
+CPU drafter 配对后，GPU draft 目前只是同量级，且 GPU 权重流会影响随后 CPU target
+验证的频率/内存状态，端到端反而慢约 16%–18%。因此当前结论是：**GPU 后端功能与
+正确性成立，论文式端到端加速尚未成立**。下一步的高价值工作是让 target verify 也
+GPU-resident（并与 drafter 共用 device/lm_head），或提高 checkpoint 接受率以减少
+block=8 的 37 个 target 输入；继续优化单个逐算子 submit 不会解决结构性瓶颈。
+
+诊断时可用：
+
+```bash
+TINYQWEN_VULKAN_TRACE=1 ./tinyqwen ... --dflash-model draft.tqwen \
+  --backend vulkan --speculative-tokens 8
+```
+
+每块会输出 `ctx`、`block`、录制命令数、fence wall time 和 proposal ids。它会增加
+stderr I/O，正式 benchmark 不应开启。设备要求 Vulkan 1.2、FP16 shader、16-bit
+storage、compute clustered subgroup；不满足时初始化会 fail-fast，而不会静默声称
+正在使用 GPU。

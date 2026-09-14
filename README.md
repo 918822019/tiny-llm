@@ -36,6 +36,11 @@
     > 交叉点在 seq≈32（更短不值得走 GPU）。prefill 后把 K/V 写回 KvCache，
     > decode 仍走 CPU 且逐 token 一致。测速 `scripts/bench_metal_prefill.sh`，
     > 归因与证伪记录见 `docs/optimization_log.md`。
+> - **Android Vulkan FP16（`--backend vulkan`）**：普通模型提供逐算子 FP16
+    > matvec/matmul 正确性路径；DFlash 自动切换为 GPU 常驻的整块 drafter，把
+    > 3 层 DFlare、共享 lm_head、Markov 修正和 argmax 合并成每块一次提交。
+    > PLK110 / Adreno 840 已通过 208 项真机测试并与 CPU greedy 逐 token 一致；
+    > 当前目标模型验证仍走 CPU，因此这是可用的实验后端，尚不能宣称端到端加速。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
 
@@ -155,8 +160,9 @@ Qwen3 目标模型的指定层残差流、并行构造 mask block、应用低秩
   --speculative-tokens 2 --max-new-tokens 32
 ```
 
-当前支持 FP16、greedy、单链和 CPU；算法、导出、Android 真机结果与性能限制见
-`docs/dflash.md`。
+当前支持 FP16、greedy、单链，以及 CPU / Android Vulkan GPU-resident drafter；
+算法、导出、Android 真机结果与性能限制见 `docs/dflash.md`。Android 用法是在同一
+命令末尾加 `--backend vulkan`。
 
 ## 不需要真模型的验证
 
@@ -208,7 +214,7 @@ tinyqwen --model <model.tqwen> [options]
 |---------------------------|--------|-----------------------------------------------------------------------------|
 | `--model PATH`            | 必填     | .tqwen 权重文件                                                                 |
 | `--draft-model PATH`      | 无      | 启用精确 greedy 投机解码；草稿模型须与目标模型共用 tokenizer                              |
-| `--dflash-model PATH`     | 无      | 启用 DFlare + Markov 块草稿；当前为 Qwen3 稠密目标、FP16、greedy、CPU                    |
+| `--dflash-model PATH`     | 无      | 启用 DFlare + Markov 块草稿；当前为 Qwen3 稠密目标、FP16、greedy；Android 可用 Vulkan drafter |
 | `--speculative-tokens K`  | 4      | 每个 verify block 的草稿 token 数                                                  |
 | `--speculative-stats-out PATH` | 无 | 写接受率、拒绝/回退、目标调用数及 `draft_ms`/`target_verify_ms` 分项耗时 JSON                  |
 | `--draft-matvec-impl NAME` | 无 | 单独选择草稿模型 dtype 的 matvec kernel；目标/草稿同 dtype 时两边共享该选择                      |
@@ -225,7 +231,7 @@ tinyqwen --model <model.tqwen> [options]
 | `--config PATH`           | 无      | key=value 配置文件（见下；CLI 开关优先于它）                                               |
 | `--matvec-impl NAME`      | ref    | matvec kernel 实现：任意已注册名；f32/f16/i4 三套独立注册表，按模型 dtype 解析，未知值报错并列出可用          |
 | `--ops-impl NAME`         | ref    | 非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax + GDN 四算子）：`ref` / `neon` |
-| `--backend NAME`          | CPU    | 计算后端（IBackend 实现）：空 = CPU；`cuda` = 逐算子 CUDA 后端（需 CUDA 构建）                   |
+| `--backend NAME`          | CPU    | 计算后端：空 = CPU；`cuda` = 逐算子 CUDA；`vulkan` = Android FP16（DFlash 时自动用 GPU 常驻整块 drafter） |
 | `--engine NAME`           | 无      | engine：`cuda` = GPU-resident 整段 **decode**（需 CUDA 构建；仅 Qwen2.x + greedy）；`metal` = Apple GPU 整批 prefill，并可用于投机 continuation verify（仅 Apple；两者互斥） |
 | `--no-fuse-gate-up`       | 关      | 禁用 FFN gate/up 成对融合（A/B 用）                                                  |
 | `--no-fuse-qkv`           | 关      | 禁用 q/k/v 三路融合（A/B 用）                                                        |
