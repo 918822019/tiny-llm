@@ -105,6 +105,8 @@ adb shell "cd /data/local/tmp/tinyqwen && ./tinyqwen \
 配置：OnePlus PLK110 / Android 16，Qwen3-0.6B target FP16，DFlash FP16，43-token
 英文代码提示，生成 16 token，NEON matvec + ops，FP16 KV。
 
+### 5.1 初始串行 FP16 路径
+
 | 路径 | 块长 | 接受情况 | 主模型调用 | decode |
 |---|---:|---:|---:|---:|
 | 普通 greedy | — | — | 15 次单步 | 干净轮 412–422 ms |
@@ -116,11 +118,40 @@ block=8 时平均每个验证块产出 `16/5 = 3.2` token；但目前在这台�
 以同场较干净轮的最小值比较，block=2 约慢 20%–23%。设备后台负载会把普通解码
 放大到 1.2–1.3 秒，因此被污染轮次中 DFlash 看似更快；这不是可归因的加速结论。
 
-根因是 Android 的 FP16 `matmul` 尚未实现，目标块验证会回退为 N 次 FP16 matvec。
-因此块越长，目标实际读取权重次数越多；同时草稿侧每个位置的共享 lm_head 和 Markov
-投影也仍逐位置执行。下一步性能工作应优先实现 Android FP16 batched GEMM / batched
-lm_head，再重新测 block=2..8。当前版本证明的是算法链路、接受行为和 greedy 精确性，
-不能把论文服务器 GPU 的加速比直接外推到手机 CPU。
+当时根因是 Android 的 FP16 `matmul` 尚未实现，目标块验证会回退为 N 次 FP16
+matvec；草稿侧 block backbone 和共享 lm_head 也逐位置执行。
+
+### 5.2 FP16 小块 GEMM 后
+
+现已增加 FP16 weight-only `matmul` 分发、reference kernel 和 aarch64 NEON/常驻线程池
+kernel。NEON kernel 一次加载权重、同时计算最多四个 token 列，并保持与既有 matvec
+相同的四链累加顺序。目标 Transformer 验证、目标 verify lm_head、DFlash context/block
+投影和 DFlash 共享 lm_head 全部改走批量路径；Markov 位置之间有真实 token 依赖，仍按
+顺序执行。统计 JSON 新增 `draft_ms` 与 `target_verify_ms`，可以直接判断收益被哪一侧吃掉。
+
+同一英文代码提示、同一模型与生成设置的更新结果：
+
+| 生成长度 | 路径 | 块长 | 接受情况 | 主模型调用 | decode |
+|---:|---|---:|---:|---:|---:|
+| 16 | 普通 greedy | — | — | 15 次 | 较干净轮 296.5–306.0 ms |
+| 16 | DFlash | 2 | 6/8（75.0%） | 9 次、17 输入 | 290.7–292.6 ms |
+| 16 | DFlash | 8 | 10/32（31.2%） | 5 次、37 输入 | 最小 435.3 ms |
+| 64 | 普通 greedy（6 线程） | — | — | 63 次 | 1361.7 ms |
+| 64 | DFlash（6 线程） | 2 | 25/37（67.6%） | 38 次、75 输入 | 1629.8 ms |
+
+16-token、block=2 已从负收益转为约 2%–5% 的小幅正收益，但仍接近设备噪声边界；
+block=8 则从约 1040 ms 降到最小 435 ms，证明批量 kernel 确实生效，不过仍慢于普通
+greedy。更能摊销固定成本的 64-token 配对实验中，两条路径的全部 64 个 token 逐位
+一致：目标验证只用 1195.3 ms，比普通 decode 少约 166 ms，但 drafter 本身用了
+434.0 ms，最终总耗时慢约 19.7%。另一次较干净 DFlash 轮为 1509.5 ms，仍比同线程
+普通路径慢约 10.6%。因此不能把 16-token 的微弱领先宣称为稳定加速。
+
+瓶颈已经发生转移：不再是“目标验证没有批量化”，而是这份 0.6B
+DFlare + rank-128 Markov drafter 在 CPU 上的额外权重读取。尤其 Markov 链要求先得到
+位置 `k-1` 的 token 才能构造位置 `k` 的 bias，不能像 backbone/lm_head 那样一次批量
+完成。在当前 checkpoint 与手机 CPU 上，长序列仍没有复现论文 GPU 实验的端到端
+加速；下一步要么优化/裁剪 drafter 与 Markov 输出头，要么使用更适合并行块解码的
+加速器后端。
 
 另一个实测现象：中文“用一句话介绍自己”样本的 draft acceptance 为 0%，而英文
 问答/代码/数学样本为 19%–31%（block=8）。这说明单条 prompt 不能代表论文报告的

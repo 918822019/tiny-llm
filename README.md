@@ -210,7 +210,7 @@ tinyqwen --model <model.tqwen> [options]
 | `--draft-model PATH`      | 无      | 启用精确 greedy 投机解码；草稿模型须与目标模型共用 tokenizer                              |
 | `--dflash-model PATH`     | 无      | 启用 DFlare + Markov 块草稿；当前为 Qwen3 稠密目标、FP16、greedy、CPU                    |
 | `--speculative-tokens K`  | 4      | 每个 verify block 的草稿 token 数                                                  |
-| `--speculative-stats-out PATH` | 无 | 写接受率、拒绝/回退、目标调用数和耗时 JSON                                                |
+| `--speculative-stats-out PATH` | 无 | 写接受率、拒绝/回退、目标调用数及 `draft_ms`/`target_verify_ms` 分项耗时 JSON                  |
 | `--draft-matvec-impl NAME` | 无 | 单独选择草稿模型 dtype 的 matvec kernel；目标/草稿同 dtype 时两边共享该选择                      |
 | `--tokens CSV`            | 三选一    | 逗号分隔的 token ids                                                             |
 | `--tokens-json PATH`      | 三选一    | `tokenize_prompt.py` 输出的 JSON                                               |

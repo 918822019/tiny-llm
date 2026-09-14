@@ -100,6 +100,8 @@ add_library(tinyqwen_kernels OBJECT
         # SDOT v5：对称量化版（zero=8），无 zero 修正项与前缀和，省 per-group 标量。
         matvec/matvec_i4_sdot5.cpp
         matvec/matmul_ref.cpp
+        # FP16 weight-only GEMM：ref 正确性锚 + aarch64 NEON/MT 小块优化。
+        matvec/matmul_f16_ref.cpp
         matvec/matmul_i4_ref.cpp
         matvec/matmul_gptq_ref.cpp
         matvec/matmul_gptq_neon.cpp

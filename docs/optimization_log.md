@@ -4125,6 +4125,35 @@ done; done
 
 ---
 
+### DFlash Android FP16 小块 GEMM（2026-09-14）
+
+- **优化栈**：Qwen3-0.6B FP16 target + 3-layer DFlare/Markov FP16 drafter +
+  NEON matvec/ops + FP16 KV。
+- **是什么**：新增 FP16 weight-only matmul 分发、全平台 ref kernel，以及 aarch64
+  NEON + 常驻线程池实现；每次权重加载复用于最多 4 个 token，并保持旧 matvec 的
+  四链累加顺序。目标 block Transformer、verify lm_head、DFlash context/block
+  投影和共享 lm_head 全部切换到批量路径。Markov W2 因位置间 token 依赖保留串行。
+- **假设**：旧 Android `CPUBackend::matmul(kF16)` 实际是 N 次 matvec，投机块越大
+  反而重复读 N 遍权重；小 N GEMM 应把验证成本从“按 token 读权重”改为“按块读权重”。
+- **结果（PLK110 / Android 16）**：43-token 英文代码提示、生成 16 token：
+  block=8 从约 **1040 → 435 ms（2.39×）**；block=2 为 **290.7–292.6 ms**，
+  普通 greedy 较干净轮 **296.5–306.0 ms**，只有约 2%–5% 微弱领先。
+- **长序列判定**：生成 64 token、双方 6 线程的相邻配对：普通 greedy
+  **1361.7 ms**；block=2 DFlash **1629.8 ms（0.84×，慢 19.7%）**。
+  另一次 DFlash 较干净轮 1509.5 ms，仍慢 10.6%，所以短序列小幅领先不能当成
+  稳定加速。
+- **验证**：host build + 206 tests 0 failed；Android build + 206 tests 0 failed；
+  FP16 matmul 新增 ref-vs-iterated-matvec 与 NEON-vs-ref（含 MT 阈值、K 尾段、N=7）
+  对齐。手机上普通 greedy 与 DFlash 的 64 个 `generated_ids` 逐字节一致。
+- **瓶颈转移**：新增 `draft_ms` / `target_verify_ms`。64-token 配对中 target verify
+  **1195.3 ms**，相对普通路径省约 166 ms；draft **434.0 ms**，净多约 268 ms。
+  因此剩余问题已从“target 没有批量验证”转为“DFlare + rank-128 Markov drafter
+  对 CPU 太贵”。线程扫描 4/6/8 中 4 明显更慢，6 略优于 8，但不足以转正。
+- **教训**：接受率、目标调用次数和 block=8 内核加速都不能替代端到端长生成结果；
+  必须同时报告 `draft_ms`、`target_verify_ms` 与最终 decode。
+
+---
+
 <!-- 模板：复制下面这段，填好后追加。注意优化栈 = 上一配置 + 本次优化。 -->
 <!--
 ### <优化名>（<日期>）

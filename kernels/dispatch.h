@@ -245,6 +245,16 @@ namespace tinyqwen {
     bool set_matmul_impl_by_name(const char *name);               // 按名字选择
     void matmul_f32(const float *w, const float *x, float *y, int M, int K, int N);  // 通用入口
 
+    // f16 weight-only matmul：权重为 IEEE fp16，激活与输出保持 fp32。
+    // 与 f16 matvec 共用权重布局；X/Y 仍按 token 列主序。
+    using MatmulF16Fn = void (*)(const uint16_t *w, const float *x, float *y,
+                                 int M, int K, int N);
+    void register_matmul_f16_impl(const char *name, MatmulF16Fn fn);
+    bool set_matmul_f16_impl_by_name(const char *name);
+    const char *matmul_f16_impl_name();
+    void matmul_f16(const uint16_t *w, const float *x, float *y,
+                    int M, int K, int N);
+
     // INT4 matmul 签名
     using MatmulI4Fn = void (*)(const uint8_t *w, const float *x, float *y,
                                 int M, int K, int N, int group_size);
@@ -273,6 +283,10 @@ namespace tinyqwen {
 #define TINYQWEN_MATMUL_VARIANT(fn, name)                                              \
     [[maybe_unused]] static const bool tqwen_reg_mm_## fn =                             \
             (tinyqwen::register_matmul_impl(name, fn), true)
+
+#define TINYQWEN_MATMUL_F16_VARIANT(fn, name)                                         \
+    [[maybe_unused]] static const bool tqwen_reg_mm_f16_##fn =                         \
+            (tinyqwen::register_matmul_f16_impl(name, fn), true)
 
 #define TINYQWEN_MATMUL_I4_VARIANT(fn, name)                                           \
     [[maybe_unused]] static const bool tqwen_reg_mm_i4_## fn =                          \

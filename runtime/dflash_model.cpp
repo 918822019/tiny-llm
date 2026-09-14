@@ -133,6 +133,12 @@ void DFlashModel::mv(const uint16_t *w, const float *x, float *y,
                      x, y, rows, cols);
 }
 
+void DFlashModel::mm(const uint16_t *w, const float *x, float *y,
+                     int rows, int cols, int tokens) const {
+    backend_->matmul(WeightTensor{w, QuantType::kF16, rows, cols, 0},
+                     x, y, rows, cols, tokens);
+}
+
 void DFlashModel::norm(const float *x, const float *w, float *y, int n) const {
     backend_->rmsnorm(x, w, y, n, cfg_.rms_norm_eps);
 }
@@ -231,9 +237,13 @@ bool DFlashModel::propose(const float *target_hidden, int ctx_tokens, int anchor
     std::vector<float> nk(static_cast<size_t>(block_tokens) * KV);
     std::vector<float> nv(static_cast<size_t>(block_tokens) * KV);
     std::vector<float> attn(static_cast<size_t>(block_tokens) * Q);
-    std::vector<float> tmp(std::max(Q, I));
-    std::vector<float> gate(I), up(I), ffn(H);
-    std::vector<float> kctx(KV), vctx(KV), qdummy(Q, 0.0f);
+    std::vector<float> o_batch(static_cast<size_t>(block_tokens) * H);
+    std::vector<float> gate(static_cast<size_t>(block_tokens) * I);
+    std::vector<float> up(static_cast<size_t>(block_tokens) * I);
+    std::vector<float> ffn(static_cast<size_t>(block_tokens) * H);
+    std::vector<float> kctx(static_cast<size_t>(ctx_tokens) * KV);
+    std::vector<float> vctx(static_cast<size_t>(ctx_tokens) * KV);
+    std::vector<float> qdummy(Q, 0.0f);
 
     for (uint32_t li = 0; li < cfg_.n_layers; ++li) {
         const Layer &w = layers_[li];
@@ -249,26 +259,31 @@ bool DFlashModel::propose(const float *target_hidden, int ctx_tokens, int anchor
                 const float *src = target_hidden + (static_cast<size_t>(c) * K + k) * H;
                 for (int d = 0; d < H; ++d) dst[d] += alpha[k] * src[d];
             }
-            mv(w.k_proj_ctx, dst, kctx.data(), KV, H);
-            mv(w.v_proj_ctx, dst, vctx.data(), KV, H);
+        }
+        mm(w.k_proj_ctx, fused.data(), kctx.data(), KV, H, ctx_tokens);
+        mm(w.v_proj_ctx, fused.data(), vctx.data(), KV, H, ctx_tokens);
+        for (int c = 0; c < ctx_tokens; ++c) {
+            float *kc = kctx.data() + static_cast<size_t>(c) * KV;
+            float *vc = vctx.data() + static_cast<size_t>(c) * KV;
             for (int h = 0; h < NK; ++h)
-                norm(kctx.data() + h * HD, w.k_norm, kctx.data() + h * HD, HD);
+                norm(kc + h * HD, w.k_norm, kc + h * HD, HD);
             std::fill(qdummy.begin(), qdummy.end(), 0.0f);
-            rope(qdummy.data(), kctx.data(), seq_len_ + c);
+            rope(qdummy.data(), kc, seq_len_ + c);
             const size_t off = (static_cast<size_t>(li) * max_seq_len_ + seq_len_ + c) * KV;
             for (int d = 0; d < KV; ++d) {
-                k_cache_[off + d] = float_to_half(kctx[d]);
-                v_cache_[off + d] = float_to_half(vctx[d]);
+                k_cache_[off + d] = float_to_half(kc[d]);
+                v_cache_[off + d] = float_to_half(vc[d]);
             }
         }
 
         for (int t = 0; t < block_tokens; ++t) {
-            const float *x = hidden.data() + static_cast<size_t>(t) * H;
             float *z = normed.data() + static_cast<size_t>(t) * H;
-            norm(x, w.input_norm, z, H);
-            mv(w.q_proj, z, q.data() + static_cast<size_t>(t) * Q, Q, H);
-            mv(w.k_proj, z, nk.data() + static_cast<size_t>(t) * KV, KV, H);
-            mv(w.v_proj, z, nv.data() + static_cast<size_t>(t) * KV, KV, H);
+            norm(hidden.data() + static_cast<size_t>(t) * H, w.input_norm, z, H);
+        }
+        mm(w.q_proj, normed.data(), q.data(), Q, H, block_tokens);
+        mm(w.k_proj, normed.data(), nk.data(), KV, H, block_tokens);
+        mm(w.v_proj, normed.data(), nv.data(), KV, H, block_tokens);
+        for (int t = 0; t < block_tokens; ++t) {
             float *qt = q.data() + static_cast<size_t>(t) * Q;
             float *kt = nk.data() + static_cast<size_t>(t) * KV;
             for (int h = 0; h < NH; ++h) norm(qt + h * HD, w.q_norm, qt + h * HD, HD);
@@ -276,32 +291,43 @@ bool DFlashModel::propose(const float *target_hidden, int ctx_tokens, int anchor
             rope(qt, kt, start + t);
         }
         for (int t = 0; t < block_tokens; ++t) {
-            const size_t ho = static_cast<size_t>(t) * H;
             attention(q.data() + static_cast<size_t>(t) * Q, nk, nv,
                       static_cast<int>(li), start, block_tokens,
                       attn.data() + static_cast<size_t>(t) * Q);
-            mv(w.o_proj, attn.data() + static_cast<size_t>(t) * Q, tmp.data(), H, Q);
-            for (int d = 0; d < H; ++d) hidden[ho + d] += tmp[d];
-            norm(hidden.data() + ho, w.post_norm, normed.data() + ho, H);
-            mv(w.gate, normed.data() + ho, gate.data(), I, H);
-            mv(w.up, normed.data() + ho, up.data(), I, H);
-            backend_->swiglu(gate.data(), up.data(), I);
-            mv(w.down, gate.data(), ffn.data(), H, I);
-            for (int d = 0; d < H; ++d) hidden[ho + d] += ffn[d];
         }
+        mm(w.o_proj, attn.data(), o_batch.data(), H, Q, block_tokens);
+        for (int t = 0; t < block_tokens; ++t) {
+            const size_t ho = static_cast<size_t>(t) * H;
+            for (int d = 0; d < H; ++d) hidden[ho + d] += o_batch[ho + d];
+            norm(hidden.data() + ho, w.post_norm, normed.data() + ho, H);
+        }
+        mm(w.gate, normed.data(), gate.data(), I, H, block_tokens);
+        mm(w.up, normed.data(), up.data(), I, H, block_tokens);
+        for (int t = 0; t < block_tokens; ++t)
+            backend_->swiglu(gate.data() + static_cast<size_t>(t) * I,
+                             up.data() + static_cast<size_t>(t) * I, I);
+        mm(w.down, gate.data(), ffn.data(), H, I, block_tokens);
+        for (size_t d = 0; d < static_cast<size_t>(block_tokens) * H; ++d)
+            hidden[d] += ffn[d];
     }
     seq_len_ = start;
 
-    std::vector<float> final_h(H), logits(V), markov(markov_rank_), bias(V);
+    const int draft_positions = block_tokens - 1;
+    std::vector<float> final_h(static_cast<size_t>(draft_positions) * H);
+    std::vector<float> logits(static_cast<size_t>(draft_positions) * V);
+    std::vector<float> markov(markov_rank_), bias(V);
+    for (int t = 1; t < block_tokens; ++t)
+        norm(hidden.data() + static_cast<size_t>(t) * H, final_norm_,
+             final_h.data() + static_cast<size_t>(t - 1) * H, H);
+    target_->project_lm_head_raw_batch(final_h.data(), logits.data(), draft_positions);
     int prev = anchor;
     for (int t = 1; t < block_tokens; ++t) {
-        norm(hidden.data() + static_cast<size_t>(t) * H, final_norm_, final_h.data(), H);
-        target_->project_lm_head_raw(final_h.data(), logits.data());
         const uint16_t *row = markov_w1_ + static_cast<size_t>(prev) * markov_rank_;
         for (int r = 0; r < markov_rank_; ++r) markov[r] = half_to_float(row[r]);
         mv(markov_w2_, markov.data(), bias.data(), V, markov_rank_);
-        for (int v = 0; v < V; ++v) logits[v] += bias[v];
-        prev = backend_->argmax(logits.data(), V);
+        float *position_logits = logits.data() + static_cast<size_t>(t - 1) * V;
+        for (int v = 0; v < V; ++v) position_logits[v] += bias[v];
+        prev = backend_->argmax(position_logits, V);
         proposals->push_back(prev);
     }
     return true;

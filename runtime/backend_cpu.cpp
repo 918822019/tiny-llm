@@ -99,12 +99,7 @@ namespace tinyqwen {
         } else if (w.quant_type == QuantType::kI4) {
             matmul_i4(static_cast<const uint8_t*>(w.data), x, y, M, K, N, w.group_size);
         } else if (w.quant_type == QuantType::kF16) {
-            // f16 matmul 暂未实现，回退到 N 次 matvec（效率较低）
-            for (int c = 0; c < N; ++c) {
-                matvec_f16(static_cast<const uint16_t*>(w.data),
-                          x + static_cast<size_t>(c) * K,
-                          y + static_cast<size_t>(c) * M, M, K);
-            }
+            matmul_f16(static_cast<const uint16_t*>(w.data), x, y, M, K, N);
         } else {
             matmul_f32(static_cast<const float*>(w.data), x, y, M, K, N);
         }

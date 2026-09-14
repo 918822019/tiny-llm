@@ -48,6 +48,8 @@ private:
 
     DFlashModel() = default;
     void mv(const uint16_t *w, const float *x, float *y, int rows, int cols) const;
+    void mm(const uint16_t *w, const float *x, float *y,
+            int rows, int cols, int tokens) const;
     void norm(const float *x, const float *w, float *y, int n) const;
     void rope(float *q, float *k, int pos) const;
     void attention(const float *q, const std::vector<float> &noise_k,

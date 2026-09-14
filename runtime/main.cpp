@@ -617,8 +617,10 @@ int main(int argc, char **argv) {
                          impl_name.c_str(), tinyqwen::available_matvec_f16_impls());
             return 2;
         }
-        std::fprintf(stderr, "[init] matvec impl: %s (f16 weights)\n",
-                     tinyqwen::matvec_f16_impl_name());
+        if (!tinyqwen::set_matmul_f16_impl_by_name(impl_name.c_str()))
+            tinyqwen::set_matmul_f16_impl_by_name("ref");
+        std::fprintf(stderr, "[init] matvec impl: %s; matmul: %s (f16 weights)\n",
+                     tinyqwen::matvec_f16_impl_name(), tinyqwen::matmul_f16_impl_name());
     } else if (is_gptq) {
         // GPTQ 有独立注册表（AutoGPTQ 列主序，与 i4 的 HQQ interleaved 不兼容）。
         // 没有这个分支时 GPTQ 模型会掉进下面的 else，选到 f32 注册表——
@@ -641,6 +643,8 @@ int main(int argc, char **argv) {
         if (!tinyqwen::set_matvec_f16_impl_by_name("neon_mt_kv_nt")) {
             tinyqwen::set_matvec_f16_impl_by_name("ref");
         }
+        if (!tinyqwen::set_matmul_f16_impl_by_name("neon_mt_kv_nt"))
+            tinyqwen::set_matmul_f16_impl_by_name("ref");
         // 批量 GEMM（MoE 批量 prefill）用 NEON 版；标量 ref 会让 prefill
         // 反而比逐 token 慢 3.5×（实测 expert_ffn 25.14s vs 4.50s）。
         tinyqwen::set_matmul_gptq_impl_by_name("neon");
@@ -1165,12 +1169,13 @@ int main(int argc, char **argv) {
                      "[speculative] generated=%zu blocks=%d proposed=%d accepted=%d "
                      "acceptance=%.1f%% corrections=%d bonus=%d rollbacks=%d\n"
                      "[speculative] target_calls=%d target_inputs=%d draft_calls=%d "
-                     "prefill=%.2f ms decode=%.2f ms\n",
+                     "prefill=%.2f ms decode=%.2f ms draft=%.2f ms verify=%.2f ms\n",
                      spec.generated_ids.size(), s.blocks, s.draft_proposed,
                      s.draft_accepted, s.acceptance_rate() * 100.0,
                      s.corrections, s.bonus_tokens, s.rollbacks,
                      s.target_verify_calls, s.target_input_tokens,
-                     s.draft_forward_calls, s.prefill_ms, s.decode_ms);
+                     s.draft_forward_calls, s.prefill_ms, s.decode_ms,
+                     s.draft_ms, s.target_verify_ms);
 
         if (!args.speculative_stats_out.empty()) {
             FILE *sf = std::fopen(args.speculative_stats_out.c_str(), "w");
@@ -1197,6 +1202,8 @@ int main(int argc, char **argv) {
                          "  \"draft_forward_calls\": %d,\n"
                          "  \"baseline_tail_steps\": %d,\n"
                          "  \"prefill_ms\": %.6f,\n"
+                         "  \"draft_ms\": %.6f,\n"
+                         "  \"target_verify_ms\": %.6f,\n"
                          "  \"decode_ms\": %.6f\n"
                          "}\n",
                          spec.generated_ids.size(), spec.hit_eos ? "true" : "false",
@@ -1204,7 +1211,8 @@ int main(int argc, char **argv) {
                          s.draft_accepted, s.acceptance_rate(), s.corrections,
                          s.bonus_tokens, s.rollbacks, s.target_verify_calls,
                          s.target_input_tokens, s.draft_forward_calls,
-                         s.baseline_tail_steps, s.prefill_ms, s.decode_ms);
+                         s.baseline_tail_steps, s.prefill_ms, s.draft_ms,
+                         s.target_verify_ms, s.decode_ms);
             std::fclose(sf);
             std::fprintf(stderr, "[speculative-stats] %s\n",
                          args.speculative_stats_out.c_str());

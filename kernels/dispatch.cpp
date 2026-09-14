@@ -611,6 +611,15 @@ namespace tinyqwen {
         }
         MatmulFn g_mm_current = nullptr;  // 当前 matmul 选择
 
+        // f16 weight-only matmul 注册表。与 f16 matvec 独立选择，避免没有
+        // 对应 GEMM 变体时误把 fp16 权重交给 f32 kernel。
+        std::unordered_map<std::string, MatmulF16Fn> &mm_f16_registry() {
+            static std::unordered_map<std::string, MatmulF16Fn> r;
+            return r;
+        }
+        MatmulF16Fn g_mm_f16_current = nullptr;
+        const char *g_mm_f16_name = "ref";
+
         // INT4 matmul 注册表
         std::unordered_map<std::string, MatmulI4Fn> &mm_i4_registry() {
             static std::unordered_map<std::string, MatmulI4Fn> r;
@@ -645,6 +654,27 @@ namespace tinyqwen {
     // matmul f32 通用入口
     void matmul_f32(const float *w, const float *x, float *y, int M, int K, int N) {
         g_mm_current(w, x, y, M, K, N);  // 直接调用（必须有至少一个注册）
+    }
+
+    void register_matmul_f16_impl(const char *name, MatmulF16Fn fn) {
+        mm_f16_registry()[name] = fn;
+        if (!g_mm_f16_current) g_mm_f16_current = fn;
+    }
+
+    bool set_matmul_f16_impl_by_name(const char *name) {
+        auto &r = mm_f16_registry();
+        auto it = r.find(name);
+        if (it == r.end()) return false;
+        g_mm_f16_current = it->second;
+        g_mm_f16_name = it->first.c_str();
+        return true;
+    }
+
+    const char *matmul_f16_impl_name() { return g_mm_f16_name; }
+
+    void matmul_f16(const uint16_t *w, const float *x, float *y,
+                    int M, int K, int N) {
+        g_mm_f16_current(w, x, y, M, K, N);
     }
 
     // 注册 INT4 matmul 实现

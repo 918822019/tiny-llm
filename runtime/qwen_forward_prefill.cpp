@@ -387,24 +387,21 @@ namespace tinyqwen {
         if (all_next) {
             ScopedTimer t(prof, "verify_all_positions");
             all_next->reserve(n);
+            std::vector<float> verify_normed(static_cast<size_t>(n) * hidden);
+            std::vector<float> verify_logits(static_cast<size_t>(n) * vocab);
             for (int i = 0; i < n; ++i) {
                 const float *h = hid_batch.data() + static_cast<size_t>(i) * hidden;
-                backend_->rmsnorm(h, final_norm_, normed_.data(), hidden,
+                backend_->rmsnorm(h, final_norm_,
+                                  verify_normed.data() + static_cast<size_t>(i) * hidden, hidden,
                                   cfg_.rms_norm_eps);
-                if (lm_head_is_f32_) {
-                    matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
-                               logits_.data(), vocab, hidden);
-                } else if (lm_head_is_f16_) {
-                    matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
-                               logits_.data(), vocab, hidden);
-                } else if (lm_head_is_i4_) {
-                    matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
-                              logits_.data(), vocab, hidden, group_size_);
-                } else {
-                    mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
-                }
-                all_next->push_back(argmax(logits_.data(), vocab));
             }
+            project_lm_head_raw_batch(verify_normed.data(), verify_logits.data(), n);
+            for (int i = 0; i < n; ++i)
+                all_next->push_back(argmax(verify_logits.data() + static_cast<size_t>(i) * vocab,
+                                           vocab));
+            std::memcpy(logits_.data(),
+                        verify_logits.data() + static_cast<size_t>(n - 1) * vocab,
+                        static_cast<size_t>(vocab) * sizeof(float));
             if (topk) top_k_logits(logits_.data(), vocab, topk_k, topk);
             kv_.advance(n);
             token_count_ += n;

@@ -41,6 +41,7 @@
 
 #include <arm_neon.h> // ARM NEON intrinsic 声明（编译器自带）
 
+#include <algorithm>  // std::min
 #include <atomic>     // std::atomic（线程同步用的原子计数器）
 #include <cstddef>    // size_t、uintptr_t
 #include <cstdint>    // uint16_t、uint64_t
@@ -217,6 +218,79 @@ namespace tinyqwen {
       return dot_row_f16_nt(row, x, n);
     }
 
+    // Small-N GEMM row kernel. Up to four token columns share each weight load. The
+    // four-chain K traversal deliberately matches dot_row_f16 exactly so the
+    // optimized batch path preserves the established greedy-token baseline.
+    // X/Y are column-major by token, while W remains row-major.
+    inline void matmul_row_f16(const float16_t *row, const float *x, float *y,
+                               int output_row, int M, int K, int N) {
+      for (int c0 = 0; c0 < N; c0 += 4) {
+        const int nc = std::min(4, N - c0);
+        float32x4_t acc[4][4];
+        for (int j = 0; j < nc; ++j)
+          for (int a = 0; a < 4; ++a) acc[j][a] = vdupq_n_f32(0.0f);
+        int k = 0;
+        const int k32 = K & ~31;
+        for (; k < k32; k += 32) {
+          const float16x8_t hw0 = vld1q_f16(row + k);
+          const float16x8_t hw1 = vld1q_f16(row + k + 8);
+          const float16x8_t hw2 = vld1q_f16(row + k + 16);
+          const float16x8_t hw3 = vld1q_f16(row + k + 24);
+          for (int j = 0; j < nc; ++j) {
+            const float *xc = x + static_cast<size_t>(c0 + j) * K + k;
+            acc[j][0] = vfmaq_f32(acc[j][0], vcvt_f32_f16(vget_low_f16(hw0)),
+                                  vld1q_f32(xc));
+            acc[j][0] = vfmaq_f32(acc[j][0], vcvt_high_f32_f16(hw0),
+                                  vld1q_f32(xc + 4));
+            acc[j][1] = vfmaq_f32(acc[j][1], vcvt_f32_f16(vget_low_f16(hw1)),
+                                  vld1q_f32(xc + 8));
+            acc[j][1] = vfmaq_f32(acc[j][1], vcvt_high_f32_f16(hw1),
+                                  vld1q_f32(xc + 12));
+            acc[j][2] = vfmaq_f32(acc[j][2], vcvt_f32_f16(vget_low_f16(hw2)),
+                                  vld1q_f32(xc + 16));
+            acc[j][2] = vfmaq_f32(acc[j][2], vcvt_high_f32_f16(hw2),
+                                  vld1q_f32(xc + 20));
+            acc[j][3] = vfmaq_f32(acc[j][3], vcvt_f32_f16(vget_low_f16(hw3)),
+                                  vld1q_f32(xc + 24));
+            acc[j][3] = vfmaq_f32(acc[j][3], vcvt_high_f32_f16(hw3),
+                                  vld1q_f32(xc + 28));
+          }
+        }
+        const int k8 = K & ~7;
+        for (; k < k8; k += 8) {
+          const float16x8_t hw = vld1q_f16(row + k);
+          for (int j = 0; j < nc; ++j) {
+            const float *xc = x + static_cast<size_t>(c0 + j) * K + k;
+            acc[j][0] = vfmaq_f32(acc[j][0], vcvt_f32_f16(vget_low_f16(hw)),
+                                  vld1q_f32(xc));
+            acc[j][0] = vfmaq_f32(acc[j][0], vcvt_high_f32_f16(hw),
+                                  vld1q_f32(xc + 4));
+          }
+        }
+        const int k4 = K & ~3;
+        for (; k < k4; k += 4) {
+          const float32x4_t wf = vcvt_f32_f16(vld1_f16(row + k));
+          for (int j = 0; j < nc; ++j) {
+            const float *xc = x + static_cast<size_t>(c0 + j) * K + k;
+            acc[j][0] = vfmaq_f32(acc[j][0], wf, vld1q_f32(xc));
+          }
+        }
+        float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int j = 0; j < nc; ++j) {
+          const float32x4_t sum01 = vaddq_f32(acc[j][0], acc[j][1]);
+          const float32x4_t sum23 = vaddq_f32(acc[j][2], acc[j][3]);
+          sums[j] = vaddvq_f32(vaddq_f32(sum01, sum23));
+        }
+        for (; k < K; ++k) {
+          const float wf = static_cast<float>(row[k]);
+          for (int j = 0; j < nc; ++j)
+            sums[j] += wf * x[static_cast<size_t>(c0 + j) * K + k];
+        }
+        for (int j = 0; j < nc; ++j)
+          y[static_cast<size_t>(c0 + j) * M + output_row] = sums[j];
+      }
+    }
+
     // ========================================================================
     // spin_until() — 自旋等待原子计数器到达目标值
     // ========================================================================
@@ -295,7 +369,8 @@ namespace tinyqwen {
       int in_dim = 0;                 // 输入维度（列数）
       int qkv_q_dim = 0;              // qkv 模式：Q 矩阵的行数
       int qkv_kv_dim = 0;             // qkv 模式：K/V 矩阵各自的行数
-      enum Mode { kSingle, kPair, kQkv } mode = kSingle; // 当前任务模式
+      int matmul_n = 1;                 // kMatmul 模式的输入列数
+      enum Mode { kSingle, kPair, kQkv, kMatmul } mode = kSingle; // 当前任务模式
       bool pair = false;              // 是否是成对模式（兼容旧逻辑）
 
       // ---- 同步原语 ----
@@ -355,6 +430,11 @@ namespace tinyqwen {
         const int end = begin + base + (idx < rem ? 1 : 0);
         // 遍历分配给本线程的每一行
         for (int r = begin; r < end; ++r) {
+          if (mode == kMatmul) {
+            const float16_t *row = w + static_cast<size_t>(r) * in_dim;
+            matmul_row_f16(row, x, y, r, out_dim, in_dim, matmul_n);
+            continue;
+          }
           const float16_t *wm; // 当前行所属的权重矩阵
           float *ym;           // 当前行对应的输出向量
           int o;               // 行在所属矩阵内的偏移
@@ -434,6 +514,19 @@ namespace tinyqwen {
         in_dim = in_dim_;
         pair = false;
         mode = kQkv;   // 标记为 QKV 模式
+        publish_and_run();
+      }
+
+      void run_matmul(const float16_t *w_, const float *x_, float *y_,
+                      int M, int K, int N) {
+        w = w_;
+        x = x_;
+        y = y_;
+        out_dim = M;
+        in_dim = K;
+        matmul_n = N;
+        pair = false;
+        mode = kMatmul;
         publish_and_run();
       }
     };
@@ -540,11 +633,32 @@ namespace tinyqwen {
               x, yq, yk, yv, q_dim, kv_dim, in_dim);
   }
 
+  // Speculative decoding uses narrow matrices (typically 2..8 token columns).
+  // Keep N=1 on the mature matvec path; for N>1, split output rows across the
+  // same resident pool and reuse each fp16 weight load across four tokens while
+  // preserving the matvec accumulation order.
+  void matmul_f16_neon_mt_kv_nt(const uint16_t *w, const float *x, float *y,
+                                int M, int K, int N) {
+    if (N <= 1) {
+      matvec_f16_neon_mt_kv_nt(w, x, y, M, K);
+      return;
+    }
+    RowPool &p = pool();
+    const auto *wh = reinterpret_cast<const float16_t *>(w);
+    if (static_cast<size_t>(M) * K * N < kMinParallelElems || p.workers.empty()) {
+      for (int row = 0; row < M; ++row)
+        matmul_row_f16(wh + static_cast<size_t>(row) * K, x, y, row, M, K, N);
+      return;
+    }
+    p.run_matmul(wh, x, y, M, K, N);
+  }
+
   // 自注册进 f16 注册表：与 f32 阶梯顶层同名 "neon_mt_kv_nt"，
   // 按模型 dtype 解析（f16 模型选到本实现）。仅 aarch64 构建存在。
   TINYQWEN_MATVEC_F16_VARIANT(matvec_f16_neon_mt_kv_nt, "neon_mt_kv_nt");
   TINYQWEN_MATVEC_F16_PAIR_VARIANT(matvec_pair_f16_neon_mt_kv_nt, "neon_mt_kv_nt");
   TINYQWEN_MATVEC_QKV_F16_VARIANT(matvec_qkv_f16_neon_mt_kv_nt, "neon_mt_kv_nt");
+  TINYQWEN_MATMUL_F16_VARIANT(matmul_f16_neon_mt_kv_nt, "neon_mt_kv_nt");
 } // namespace tinyqwen
 
 #endif // defined(__aarch64__) || defined(_M_ARM64)

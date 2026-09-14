@@ -325,6 +325,13 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     **AGENTS.md 坑 #1 记录的 i4 配方（8.1 ms/tok）当前对 `model_qwen35_i4.tqwen`
     不可用**。199 单测 + `verify.sh` 全过（无真模型时第 3 步跳过）—— 测试未覆盖
     真模型稠密 i4 decode 路径，是覆盖缺口。
+36. **投机统计变好不等于端到端变快，必须把 target 与 draft 分项计时。**
+    PLK110 上 Qwen3-0.6B FP16 + DFlare/Markov、生成 64 token：目标调用
+    63→38，target verify 1362→1195 ms，确实省 166 ms；但 drafter 另花 434 ms，
+    总 decode 反而 1362→1630 ms。FP16 小块 GEMM 已把 block=8 的 16-token 路径
+    从约 1040 降到 435 ms，证明并行验证有效，但 Markov 链仍需逐位置读 W2。
+    看 `--speculative-stats-out` 的 `draft_ms` / `target_verify_ms`，不能用接受率或
+    target_calls 单独推断 speedup；短序列 2%–5% 的领先也要按噪声边界处理。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

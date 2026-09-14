@@ -65,7 +65,7 @@ namespace tinyqwen {
 
         // =====================================================================
         // GEMM: 矩阵-矩阵乘法（prefill 批量处理）
-        // 转发到 dispatch::matmul_f32 / matmul_i4
+        // 转发到 dispatch::matmul_f32 / matmul_f16 / matmul_i4
         // =====================================================================
         void matmul(const WeightTensor& w, const float* x, float* y,
                    int M, int K, int N) override;

@@ -28,6 +28,8 @@ namespace tinyqwen {
         int baseline_tail_steps = 0;
         double prefill_ms = 0.0;
         double decode_ms = 0.0;
+        double draft_ms = 0.0;
+        double target_verify_ms = 0.0;
 
         double acceptance_rate() const {
             return draft_proposed > 0

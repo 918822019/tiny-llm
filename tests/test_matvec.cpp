@@ -1304,3 +1304,57 @@ TEST (matmul_ref_matches_iterated_matvec) {
         EXPECT_NEAR(y_mm[i], y_mv[i], 1e-5);
     }
 }
+
+TEST (matmul_f16_ref_matches_iterated_matvec) {
+    const int M = 9, K = 19, N = 5;
+    std::vector<uint16_t> w(M * K);
+    std::vector<float> x(K * N), y_mm(M * N), y_mv(M * N);
+    uint32_t seed = 991;
+    auto rng = [&]() -> float {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(static_cast<int>(seed % 200) - 100) * 0.01f;
+    };
+    for (auto &v : w) v = float_to_half(rng());
+    for (auto &v : x) v = rng();
+
+    EXPECT_TRUE(set_matmul_f16_impl_by_name("ref"));
+    matmul_f16(w.data(), x.data(), y_mm.data(), M, K, N);
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("ref"));
+    for (int c = 0; c < N; ++c)
+        matvec_f16(w.data(), x.data() + c * K, y_mv.data() + c * M, M, K);
+
+    for (int i = 0; i < M * N; ++i) EXPECT_NEAR(y_mm[i], y_mv[i], 1e-6);
+}
+
+TEST (matmul_f16_neon_matches_ref) {
+    if (!set_matmul_f16_impl_by_name("neon_mt_kv_nt")) return;
+    // Cross both the vector tail and MT threshold. N=7 matches the common
+    // DFlash block width (anchor plus six/seven proposed positions).
+    const int M = 521, K = 513, N = 7;
+    std::vector<uint16_t> w(static_cast<size_t>(M) * K);
+    std::vector<float> x(static_cast<size_t>(K) * N);
+    std::vector<float> y_neon(static_cast<size_t>(M) * N);
+    std::vector<float> y_matvec(static_cast<size_t>(M) * N);
+    std::vector<float> y_ref(static_cast<size_t>(M) * N);
+    uint32_t seed = 20260914;
+    auto rng = [&]() -> float {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(static_cast<int>(seed % 200) - 100) * 0.005f;
+    };
+    for (auto &v : w) v = float_to_half(rng());
+    for (auto &v : x) v = rng();
+
+    matmul_f16(w.data(), x.data(), y_neon.data(), M, K, N);
+    EXPECT_TRUE(set_matvec_f16_impl_by_name("neon_mt_kv_nt"));
+    for (int c = 0; c < N; ++c)
+        matvec_f16(w.data(), x.data() + static_cast<size_t>(c) * K,
+                   y_matvec.data() + static_cast<size_t>(c) * M, M, K);
+    EXPECT_EQ(std::memcmp(y_neon.data(), y_matvec.data(),
+                          y_neon.size() * sizeof(float)), 0);
+    EXPECT_TRUE(set_matmul_f16_impl_by_name("ref"));
+    matmul_f16(w.data(), x.data(), y_ref.data(), M, K, N);
+    for (int i = 0; i < M * N; ++i) {
+        const float tol = std::abs(y_ref[i]) * 2e-4f + 2e-4f;
+        EXPECT_NEAR(y_neon[i], y_ref[i], tol);
+    }
+}

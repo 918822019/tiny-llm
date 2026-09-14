@@ -166,9 +166,13 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
         // draft+bonus 两个候选。两边都消费刚输出的 pending，保持状态对齐。
         if (remaining == 1) {
             std::vector<int> after;
+            const Clock::time_point target_begin = Clock::now();
             if (!target_forward(target, target_metal, &pending, 1, &after, err))
                 return false;
+            result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
+            const Clock::time_point draft_begin = Clock::now();
             draft.forward_token(pending);
+            result->stats.draft_ms += elapsed_ms(draft_begin, Clock::now());
             ++result->stats.target_verify_calls;
             ++result->stats.target_input_tokens;
             ++result->stats.draft_forward_calls;
@@ -184,6 +188,7 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
         // 消费一个提案得到下一个。末个提案暂不消费，等验证结果决定保留与否。
         std::vector<int> proposals;
         proposals.reserve(want);
+        const Clock::time_point draft_begin = Clock::now();
         int proposal = draft.forward_token(pending);
         ++result->stats.draft_forward_calls;
         for (int i = 0; i < want; ++i) {
@@ -194,6 +199,7 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
                 ++result->stats.draft_forward_calls;
             }
         }
+        result->stats.draft_ms += elapsed_ms(draft_begin, Clock::now());
 
         std::vector<int> verified_inputs;
         verified_inputs.reserve(proposals.size() + 1);
@@ -202,11 +208,13 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
 
         const QwenModel::StateCheckpoint target_checkpoint = target.checkpoint();
         std::vector<int> target_after;
+        const Clock::time_point target_begin = Clock::now();
         if (!target_forward(target, target_metal, verified_inputs.data(),
                             static_cast<int>(verified_inputs.size()),
                             &target_after, err)) {
             return false;
         }
+        result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
         ++result->stats.blocks;
         ++result->stats.target_verify_calls;
         result->stats.target_input_tokens += static_cast<int>(verified_inputs.size());
@@ -220,14 +228,19 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
         if (!decision.all_accepted) {
             const bool target_replays = target.has_recurrent_state();
             const bool draft_replays = draft.has_recurrent_state();
+            const Clock::time_point target_restore_begin = Clock::now();
             if (!restore_prefix(target, target_metal, target_checkpoint,
                                 verified_inputs, keep, err)) {
                 return false;
             }
+            result->stats.target_verify_ms +=
+                elapsed_ms(target_restore_begin, Clock::now());
+            const Clock::time_point draft_restore_begin = Clock::now();
             if (!restore_prefix(draft, nullptr, draft_checkpoint,
                                 verified_inputs, keep, err)) {
                 return false;
             }
+            result->stats.draft_ms += elapsed_ms(draft_restore_begin, Clock::now());
             if (target_replays) {
                 ++result->stats.target_verify_calls;
                 result->stats.target_input_tokens += keep;
@@ -237,7 +250,9 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
             ++result->stats.rollbacks;
         } else {
             // 目标验证后已消费全部输入；草稿还差最后一个提案没进 cache。
+            const Clock::time_point draft_bonus_begin = Clock::now();
             draft.forward_token(proposals.back());
+            result->stats.draft_ms += elapsed_ms(draft_bonus_begin, Clock::now());
             ++result->stats.draft_forward_calls;
             ++result->stats.bonus_tokens;
         }
@@ -304,10 +319,12 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
         if (remaining <= 0) break;
         if (remaining == 1) {
             std::vector<int> after;
+            const Clock::time_point target_begin = Clock::now();
             if (target.forward_verify(&pending, 1, &after) < 0 || after.size() != 1) {
                 if (err) *err = "DFlash target tail step failed";
                 return false;
             }
+            result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
             pending = after[0];
             ++result->stats.target_verify_calls;
             ++result->stats.target_input_tokens;
@@ -317,8 +334,10 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
 
         const int verify_size = std::min(block, remaining);
         std::vector<int> proposals;
+        const Clock::time_point draft_begin = Clock::now();
         if (!draft.propose(target_hidden.data(), ctx_tokens, pending, verify_size,
                            &proposals, err)) return false;
+        result->stats.draft_ms += elapsed_ms(draft_begin, Clock::now());
         ++result->stats.draft_forward_calls;
         result->stats.draft_proposed += static_cast<int>(proposals.size());
 
@@ -329,12 +348,14 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
         const QwenModel::StateCheckpoint checkpoint = target.checkpoint();
         std::vector<int> target_after;
         std::vector<float> verified_hidden;
+        const Clock::time_point target_begin = Clock::now();
         if (target.forward_verify_capture(inputs.data(), static_cast<int>(inputs.size()),
                                           draft.target_layer_ids(), &target_after,
                                           &verified_hidden) < 0) {
             if (err) *err = "DFlash target verification/capture failed";
             return false;
         }
+        result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
         ++result->stats.blocks;
         ++result->stats.target_verify_calls;
         result->stats.target_input_tokens += static_cast<int>(inputs.size());

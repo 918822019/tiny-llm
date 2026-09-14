@@ -75,6 +75,22 @@ namespace tinyqwen {
             const_cast<QwenModel *>(this)->mv(lm_head_, hidden, logits, vocab, width);
         }
     }
+
+    void QwenModel::project_lm_head_raw_batch(const float *hidden, float *logits, int n) const {
+        if (n <= 0) return;
+        if (n == 1) {
+            project_lm_head_raw(hidden, logits);
+            return;
+        }
+        const int vocab = static_cast<int>(cfg_.vocab_size);
+        const int width = static_cast<int>(cfg_.hidden_size);
+        QuantType qt = QuantType::kF32;
+        if (lm_head_is_f16_ || lm_head_dtype_ == Dtype::kF16) qt = QuantType::kF16;
+        else if (lm_head_is_i4_ || lm_head_dtype_ == Dtype::kI4) qt = QuantType::kI4;
+        else if (lm_head_dtype_ == Dtype::kGPTQ4) qt = QuantType::kGPTQ;
+        backend_->matmul(WeightTensor{lm_head_, qt, vocab, width, group_size_},
+                         hidden, logits, vocab, width, n);
+    }
     namespace {
         // =====================================================================
         // quant_type_of() — Dtype -> QuantType 的安全映射
