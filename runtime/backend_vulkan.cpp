@@ -279,6 +279,30 @@ namespace tinyqwen {
       CPUBackend::matmul(w, x, y, rows, cols, tokens);
     }
 
+    bool prepare_weight(const WeightTensor &w, std::string *err) override {
+      if (w.quant_type != QuantType::kF16 || disabled_)
+        return true;
+      if (!w.data || w.rows <= 0 || w.cols <= 0) {
+        if (err)
+          *err = "invalid Vulkan weight preparation request";
+        return false;
+      }
+      const uint64_t elements = static_cast<uint64_t>(w.rows) * w.cols;
+      if (elements > std::numeric_limits<VkDeviceSize>::max() / sizeof(uint16_t)) {
+        if (err)
+          *err = "Vulkan prepared weight size overflow";
+        return false;
+      }
+      const VkDeviceSize bytes = elements * sizeof(uint16_t);
+      if (bytes > properties_.limits.maxStorageBufferRange) {
+        if (err)
+          *err = "Vulkan prepared weight exceeds maxStorageBufferRange";
+        return false;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      return weight_buffer(static_cast<const uint16_t *>(w.data), bytes, err) != nullptr;
+    }
+
   private:
     bool create_pipeline(std::string *err) {
       VkDescriptorSetLayoutBinding bindings[3]{};

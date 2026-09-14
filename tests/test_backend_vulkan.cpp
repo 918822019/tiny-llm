@@ -58,6 +58,8 @@ TEST(vulkan_backend_f16_matvec_matches_cpu) {
   auto input = make_inputs(cols, 1);
   std::vector<float> got(rows), reference(rows);
   const WeightTensor tensor{weights.data(), QuantType::kF16, rows, cols, 0};
+  EXPECT_TRUE(vulkan->prepare_weight(tensor, &error));
+  EXPECT_TRUE(error.empty());
   vulkan->matvec(tensor, input.data(), got.data(), rows, cols);
   cpu->matvec(tensor, input.data(), reference.data(), rows, cols);
   expect_close(got, reference, 2e-4f);

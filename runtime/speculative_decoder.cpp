@@ -509,6 +509,15 @@ bool eagle3_speculative_generate(QwenModel &target, Eagle3Model &draft,
         return false;
     }
 
+    // Batched verification routes the tied lm_head through backend matmul.
+    // Materialize persistent GPU storage before decode timing; otherwise its
+    // first-use allocation/copy is charged to the first speculative block and
+    // makes short-run throughput depend on allocator/page-cache noise.
+    if (config.batch_target_verify && !target.prepare_lm_head(err)) {
+        if (err && err->empty()) *err = "EAGLE3 target lm_head preparation failed";
+        return false;
+    }
+
     // EAGLE3 was trained on next-token-shifted embeddings: H(prompt[i]) pairs
     // with embed(prompt[i+1]), and the last prompt state pairs with the target's
     // already selected pending token. This also seeds the first proposal.

@@ -353,6 +353,15 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     一致才是实现判据。PLK110 英文 64-token width=2 接受率 53.7%、target call 63→41，
     但 draft ~201 ms 大于 verify 节省 ~97 ms，端到端仍慢 3.6%–5.2%；width=4 更慢。
     模型卡的 GPU width=4 不能直接当手机 CPU 最优参数，完整口径见 `docs/eagle3.md`。
+39. **跨进程 GPU warmup 不会保留权重，lazy upload 不能混进 decode 归因。**
+    EAGLE3 batched 的 `N>1` tied lm_head 走 Vulkan matmul，而 greedy/sequential 的
+    `N=1` 路径走 CPU；旧实现到首个 speculative block 才创建/复制约 296.8 MiB GPU
+    buffer。单独跑一个 warmup 进程只能暖文件 cache/驱动，进程退出后 device buffer
+    已销毁。现在用 `IBackend::prepare_weight` 在 target prefill 后准备 lm_head：成本移出
+    decode 但仍计入请求 prefill。性能对照还必须让主要两路径相邻并交替先后顺序；PLK110
+    七轮 pair 得到 decode **1.239×**（每轮 1.237–1.246×）、prefill+decode **1.150×**，
+    旧四路径 1.406× 受 lazy upload/热状态/顺序混杂，只能保留为历史值。复现用
+    `EAGLE3_BENCH_MODE=pair scripts/bench_eagle3_ablation_android.sh ... 7 64 2`。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

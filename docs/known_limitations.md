@@ -96,6 +96,10 @@
     362–370 ms，较同场 CPU DFlash 610 ms 明显更快；但普通 greedy 为 313 ms。
     64-token 输出仍逐位一致，GPU DFlash 1982 ms、greedy 1769 ms。故 GPU 后端与
     局部加速成立，论文式端到端加速仍未成立。
+  - EAGLE3 没有使用上述 GPU-resident 整块执行器：drafter 仍在 CPU，target 仍是逐算子
+    Vulkan。英文 64-token、width=2 的 7 轮生产路径配对中，Vulkan 内部 decode 为
+    1.239x、请求内 prefill+decode 为 1.150x，但两条 Vulkan 路径都明显慢于 CPU；
+    该倍率只能证明投机提案与 token tile 的交互生效，不能证明手机最佳后端或论文吞吐。
 
 ## 格式
 

@@ -62,7 +62,7 @@
 | dflash-vulkan-f16（Android / Adreno 840） | 本次 | — | — | — | GPU draft 与 CPU 同量级（配对轮约 155–186 vs 161–166 ms） | Vulkan FP16 逐算子正确性后端 + DFlash GPU-resident 整块执行器；208 真机测试、真实输出逐 token 对齐。逐算子 2160 submit 的错误形态改为每 proposal block 一次 submit；端到端仍慢 16%–18%，target verify 尚在 CPU，属于功能落地而非提速结论 |
 | dflash-vulkan-target（Android / Adreno 840） | 本次 | — | — | — | **1.65× vs 同场 CPU DFlash**（610.02→369.71 ms） | CPU prefill 后导入 KV；DFlash proposal 与 dense Qwen3 target verify/capture 共用 device/allocator/lm_head。16/64 token 均与 greedy 逐位一致，target verify 428.11→231.96 ms；但 16-token 仍慢于 greedy 313.31 ms，低接受率下尚不符合论文端到端预期 |
 | eagle3-qwen3-0.6b（Android / PLK110） | 本次 | — | — | — | CPU **0.95×**（中位 2871.97→3021.45 ms）；逐算子 Vulkan 内部 **1.30×** | SpecForge EAGLE3 BF16→统一 FP16；三层 target residual + shifted embedding + recurrent rollback。英文 64-token 接受 22/41（53.7%）、target call 63→41，全部 CPU/Vulkan 输出与 greedy 逐位一致；CPU drafter 约 201 ms 吃掉 verify 收益，Vulkan 仍有 9253 次提交，功能成立但手机最佳后端尚未转正 |
-| eagle3-batch-verify-ablation（Android / PLK110） | 本次 | — | — | — | 无 batch 投机 **0.779×**；batch/tile 在投机内 **1.815×**；组合 vs Vulkan greedy **1.406×** | 新增逐 token target verify 诊断模式，在相同 82 个 target 输入、22/41 接受率下做因果消融：sequential 82 calls/17248 dispatch，batched 41 calls/9253 dispatch；全部输出一致。结论是 drafter 提供可验证候选、tile/批处理兑现执行收益，属于强交互而非可独立相加；通用 Vulkan 绝对性能仍远慢于 CPU |
+| eagle3-batch-verify-ablation（Android / PLK110） | 本次 | — | — | — | 无 batch 投机 **0.741×**；batch/tile 在投机内 **1.799×**；生产配对 decode **1.239×**、请求内总耗时 **1.150×** | 新增逐 token target verify 诊断和 backend 权重预准备；相同 82 个 target 输入、22/41 接受率下 sequential 82 calls、batched 41 calls，全部输出一致。7 轮仅跑 greedy/batched、相邻且交替顺序，decode 每轮均为 1.237–1.246×；旧 1.406× 混入懒上传与四路径热状态，已降级为历史值。通用 Vulkan 绝对性能仍远慢于 CPU |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ### dflash-qwen3-0.6b-markov（2026-09-14，Android 正确性与首轮性能）
@@ -4270,30 +4270,47 @@ done; done
   token-major hidden capture。proposal、接受/拒绝、target/draft truncate 和输出规则
   均不改变。`target_verify_calls` 记录真实物理调用数，stats JSON 新增
   `target_verify_mode`。
-- **测量工具**：新增 `scripts/bench_eagle3_ablation_android.sh`，自动部署 binary/缺失
-  模型，依次预热 CPU greedy、Vulkan greedy、Vulkan EAGLE sequential/batched，随后
-  正反序交错三轮；逐轮比较完整 `generated_ids`，并输出每项中位延迟、同轮加速比和
-  JSON 汇总。
+- **测量修正**：batched 的 `N>1` tied lm_head 走 Vulkan，而 greedy/sequential 的
+  `N=1` lm_head 走 CPU。旧路径在首个 speculative block 内才创建/复制约 296.8 MiB
+  GPU buffer，另一个预热进程又无法保留它，导致一次性准备成本混进 decode。新增
+  `IBackend::prepare_weight` / `QwenModel::prepare_lm_head`，在 EAGLE target prefill 后
+  显式准备；成本移出 decode、但仍计入该请求 prefill。测试顺序也改为让
+  greedy↔batched、batched↔sequential 相邻并逐轮反转。
+- **测量工具**：`scripts/bench_eagle3_ablation_android.sh` 自动部署、逐轮比较完整
+  `generated_ids`，输出 prefill/decode/total、同轮加速比分布和 JSON。默认 `full` 跑
+  四路径；`EAGLE3_BENCH_MODE=pair` 只跑生产 greedy/batched，用于更多轮的低干扰复测。
 - **负载**：PLK110 / Android 16 / Adreno 840；Qwen3-0.6B target 与 EAGLE3 draft
   均 FP16，KV FP16，41-token 英文 chat prompt，强制生成 64 token，width=2，6 workers。
 - **控制变量**：sequential 与 batched 都验证 82 个 target 输入，proposal/accepted 均为
-  41/22（53.66%），64 个输出 token 在四路径、全部 12 个正式样本中完全相同。
-- **结果**：Vulkan greedy 为 11496.85 / 11647.11 / 11771.06 ms；EAGLE sequential
-  为 14755.52 / 15226.92 / 14831.30 ms；EAGLE batched 为 8128.70 / 8379.11 /
-  8372.49 ms。按同轮加速比取中位：投机但不 batch 为 **0.779×**，投机场景内 batch/
-  tile 为 **1.815×**，完整投机 vs Vulkan greedy 为 **1.406×**。
-- **机制证据**：sequential→batched 时 target 调用 82→41，Vulkan dispatch
-  17248→9253，target verify 中位约 14654.03→8106.90 ms；输入数与接受率未变，排除了
-  “drafter 这轮碰巧更准”的解释。批量路径也让两行 lm_head 走 backend matmul，属于
-  token tile 所带来的权重复用/后端路由收益的一部分。
-- **判定**：1.4× 是 EAGLE 提案与 token tile 的交互。单有 drafter 会因额外 target
-  输入和 draft 开销而倒退；单有 greedy 又没有未来 token 可填充 tile。执行层决定性
-  收益来自 batch/tile，但它以 drafter 的有效候选为前提。通用 Vulkan 对 CPU anchor
-  同轮仅 **0.183×**，queue wait 仍占绝大多数，因此该结论只解释 Vulkan 内部相对加速，
-  不代表 TinyLLM GPU 已成为手机最佳后端。
-- **验证**：host Release build/CTest 0 failed；PLK110 Android 测试 0 failed；host
-  sequential/batched 输出相同，且同为 53 个输入时 calls 分别为 53/27；真机正式消融
-  全部输出完全一致。完整表与命令见 `docs/eagle3.md`。
+  41/22（53.66%）；sequential/batched 的物理 target 调用分别为 82/41。64 个输出
+  token 在四路径及全部正式样本中完全相同。
+- **完整阶梯（三轮）**：decode 中位依次为 CPU greedy 2605.78、Vulkan greedy
+  8429.86、EAGLE sequential 11263.70、EAGLE batched 6573.34 ms；请求内
+  prefill+decode 中位依次为 3665.35、9866.40、13190.54、8421.69 ms。按同轮比值
+  取中位：投机但不 batch 为 **0.741×**，投机场景内 batch/tile 为 **1.799×**，
+  完整投机 vs Vulkan greedy 的 decode 为 **1.292×**、请求内总耗时为 **1.183×**。
+- **生产路径复测（七轮）**：排除 CPU/sequential 热干扰，只让 Vulkan greedy 与
+  batched EAGLE 相邻并交替先后顺序。decode 中位 8251.62→6646.20 ms，逐轮加速
+  **1.237–1.246×**、中位 **1.239×**；prefill+decode 中位 10003.54→8708.91 ms，
+  逐轮 **1.143–1.154×**、中位 **1.150×**。另一次独立七轮配对得到 decode 中位
+  1.241×，方向和量级一致。EAGLE draft/target verify 中位分别为 571.11/6077.74 ms。
+- **历史数字修订**：旧四路径三轮曾得到 **1.406×**，但同时存在 lazy lm_head 准备、
+  非相邻主要对照和明显热状态漂移。该数值保留作历史记录，不再作为权威性能结论；与
+  llama.cpp 单轮约 1.41× 接近只能说明方向相容，不能证明稳定倍率相同。
+- **机制证据**：sequential→batched 保持输入数、proposal、接受率不变，却把物理 target
+  调用 82→41；无 batch 的投机只有 0.741×，排除了“drafter 自己就是加速来源”的解释。
+  批量路径的两行 lm_head 走 backend matmul，Transformer 权重也在 token tile 内复用。
+- **判定**：权威倍率为约 **1.24× decode / 1.15× 请求内端到端**，来源是 EAGLE
+  有效提案与 token tile 的乘法交互。单有 drafter 会因额外 target 输入和 draft 成本
+  倒退；单有 greedy 又没有未来 token 可填 tile。通用逐算子 Vulkan 的绝对速度仍远慢
+  于 CPU，queue wait 占大头，因此不代表 TinyLLM GPU 已成为手机最佳后端，也不能等同
+  于服务器论文吞吐。
+- **额外扫描**：sky prompt 的 width=2/3/4 接受率为 53.7%/38.0%/29.3%，target 输入
+  82/107/133，说明宽度增大后浪费迅速上升；Fibonacci/TCP width=2 接受率为
+  65.8%/63.2%。这些额外性能轮次在测量修正前完成，仅将接受统计和趋势作为有效证据。
+- **验证**：host Release build/CTest 0 failed；PLK110 Android **209 tests, 0 failed**；
+  host sequential/batched 输出相同，且同为 53 个输入时 calls 分别为 53/27；真机四路径
+  与七轮 pair 的全部输出完全一致。完整表与命令见 `docs/eagle3.md`。
 
 ---
 

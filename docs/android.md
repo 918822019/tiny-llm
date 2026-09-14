@@ -132,8 +132,11 @@ adb shell "cd /data/local/tmp/tinyqwen && \
 PLK110 上英文 64-token 样例的 proposal 接受率为 53.7%，target 调用从 63 降到
 41；但 CPU EAGLE3 三轮 decode 中位数 3021.45 ms，普通 greedy 为 2871.97 ms，
 仍慢 5.2%。追加 `--backend vulkan` 后，target 使用通用逐算子 Vulkan、drafter 仍在
-CPU；它相对 Vulkan greedy 有 1.30x decode 加速，但仍明显慢于 CPU greedy。完整
-转换命令、正确性校验、中文结果与原因分析见 `eagle3.md`。
+CPU。显式准备 batched lm_head、只跑生产两路径并交替顺序后，7 轮相邻配对的 decode
+加速中位为 **1.239x**（范围 1.237–1.246x），请求内 `prefill + decode` 为
+**1.150x**（1.143–1.154x）；全部输出逐 token 一致。它仍明显慢于 CPU greedy，且
+旧四路径测得的 1.406x 已因懒上传与热状态混杂降级为历史值。完整转换命令、消融口径、
+中文结果与原因分析见 `eagle3.md`。
 
 DFlash / DFlare + Markov 使用 `--dflash-model draft.tqwen`。加
 `--backend vulkan` 后，CPU 只做 prefill 并把 target KV 前缀导入 GPU；DFlash drafter

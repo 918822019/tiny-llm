@@ -179,7 +179,11 @@ drafter 都走 CPU；追加 `--backend vulkan` 时只有 target 的 FP16 matrix 
 lm_head、accept/rollback 串成少量 command buffer，并让两侧权重/KV 常驻同一 device。
 EAGLE3 默认把 root 与 proposals 一次交给 target，从而让 FP16 matmul 的 token 维 tile
 复用权重；诊断参数 `--no-eagle3-batch-verify` 会改为逐 token 调用，但保持相同输入、
-capture、接受决策与回滚语义，用于隔离这种批量收益。
+capture、接受决策与回滚语义，用于隔离这种批量收益。由于 batched 的 `N>1` tied
+lm_head 也走 backend matmul，EAGLE3 在 target prefill 后调用可选的
+`IBackend::prepare_weight`：Vulkan 会提前创建/复制持久权重 buffer，CPU 是 no-op。
+准备成本位于 decode 计时之前但仍计入 prefill，避免把约 296.8 MiB lm_head 的首次上传
+误算成稳态 speculative block 成本。
 
 ## 数据流
 

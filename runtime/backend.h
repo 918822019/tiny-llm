@@ -20,6 +20,7 @@
 // ============================================================================
 
 #include <cstdint>
+#include <string>
 
 namespace tinyqwen {
 
@@ -73,6 +74,14 @@ namespace tinyqwen {
     class IBackend {
     public:
         virtual ~IBackend() = default;
+
+        // Optionally materialize a persistent backend copy before a timed
+        // execution region. Stateless CPU backends need no preparation.
+        virtual bool prepare_weight(const WeightTensor& w, std::string* err) {
+            (void)w;
+            (void)err;
+            return true;
+        }
 
         // =====================================================================
         // matvec 系列: 矩阵-向量乘法

@@ -21,6 +21,7 @@
 #include "test_framework.h"
 
 #include <cmath>
+#include <string>
 #include <vector>
 
 #include "backend.h"
@@ -33,6 +34,15 @@ using namespace tinyqwen;
 TEST (cpu_backend_create) {
     auto backend = create_cpu_backend();  // 创建 CPU 后端
     EXPECT_TRUE(backend != nullptr);      // 确保指针非空
+}
+
+TEST (cpu_backend_prepare_weight_is_noop) {
+    auto backend = create_cpu_backend();
+    const std::vector<float> values = {1.0f, 2.0f, 3.0f, 4.0f};
+    const WeightTensor weight{values.data(), QuantType::kF32, 2, 2, 0};
+    std::string error;
+    EXPECT_TRUE(backend->prepare_weight(weight, &error));
+    EXPECT_TRUE(error.empty());
 }
 
 // 测试用例：CPU 后端 RMS 归一化

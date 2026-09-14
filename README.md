@@ -37,10 +37,10 @@
     > decode 仍走 CPU 且逐 token 一致。测速 `scripts/bench_metal_prefill.sh`，
     > 归因与证伪记录见 `docs/optimization_log.md`。
 > - **Android Vulkan FP16（`--backend vulkan`）**：普通模型提供逐算子 FP16
-    > matvec/matmul 正确性路径；DFlash 自动切换为 GPU 常驻的整块 drafter，把
-    > 3 层 DFlare、共享 lm_head、Markov 修正和 argmax 合并成每块一次提交。
-    > PLK110 / Adreno 840 已通过 208 项真机测试并与 CPU greedy 逐 token 一致；
-    > 当前目标模型验证仍走 CPU，因此这是可用的实验后端，尚不能宣称端到端加速。
+    > matvec/matmul 正确性路径；DFlash 自动切换为 GPU 常驻的整块 drafter + target
+    > verifier，EAGLE3 则让 target 走通用逐算子 Vulkan、drafter 留在 CPU。
+    > PLK110 / Adreno 840 已通过 209 项真机测试并与 CPU greedy 逐 token 一致；
+    > 通用 Vulkan 绝对速度仍慢于 CPU，因此这是实验后端，不是手机最佳性能配置。
 >
 > 新手建议先读 [`docs/infra_primer.md`](docs/infra_primer.md)。
 
@@ -184,7 +184,10 @@ EAGLE3 的 `--speculative-tokens` 是包含 pending root 的验证块宽度，�
 只把 target 放到通用逐算子 Vulkan 后端，drafter 仍在 CPU。转换格式、状态语义、
 原始权重对齐和 PLK110 实测见 `docs/eagle3.md`。需要区分投机调度与批量 token tile
 贡献时，可用诊断参数 `--no-eagle3-batch-verify` 和
-`scripts/bench_eagle3_ablation_android.sh`；该参数不是部署推荐配置。
+`scripts/bench_eagle3_ablation_android.sh`；该参数不是部署推荐配置。修正 GPU 权重准备
+与测试顺序后，width=2 的 7 轮相邻配对为 decode **1.239x**、请求内
+`prefill + decode` **1.150x**；这来自 EAGLE 提案与批量 tile 的交互，旧 1.406x
+不再作为权威值。只复测生产两路径可设置 `EAGLE3_BENCH_MODE=pair`。
 
 ## 不需要真模型的验证
 

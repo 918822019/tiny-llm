@@ -102,6 +102,15 @@ namespace tinyqwen {
                             static_cast<int>(cfg_.hidden_size), group_size_};
         return true;
     }
+
+    bool QwenModel::prepare_lm_head(std::string *err) const {
+        WeightTensor weight{};
+        if (!lm_head_weight(&weight)) {
+            if (err) *err = "target model has no lm_head weight";
+            return false;
+        }
+        return backend_->prepare_weight(weight, err);
+    }
     namespace {
         // =====================================================================
         // quant_type_of() — Dtype -> QuantType 的安全映射

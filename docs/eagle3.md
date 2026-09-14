@@ -157,8 +157,11 @@ Android 上的四路径消融可以自动运行：
   prompt.json 3 64 2
 ```
 
-脚本先预热，再正反序交错执行三轮，比较全部 `generated_ids`，并保存每轮输出、统计和
-汇总 JSON 到 `artifacts/eagle3-ablation-*`。
+脚本默认跑完整四路径消融：先做短预热，再把 greedy/batched、batched/sequential 保持
+相邻并逐轮反转顺序；它比较全部 `generated_ids`，同时报告 prefill、decode、两者之和及
+同轮加速比。只复测实际部署的 Vulkan greedy/batched 两条路径时，使用
+`EAGLE3_BENCH_MODE=pair`；此模式适合增加重复次数并缩小慢速 sequential 路径造成的热
+干扰。每轮原始输出、统计和汇总 JSON 保存到 `artifacts/eagle3-ablation-*`。
 
 ## 5. PLK110 真机结果（2026-09-14）
 
@@ -185,10 +188,10 @@ CPU 宽度 2 的 target verify 最好一轮为 2761.04 ms，确实比同场 gree
 比较则慢 5.2%。这说明投机机制和 batch verification 都已经生效，尚未跨过端到端
 盈亏点。
 
-Vulkan 混合路径相对逐算子 Vulkan greedy 的 decode 是 1.30x（6279.38 ->
-4845.53 ms），但它有 9253 次 GPU dispatch，并且仍比 CPU greedy 慢约 69%。因此这
-只能证明 GPU target A/B 路径正确且能从较少 target block 中受益，不能称为手机最佳
-后端。
+这次早期单轮里，Vulkan 混合路径相对逐算子 Vulkan greedy 的 decode 是 1.30x
+（6279.38 -> 4845.53 ms），但它有 9253 次 GPU dispatch，并且仍比 CPU greedy 慢约
+69%。因此它只能证明 GPU target A/B 路径正确且能从较少 target block 中受益，不能称为
+手机最佳后端；测量修正后的多轮权威数字见 5.3 节。
 
 ### 5.2 中文 16-token
 
@@ -219,34 +222,84 @@ greedy 无法预知未来 token，因此“关闭投机、但仍让多 token til
 4. Vulkan EAGLE3 batched：开启 drafter 与默认的两 token 批量 tile。
 
 测试仍使用 41-token 英文 prompt、强制生成 64 token、width=2、FP16 target/draft/KV、
-6 个 CPU worker。每条路径预热一次后正反序交错三轮。三轮中所有四条路径的 64 个
-`generated_ids` 完全相同；两种 EAGLE3 路径也都有相同的 22/41（53.66%）接受率和
-82 个 target 输入，因此性能差异不是 drafter 质量或接受决策变化造成的。
+6 个 CPU worker。所有正式样本的 64 个 `generated_ids` 完全相同；两种 EAGLE3 路径
+也都有相同的 22/41（53.66%）接受率和 82 个 target 输入，因此性能差异不是 proposal
+或接受决策变化造成的。
 
-| 路径 | decode 三轮（ms） | 中位（ms） | target 调用 / 输入 | Vulkan dispatch（含 prefill） |
+#### 测量修正
+
+首轮消融曾报告完整投机相对 Vulkan greedy 为 1.406x。继续复查后发现两项会污染短
+进程计时的因素：
+
+1. batched verification 的 `N>1` lm_head 会走 Vulkan matmul，而 greedy/sequential
+   的 `N=1` lm_head 走 CPU。旧实现到第一个 speculative block 才创建并复制约
+   296.8 MiB 的 tied lm_head GPU buffer，因此一次性准备成本被混进 decode；另一个
+   warmup 进程无法替后续新进程保留这个 buffer。
+2. 四路径旧顺序让极慢的 sequential 路径隔在主要对照之间，手机温度和频率漂移会直接
+   进入配对比值。
+
+现在 batched EAGLE3 在 target prefill 后显式调用 backend weight preparation：GPU
+buffer 的创建/复制发生在 decode 计时前，但仍完整计入该请求的 prefill，而不是被隐藏。
+脚本也让 `greedy↔batched` 与 `batched↔sequential` 相邻，并在偶数轮反转顺序。
+
+修正后的三轮完整阶梯中位数如下；`total` 是每轮 `prefill + decode` 后再取中位，因此
+不必等于前两列中位数之和：
+
+| 路径 | prefill 中位（ms） | decode 中位（ms） | total 中位（ms） | target 调用 / 输入 |
 |---|---:|---:|---:|---:|
-| CPU greedy | 2105.50 / 2390.29 / 2146.54 | 2146.54 | 63 / 63 | — |
-| Vulkan greedy | 11496.85 / 11647.11 / 11771.06 | 11647.11 | 63 / 63 | 13524 |
-| Vulkan EAGLE3 sequential | 14755.52 / 15226.92 / 14831.30 | 14831.30 | 82 / 82 | 17248 |
-| Vulkan EAGLE3 batched | 8128.70 / 8379.11 / 8372.49 | 8372.49 | 41 / 82 | 9253 |
+| CPU greedy | 783.80 | 2605.78 | 3665.35 | 63 / 63 |
+| Vulkan greedy | 1370.58 | 8429.86 | 9866.40 | 63 / 63 |
+| Vulkan EAGLE3 sequential | 1524.85 | 11263.70 | 13190.54 | 82 / 82 |
+| Vulkan EAGLE3 batched | 1970.66 | 6573.34 | 8421.69 | 41 / 82 |
 
-按同轮比值取中位数，归因结果是：
+按同轮比值取中位数：只有投机、没有批量验证为 **0.741x**；投机场景内打开 batch/tile
+为 **1.799x**；完整 batched EAGLE3 相对 Vulkan greedy 的 decode 为 **1.292x**，
+`prefill + decode` 为 **1.183x**。四路径绝对耗时仍有明显热状态波动，因此生产两路径
+又单独做了 7 轮相邻配对：
 
-- **只有投机、没有批量验证：0.779x**。相对 Vulkan greedy 反而慢 28.3%；drafter 与
-  多验证的 19 个 target 输入都是净开销。
-- **投机场景内打开批量 token tile：1.815x**。输入仍是 82 个，但 target 调用
-  82→41、dispatch 17248→9253；target verify 三轮中位约 14654.03→8106.90 ms。
-- **完整投机路径相对 Vulkan greedy：1.406x**，即 decode 延迟约下降 28.9%。这与
-  llama.cpp 同机测得的约 1.41x 一致。
-- **通用 Vulkan 相对 CPU 仍只有 0.183x**。绝对值比前一轮 6.28 秒的 Vulkan 测量更慢，
-  且 queue wait 占绝大多数时间；所以这里只使用同轮配对比值做归因，不能把 8.37 秒
-  当作稳定的 GPU 性能基线，更不能说它已经胜过手机 CPU。
+```bash
+EAGLE3_BENCH_MODE=pair ./scripts/bench_eagle3_ablation_android.sh \
+  model_qwen3_06b_f16_ctx2048.tqwen \
+  eagle3_qwen3_06b_specforge_f16.tqwen \
+  prompt.json 7 64 2
+```
 
-因此，1.4x 不能归为“drafter 单独带来的加速”，也不能说成“不需要投机、tile 自己就能
-加速”。准确说法是：**drafter 的有效预测提供了可并行验证的未来 token，投机调度把
-63 个串行 target step 变成 41 个验证块，而 token tile 才把每块的两个输入合并执行；
-二者是乘法交互。**在当前实现上，禁用 tile 后投机是负收益，所以执行层面的决定性收益
-来自批量/tile；但没有投机提案，tile 也没有第二个 token 可用。
+| 路径 | prefill 中位（ms） | decode 中位（ms） | total 中位（ms） |
+|---|---:|---:|---:|
+| Vulkan greedy | 1756.20 | 8251.62 | 10003.54 |
+| Vulkan EAGLE3 batched | 2065.13 | 6646.20 | 8708.91 |
+
+7 轮逐对相除后，decode 加速中位为 **1.239x**，全部轮次范围 **1.237–1.246x**；
+请求内 `prefill + decode` 加速中位为 **1.150x**，范围 **1.143–1.154x**。EAGLE3 的
+`draft_ms` 中位为 571.11 ms，`target_verify_ms` 中位为 6077.74 ms。第二次独立的
+7 轮手工配对也得到 decode 中位 1.241x，所以当前权威结论取 **约 1.24x decode、
+约 1.15x 请求内端到端**。早先 1.406x 保留为测量修正前的历史结果，不再作为性能
+结论；它与 llama.cpp 单轮约 1.41x 接近不足以证明两边具有相同的稳定加速倍率。
+
+#### 宽度与 prompt 探索
+
+继续测试了 width=3/4 和两个英文 prompt。除 width=2 sky 的 7 轮复测外，下表性能值
+来自测量修正前的三轮探索，只能看趋势，不能和权威值做精确横向比较；接受统计和输出
+一致性不受 lm_head 准备时机影响。
+
+| prompt | width | 接受情况 | target 调用 / 输入 | 探索性 decode 加速 |
+|---|---:|---:|---:|---:|
+| sky | 2 | 22/41（53.7%） | 41 / 82 | **1.239x**（修正后 7 轮） |
+| sky | 3 | 27/71（38.0%） | 36 / 107 | 1.211x |
+| sky | 4 | 29/99（29.3%） | 34 / 133 | 1.175x |
+| Fibonacci code | 2 | 25/38（65.8%） | 38 / 76 | 1.438x |
+| TCP vs UDP | 2 | 24/38（63.2%） | 39 / 77 | 1.372x |
+
+sky 样例中，width 变宽虽把 target 调用从 41 降到 36/34，但接受率持续下降，target
+输入增至 107/133，最终反而不如 width=2。不同 prompt 的接受率差异也很明显，因此
+单 prompt 不能代表业务分布；Fibonacci/TCP 的旧性能数字需要用新 pair 模式复测后才能
+成为正式结论。
+
+归因结论不变，但倍率修正为更保守的值：**drafter 的有效预测提供可并行验证的未来
+token，投机调度把 63 个串行 target step 变成 41 个验证块，而 token tile 把每块两个
+输入合并执行；二者是乘法交互。**禁用 tile 后投机为 0.741x 负收益，说明执行层面的
+决定性收益来自 batch/tile；但没有 drafter 提案，greedy 路径也没有第二个未来 token
+可以填入 tile。
 
 ## 6. 如何解读“是否符合论文预期”
 
@@ -261,10 +314,13 @@ greedy 无法预知未来 token，因此“关闭投机、但仍让多 token til
    小且 ARM FP16 matvec 已优化；EAGLE3 每个确认 token 仍要支付一层 recurrent network
    和 32K lm_head。服务器结果使用 SGLang、BF16 GPU、CUDA graph、批量 benchmark 与
    多种数据集，不能把其推荐宽度 4 直接套到手机 CPU。
-4. **Vulkan 内部约 1.4x 是投机与 tile 的交互**：逐 token 消融证明 drafter 单独运行
-   是负收益，而批量验证把相同的 82 个 target 输入从 82 次调用合并为 41 次，才兑现
-   1.406x。它不属于 TinyLLM tile 或 drafter 任一方可独占的收益，更不改变通用 Vulkan
-   仍明显慢于 CPU 的事实。
+4. **Vulkan 内部稳定约 1.24x decode / 1.15x 请求内端到端，是投机与 tile 的交互**：
+   逐 token 消融证明 drafter 单独运行是负收益，而批量验证把相同的 82 个 target 输入
+   从 82 次调用合并为 41 次，才兑现执行收益。它不属于 TinyLLM tile 或 drafter 任一方
+   可独占的收益；早先 1.406x 是测量修正前的历史值。
+5. **仍不等于复现服务器论文吞吐**：通用 Vulkan 每个 matrix op 都 submit/wait，绝对
+   速度仍明显慢于手机 CPU；当前结果证明机制和相对 A/B 生效，不证明这是手机最佳后端，
+   也不能直接与 SGLang/CUDA graph 的论文吞吐倍率等同。
 
 当前手机建议使用宽度 2 做实验；正式决定是否启用前，应在目标业务数据集上报告
 `generated_ids` 一致率、`draft_ms`、`target_verify_ms`、decode 和接受长度分布。下一步
