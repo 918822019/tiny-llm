@@ -23,6 +23,8 @@ tinyqwen/
 │   ├── qwen_forward_prefill_qwen35.cpp # Qwen3.5 批量 prefill：prompt≥32 时线性投影
 │   │                       #   反量化 fp32 走 Accelerate/AMX sgemm（权重每层读一遍），
 │   │                       #   GDN 递归/因果 attention 保留逐 token 顺序扫描
+│   ├── dflash_model.h/.cpp # DFlare 层融合 + 非因果 mask block + Markov chain 草稿
+│   ├── speculative_decoder.h/.cpp # AR 草稿与 DFlash 的 verify/accept/rollback 编排
 │   ├── profiler.h/.cpp     # ScopedTimer + per-token/per-op 记录 + JSON 输出
 │   ├── metal_prefill.h     # Apple GPU prefill 引擎接口（纯 C++，main.cpp 不必碰 ObjC）
 │   ├── metal_prefill.mm    # 实现（ObjC++）：GEMM 走 MPS、其余算子走自写 Metal compute

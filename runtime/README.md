@@ -13,7 +13,7 @@
 | ④ 计算   | `qwen_model.*` + `qwen_forward_*.cpp`         | 真正的前向：一个 token 进、下一个 token 出             |
 | ⑤ 后端   | `backend.h` + `backend_cpu.*` + `backend_cuda.*` | 算子抽象层：模型只调 IBackend，不关心 dtype/量化/硬件      |
 | ⑥ 测量   | `profiler.*`                                  | 记录每步耗时（可关，关了零开销）                         |
-| ⑦ 编排   | `main.cpp` + `speculative_decoder.*`          | CLI、普通生成与 draft/verify/rollback 循环       |
+| ⑦ 编排   | `main.cpp` + `speculative_decoder.*` + `dflash_model.*` | CLI、普通生成、AR 草稿与 DFlash verify/rollback |
 | ⑧ GPU prefill | `metal_prefill.*`（Apple only）          | `--engine metal`：整批 prompt 跑在 Apple GPU，绕过 IBackend |
 | 配置     | `config.*`                                    | key=value 配置解析（供 ⑦ 用）                    |
 
@@ -92,6 +92,11 @@
 - Metal 同步回退自身 `kv_len`，并在 GDN 模型上把 CPU checkpoint 写回 GPU；
 - `forward_verify()` 对 Qwen2/3 dense 主体走批量 GEMM，再逐位置做 lm_head；
   Qwen3.5/MoE 的 CPU 验证暂走逐 token 正确性路径。
+
+`--dflash-model` 走另一种草稿约定：DFlash cache 只保存已确认目标隐藏状态投影出的
+context K/V，anchor/mask 的 noise K/V 每次提案后立即丢弃。目标验证同时捕获指定层
+残差流，拒绝后只把 `anchor + accepted` 对应的切片交给下一块。完整数学和真机结果
+见 `../docs/dflash.md`。
 
 ## 建议阅读顺序（由浅入深）
 

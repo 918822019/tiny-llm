@@ -24,6 +24,9 @@
 - 超出 max_seq_len / KV 溢出直接 abort（fail loud）；
 - speculative decoding 目前仅支持 greedy；两个模型必须使用同一 tokenizer，
   运行时只能自动校验 vocab/EOS 元数据，无法识别 vocab 大小相同但词表映射不同的模型；
+- DFlash 当前只支持 Qwen3 稠密目标、DFlare fusion、低秩 Markov chain、FP16 和 CPU；
+  未实现 tree/optmarkov、采样拒绝、Metal/CUDA。Android FP16 batched GEMM 尚缺，
+  真机虽能减少 target 调用但当前通常不比普通 greedy 快，实测见 `dflash.md`；
 - Qwen2/3 dense 的 CPU verify 主体走批量 GEMM；带 GDN 的 Qwen3.5 和 MoE 在 CPU
   上为保证递归状态正确暂走逐 token verify。Metal 支持 continuation batch，拒绝时
   GDN 需要 checkpoint 恢复与已接受前缀重放；

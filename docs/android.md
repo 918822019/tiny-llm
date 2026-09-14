@@ -113,6 +113,10 @@ Android 没有 Metal，目标验证走 CPU。Qwen2/3 dense 会批量验证；Qwe
 当前走逐 token 正确性路径。上线前先用同一目标模型、不带 `--draft-model` 跑一遍，
 确认两次 `generated_ids` 完全一致，再比较 `spec.json` 的接受率和总耗时。
 
+DFlash / DFlare + Markov 使用 `--dflash-model draft.tqwen`，详细导出命令、块长语义和
+PLK110 真机 A/B 见 `dflash.md`。当前 Android FP16 matmul 会回退为 N 次 matvec，
+所以“接受率大于零”不等于“端到端更快”；必须同时比较无 profiler 的 decode wall time。
+
 ## 5. 常见坑
 
 | 现象                       | 处理                                                                  |

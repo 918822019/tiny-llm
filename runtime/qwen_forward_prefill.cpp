@@ -73,10 +73,13 @@ namespace tinyqwen {
     //       作为一条 prefill 记录计时。
     int QwenModel::forward_prefill(const int *token_ids, int n,
                                    TopKResult *topk, int topk_k,
-                                   std::vector<int> *all_next) {
+                                   std::vector<int> *all_next,
+                                   const std::vector<int> *capture_layer_ids,
+                                   std::vector<float> *captured_hidden) {
         if (all_next) all_next->clear();
+        if (captured_hidden) captured_hidden->clear();
         if (n <= 0) return -1; // 空 prompt，直接返回
-        if (n == 1) {
+        if (n == 1 && !captured_hidden) {
             const int next = forward_token(token_ids[0], topk, topk_k);
             if (all_next) all_next->push_back(next);
             return next;
@@ -91,6 +94,15 @@ namespace tinyqwen {
         const int head_dim = static_cast<int>(cfg_.head_dim);
         const int base_pos = kv_.seq_len(); // 当前 KV cache 中已存储的序列长度
         const bool is_qwen35 = cfg_.uses_qwen35_attention();
+
+        if (captured_hidden) {
+            if (!capture_layer_ids || capture_layer_ids->empty()) return -1;
+            for (int li : *capture_layer_ids) {
+                if (li < 0 || li >= static_cast<int>(cfg_.n_layers)) return -1;
+            }
+            captured_hidden->resize(static_cast<size_t>(n) *
+                                    capture_layer_ids->size() * hidden);
+        }
 
         // MoE 暂不支持批量 prefill GEMM 路径（专家 gather/scatter 未实现），
         // 一律强制逐 token（forward_token 已支持 MoE FFN）。这个分支必须在
@@ -326,6 +338,19 @@ namespace tinyqwen {
                 for (size_t j = 0; j < static_cast<size_t>(hidden) * N; ++j)
                     hid_batch[j] += ffn_batch[j];
             }
+
+            if (captured_hidden) {
+                for (size_t k = 0; k < capture_layer_ids->size(); ++k) {
+                    if ((*capture_layer_ids)[k] != static_cast<int>(li)) continue;
+                    for (int c = 0; c < n; ++c) {
+                        const float *src = hid_batch.data() +
+                                           static_cast<size_t>(c) * hidden;
+                        float *dst = captured_hidden->data() +
+                                     (static_cast<size_t>(c) * capture_layer_ids->size() + k) * hidden;
+                        std::memcpy(dst, src, static_cast<size_t>(hidden) * sizeof(float));
+                    }
+                }
+            }
         }
 
         // =====================================================================
@@ -440,6 +465,15 @@ namespace tinyqwen {
                                   std::vector<int> *all_next) {
         if (!all_next) return -1;
         return forward_prefill(token_ids, n, nullptr, 0, all_next);
+    }
+
+    int QwenModel::forward_verify_capture(const int *token_ids, int n,
+                                          const std::vector<int> &capture_layer_ids,
+                                          std::vector<int> *all_next,
+                                          std::vector<float> *captured_hidden) {
+        if (!all_next || !captured_hidden) return -1;
+        return forward_prefill(token_ids, n, nullptr, 0, all_next,
+                               &capture_layer_ids, captured_hidden);
     }
     // =========================================================================
     // QwenModel::forward_ppl() — 批量 prefill + 全位置交叉熵（困惑度）

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "qwen_model.h"
+#include "dflash_model.h"
 
 namespace tinyqwen {
     struct MetalPrefillEngine;
@@ -60,4 +61,12 @@ namespace tinyqwen {
                               const std::vector<int> &prompt,
                               const SpeculativeConfig &config,
                               SpeculativeResult *result, std::string *err);
+
+    // DFlash/DFlare greedy chain decoding. Unlike an autoregressive draft LM,
+    // the drafter consumes selected target residual streams and proposes a
+    // whole mask block with an optional Markov dependency between positions.
+    bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
+                                     const std::vector<int> &prompt,
+                                     const SpeculativeConfig &config,
+                                     SpeculativeResult *result, std::string *err);
 } // namespace tinyqwen

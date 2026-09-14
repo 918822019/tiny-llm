@@ -167,11 +167,27 @@ namespace tinyqwen {
         //     - prefill 结束后 KV cache 中已有 n 个 token 的 K/V
         // ---------------------------------------------------------------------
         int forward_prefill(const int *token_ids, int n, TopKResult *topk = nullptr,
-                            int topk_k = 5, std::vector<int> *all_next = nullptr);
+                            int topk_k = 5, std::vector<int> *all_next = nullptr,
+                            const std::vector<int> *capture_layer_ids = nullptr,
+                            std::vector<float> *captured_hidden = nullptr);
 
         // 批量验证 token，并返回每个输入位置之后的 greedy token：
         // all_next[i] = argmax P(next | prefix, token_ids[0..i])。
         int forward_verify(const int *token_ids, int n, std::vector<int> *all_next);
+
+        // DFlash verification hook. captured_hidden is token-major [n, K, hidden],
+        // where K follows capture_layer_ids and layer L means the residual stream
+        // after transformer layer L (HF output_hidden_states[L + 1]).
+        int forward_verify_capture(const int *token_ids, int n,
+                                   const std::vector<int> &capture_layer_ids,
+                                   std::vector<int> *all_next,
+                                   std::vector<float> *captured_hidden);
+
+        // DFlash reuses the target model's tied input/output embedding matrix.
+        // project_lm_head_raw deliberately does not apply the target final norm:
+        // the DFlash model owns and applies its own norm first.
+        bool copy_embedding(int token_id, float *out) const;
+        void project_lm_head_raw(const float *hidden, float *logits) const;
 
         // ---------------------------------------------------------------------
         // forward_ppl: 批量 prefill + 全位置 lm_head + 交叉熵，计算困惑度

@@ -39,6 +39,42 @@
 #include "ref_ops.h"
 
 namespace tinyqwen {
+
+    bool QwenModel::copy_embedding(int token_id, float *out) const {
+        if (!out || token_id < 0 || token_id >= static_cast<int>(cfg_.vocab_size) ||
+            embed_file_offset_ != 0) return false;
+        const int hidden = static_cast<int>(cfg_.hidden_size);
+        if (embed_dtype_ == Dtype::kF32) {
+            std::memcpy(out, static_cast<const float *>(embed_) +
+                             static_cast<size_t>(token_id) * hidden,
+                        static_cast<size_t>(hidden) * sizeof(float));
+        } else if (embed_dtype_ == Dtype::kI4) {
+            dequant_i4_row(static_cast<const uint8_t *>(embed_), token_id, hidden,
+                           group_size_, out);
+        } else if (embed_dtype_ == Dtype::kF16) {
+            const uint16_t *row = static_cast<const uint16_t *>(embed_) +
+                                  static_cast<size_t>(token_id) * hidden;
+            for (int i = 0; i < hidden; ++i) out[i] = half_to_float(row[i]);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    void QwenModel::project_lm_head_raw(const float *hidden, float *logits) const {
+        const int vocab = static_cast<int>(cfg_.vocab_size);
+        const int width = static_cast<int>(cfg_.hidden_size);
+        if (lm_head_is_f32_) {
+            matvec_f32(static_cast<const float *>(lm_head_), hidden, logits, vocab, width);
+        } else if (lm_head_is_f16_) {
+            matvec_f16(static_cast<const uint16_t *>(lm_head_), hidden, logits, vocab, width);
+        } else if (lm_head_is_i4_) {
+            matvec_i4(static_cast<const uint8_t *>(lm_head_), hidden, logits,
+                      vocab, width, group_size_);
+        } else {
+            const_cast<QwenModel *>(this)->mv(lm_head_, hidden, logits, vocab, width);
+        }
+    }
     namespace {
         // =====================================================================
         // quant_type_of() — Dtype -> QuantType 的安全映射

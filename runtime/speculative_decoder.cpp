@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "metal_prefill.h"
 
@@ -251,6 +253,125 @@ bool speculative_generate(QwenModel &target, QwenModel &draft,
         pending = decision.next_pending;
     }
 
+    result->stats.decode_ms = elapsed_ms(decode_begin, Clock::now());
+    return true;
+}
+
+bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
+                                 const std::vector<int> &prompt,
+                                 const SpeculativeConfig &config,
+                                 SpeculativeResult *result, std::string *err) {
+    if (!result || prompt.empty() || config.max_new_tokens <= 0) {
+        if (err) *err = "invalid DFlash generation arguments";
+        return false;
+    }
+    *result = SpeculativeResult{};
+    const int block = std::min(config.draft_tokens, draft.block_size());
+    if (block < 2) {
+        if (err) *err = "DFlash requires at least two verification tokens";
+        return false;
+    }
+    if (static_cast<int>(prompt.size()) + config.max_new_tokens >
+        target.kv_cache().max_seq_len()) {
+        if (err) *err = "prompt + generation exceeds target KV capacity";
+        return false;
+    }
+
+    target.reset();
+    draft.reset();
+    target.set_prompt_len(static_cast<int>(prompt.size()));
+    const Clock::time_point prefill_begin = Clock::now();
+    std::vector<float> target_hidden;
+    int pending = target.forward_prefill(prompt.data(), static_cast<int>(prompt.size()),
+                                         nullptr, 0, nullptr,
+                                         &draft.target_layer_ids(), &target_hidden);
+    if (pending < 0) {
+        if (err) *err = "DFlash target prefill/capture failed";
+        return false;
+    }
+    result->stats.prefill_ms = elapsed_ms(prefill_begin, Clock::now());
+    int ctx_tokens = static_cast<int>(prompt.size());
+
+    const Clock::time_point decode_begin = Clock::now();
+    while (static_cast<int>(result->generated_ids.size()) < config.max_new_tokens) {
+        result->generated_ids.push_back(pending);
+        if (config.eos_token_id >= 0 && pending == config.eos_token_id) {
+            result->hit_eos = true;
+            break;
+        }
+        const int remaining = config.max_new_tokens -
+                              static_cast<int>(result->generated_ids.size());
+        if (remaining <= 0) break;
+        if (remaining == 1) {
+            std::vector<int> after;
+            if (target.forward_verify(&pending, 1, &after) < 0 || after.size() != 1) {
+                if (err) *err = "DFlash target tail step failed";
+                return false;
+            }
+            pending = after[0];
+            ++result->stats.target_verify_calls;
+            ++result->stats.target_input_tokens;
+            ++result->stats.baseline_tail_steps;
+            continue;
+        }
+
+        const int verify_size = std::min(block, remaining);
+        std::vector<int> proposals;
+        if (!draft.propose(target_hidden.data(), ctx_tokens, pending, verify_size,
+                           &proposals, err)) return false;
+        ++result->stats.draft_forward_calls;
+        result->stats.draft_proposed += static_cast<int>(proposals.size());
+
+        std::vector<int> inputs;
+        inputs.reserve(verify_size);
+        inputs.push_back(pending);
+        inputs.insert(inputs.end(), proposals.begin(), proposals.end());
+        const QwenModel::StateCheckpoint checkpoint = target.checkpoint();
+        std::vector<int> target_after;
+        std::vector<float> verified_hidden;
+        if (target.forward_verify_capture(inputs.data(), static_cast<int>(inputs.size()),
+                                          draft.target_layer_ids(), &target_after,
+                                          &verified_hidden) < 0) {
+            if (err) *err = "DFlash target verification/capture failed";
+            return false;
+        }
+        ++result->stats.blocks;
+        ++result->stats.target_verify_calls;
+        result->stats.target_input_tokens += static_cast<int>(inputs.size());
+
+        SpeculativeDecision decision;
+        if (!decide_speculative(proposals, target_after, &decision, err)) return false;
+        if (std::getenv("TINYQWEN_DFLASH_TRACE")) {
+            std::fprintf(stderr, "[dflash-trace] anchor=%d draft:", pending);
+            for (int id : proposals) std::fprintf(stderr, " %d", id);
+            std::fprintf(stderr, " target:");
+            for (int id : target_after) std::fprintf(stderr, " %d", id);
+            std::fprintf(stderr, " accepted=%d\n", decision.accepted);
+        }
+        result->stats.draft_accepted += decision.accepted;
+        const int keep = 1 + decision.accepted;
+        if (!target.truncate(checkpoint.seq_len + keep, err)) return false;
+        if (decision.all_accepted) ++result->stats.bonus_tokens;
+        else {
+            ++result->stats.corrections;
+            ++result->stats.rollbacks;
+        }
+
+        const int H = static_cast<int>(target.config().hidden_size);
+        const int K = static_cast<int>(draft.target_layer_ids().size());
+        target_hidden.assign(verified_hidden.begin(),
+                             verified_hidden.begin() + static_cast<size_t>(keep) * K * H);
+        ctx_tokens = keep;
+        for (int i = 0; i < decision.accepted; ++i) {
+            result->generated_ids.push_back(proposals[i]);
+            if (config.eos_token_id >= 0 && proposals[i] == config.eos_token_id) {
+                result->hit_eos = true;
+                result->stats.decode_ms = elapsed_ms(decode_begin, Clock::now());
+                return true;
+            }
+        }
+        pending = decision.next_pending;
+    }
     result->stats.decode_ms = elapsed_ms(decode_begin, Clock::now());
     return true;
 }

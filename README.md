@@ -143,6 +143,21 @@ token。当前实现是精确 greedy 语义，包含 KV truncate、Qwen3.5 GDN �
 ./scripts/verify_speculative.sh
 ```
 
+DFlash / DFlare + Markov checkpoint 使用专用的 `--dflash-model` 路径。它会捕获
+Qwen3 目标模型的指定层残差流、并行构造 mask block、应用低秩 Markov 修正，再由
+目标模型精确验证：
+
+```bash
+.venv/bin/python tools/export_dflash_to_tiny.py \
+  --model <dflash-checkpoint-dir> --out draft.tqwen
+./build/runtime/tinyqwen --model qwen3_target.tqwen \
+  --dflash-model draft.tqwen --tokens-json prompt_tokens.json \
+  --speculative-tokens 2 --max-new-tokens 32
+```
+
+当前支持 FP16、greedy、单链和 CPU；算法、导出、Android 真机结果与性能限制见
+`docs/dflash.md`。
+
 ## 不需要真模型的验证
 
 用随机权重小模型打通并数值验证整条链路（loader → forward → KV cache →
@@ -193,6 +208,7 @@ tinyqwen --model <model.tqwen> [options]
 |---------------------------|--------|-----------------------------------------------------------------------------|
 | `--model PATH`            | 必填     | .tqwen 权重文件                                                                 |
 | `--draft-model PATH`      | 无      | 启用精确 greedy 投机解码；草稿模型须与目标模型共用 tokenizer                              |
+| `--dflash-model PATH`     | 无      | 启用 DFlare + Markov 块草稿；当前为 Qwen3 稠密目标、FP16、greedy、CPU                    |
 | `--speculative-tokens K`  | 4      | 每个 verify block 的草稿 token 数                                                  |
 | `--speculative-stats-out PATH` | 无 | 写接受率、拒绝/回退、目标调用数和耗时 JSON                                                |
 | `--draft-matvec-impl NAME` | 无 | 单独选择草稿模型 dtype 的 matvec kernel；目标/草稿同 dtype 时两边共享该选择                      |
@@ -264,6 +280,7 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | `docs/pytorch_alignment.md` | C++ 与 PyTorch reference 对齐流程                   |
 | `docs/quantization_guide.md`| 量化算法接入指南（新量化类型怎么加；INT4 / VQ2 布局；BiIP 旋转两条路径） |
 | `docs/android.md`           | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
+| `docs/dflash.md`          | DFlash / DFlare + Markov：导出、算法、CLI 与 Android 实测  |
 | `docs/project_structure.md` | 目录职责说明                                         |
 | `docs/known_limitations.md` | v1 已知限制                                        |
 | `kernels/README.md`         | kernels/ 导读：文件约定、已注册实现、_ref 的意义                |

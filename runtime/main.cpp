@@ -46,6 +46,7 @@
 
 #include "backend_cpu.h"
 #include "config.h"
+#include "dflash_model.h"
 #include "dispatch.h"
 #include "metal_prefill.h"
 #include "model_loader.h"
@@ -113,6 +114,7 @@ namespace {
     struct Args {
         std::string model;             // 模型文件路径（.tqwen），必选
         std::string draft_model;       // 草稿模型；非空时启用投机解码
+        std::string dflash_model;      // DFlash/DFlare 草稿 checkpoint
         int speculative_tokens = 4;    // 每个验证块的草稿 token 数
         std::string speculative_stats_out; // 投机统计 JSON
         std::string draft_matvec_impl; // 草稿模型独立 dtype 注册表的 kernel
@@ -152,6 +154,7 @@ namespace {
         std::fprintf(stderr,
                      "usage: %s --model <model.tqwen> [options]\n"
                      "  --draft-model PATH      enable exact greedy speculative decoding\n"
+                     "  --dflash-model PATH     enable DFlare + Markov block decoding\n"
                      "  --speculative-tokens K draft tokens per verify block (default 4)\n"
                      "  --speculative-stats-out PATH\n"
                      "                          write acceptance/rollback/timing JSON\n"
@@ -214,6 +217,7 @@ namespace {
             };
             if (a == "--model") out->model = value("--model");
             else if (a == "--draft-model") out->draft_model = value("--draft-model");
+            else if (a == "--dflash-model") out->dflash_model = value("--dflash-model");
             else if (a == "--speculative-tokens") out->speculative_tokens = std::atoi(value("--speculative-tokens").c_str());
             else if (a == "--speculative-stats-out") out->speculative_stats_out = value("--speculative-stats-out");
             else if (a == "--draft-matvec-impl") out->draft_matvec_impl = value("--draft-matvec-impl");
@@ -259,10 +263,14 @@ namespace {
             std::fprintf(stderr, "error: --model is required\n");
             return false;
         }
-        if (out->draft_model.empty() &&
+        if (out->draft_model.empty() && out->dflash_model.empty() &&
             (!out->speculative_stats_out.empty() || !out->draft_matvec_impl.empty())) {
             std::fprintf(stderr,
-                         "error: speculative draft options require --draft-model\n");
+                         "error: speculative options require --draft-model or --dflash-model\n");
+            return false;
+        }
+        if (!out->draft_model.empty() && !out->dflash_model.empty()) {
+            std::fprintf(stderr, "error: choose only one of --draft-model / --dflash-model\n");
             return false;
         }
         // 三种输入模式必须且只能提供一个
@@ -285,6 +293,23 @@ namespace {
                 std::fprintf(stderr,
                              "error: --draft-model currently cannot be combined with batch/PPL/"
                              "top-k/logit dump/profile/CUDA decode engine\n");
+                return false;
+            }
+        }
+        if (!out->dflash_model.empty()) {
+            if (!out->draft_matvec_impl.empty()) {
+                std::fprintf(stderr,
+                             "error: --draft-matvec-impl applies only to --draft-model\n");
+                return false;
+            }
+            if (out->speculative_tokens < 2) {
+                std::fprintf(stderr, "error: DFlash --speculative-tokens must be >= 2\n");
+                return false;
+            }
+            if (has_batch || out->ppl || out->topk > 0 || !out->dump_logits.empty() ||
+                !out->profile_out.empty() || !out->engine.empty() || out->backend == "cuda") {
+                std::fprintf(stderr,
+                             "error: --dflash-model requires single-prompt CPU inference\n");
                 return false;
             }
         }
@@ -449,6 +474,15 @@ int main(int argc, char **argv) {
             }
             need += draft_need;
         }
+        if (!args.dflash_model.empty()) {
+            uint64_t draft_need = 0;
+            if (!tinyqwen::ModelFile::estimate_resident_bytes(args.dflash_model, false,
+                                                               &draft_need, &err)) {
+                std::fprintf(stderr, "error: DFlash model: %s\n", err.c_str());
+                return 1;
+            }
+            need += draft_need;
+        }
         const uint64_t avail = available_memory_bytes();
         const uint64_t budget = avail ? avail - avail / 10 : 0;  // 可用 × 90%
         if (budget && need > budget) {
@@ -510,6 +544,15 @@ int main(int argc, char **argv) {
         }
         std::fprintf(stderr, "[init] speculative draft: %s (K=%d)\n",
                      args.draft_model.c_str(), args.speculative_tokens);
+    }
+    tinyqwen::ModelFile dflash_file;
+    if (!args.dflash_model.empty()) {
+        if (!dflash_file.load(args.dflash_model, &err, false)) {
+            std::fprintf(stderr, "error: DFlash model: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "[init] DFlash draft: %s (block=%d)\n",
+                     args.dflash_model.c_str(), args.speculative_tokens);
     }
     if (args.verbose) file.print_summary();
     if (file.offloaded_count() > 0) {
@@ -707,6 +750,20 @@ int main(int argc, char **argv) {
                                          tinyqwen::create_cpu_backend(), args.kv_fp16)) {
             std::fprintf(stderr, "error: draft model: %s\n", err.c_str());
             return 1;
+        }
+    }
+    std::unique_ptr<tinyqwen::DFlashModel> dflash_model;
+    if (!args.dflash_model.empty()) {
+        if (!tinyqwen::DFlashModel::create(dflash_file, args.max_seq_len, *model,
+                                           &err, &dflash_model)) {
+            std::fprintf(stderr, "error: DFlash model: %s\n", err.c_str());
+            return 1;
+        }
+        if (args.speculative_tokens > dflash_model->block_size()) {
+            std::fprintf(stderr,
+                         "error: --speculative-tokens %d exceeds DFlash block size %d\n",
+                         args.speculative_tokens, dflash_model->block_size());
+            return 2;
         }
     }
     if (file.config().is_moe()) {
@@ -1079,15 +1136,19 @@ int main(int argc, char **argv) {
     }
 
     // ---- 精确 greedy 投机解码 ----
-    if (draft_model) {
+    if (draft_model || dflash_model) {
         tinyqwen::SpeculativeConfig spec_cfg;
         spec_cfg.max_new_tokens = args.max_new_tokens;
         spec_cfg.draft_tokens = args.speculative_tokens;
         spec_cfg.eos_token_id = args.eos;
         tinyqwen::SpeculativeResult spec;
         std::string serr;
-        if (!tinyqwen::speculative_generate(*model, *draft_model, metal_engine,
-                                            tokens, spec_cfg, &spec, &serr)) {
+        const bool ok = dflash_model
+            ? tinyqwen::dflash_speculative_generate(*model, *dflash_model, tokens,
+                                                     spec_cfg, &spec, &serr)
+            : tinyqwen::speculative_generate(*model, *draft_model, metal_engine,
+                                              tokens, spec_cfg, &spec, &serr);
+        if (!ok) {
             std::fprintf(stderr, "error: speculative decoding failed: %s\n", serr.c_str());
             if (metal_engine) tinyqwen::metal_prefill_destroy(metal_engine);
             return 1;
@@ -1153,6 +1214,8 @@ int main(int argc, char **argv) {
     }
 
     // ---- prefill 阶段 ----
+    using InferenceClock = std::chrono::steady_clock;
+    const auto prefill_wall_begin = InferenceClock::now();
     int next = 0;
     tinyqwen::TopKResult topk;
     const size_t vocab = file.config().vocab_size;
@@ -1220,9 +1283,11 @@ int main(int argc, char **argv) {
         dump(model->last_logits());
     }
     std::fprintf(stderr, "[prefill] %zu tokens done\n", tokens.size());
+    const auto prefill_wall_end = InferenceClock::now();
     if (args.topk > 0) print_topk(topk);
 
     // ---- decode 阶段 ----
+    const auto decode_wall_begin = InferenceClock::now();
     std::vector<int> generated;
     for (int step = 0; step < args.max_new_tokens; ++step) {
         generated.push_back(next);
@@ -1244,6 +1309,13 @@ int main(int argc, char **argv) {
     std::printf("generated_ids:");
     for (int id: generated) std::printf(" %d", id);
     std::printf("\n");
+    const auto decode_wall_end = InferenceClock::now();
+    const double prefill_wall_ms =
+        std::chrono::duration<double, std::milli>(prefill_wall_end - prefill_wall_begin).count();
+    const double decode_wall_ms =
+        std::chrono::duration<double, std::milli>(decode_wall_end - decode_wall_begin).count();
+    std::fprintf(stderr, "[timing] prefill=%.2f ms decode=%.2f ms\n",
+                 prefill_wall_ms, decode_wall_ms);
 
     profiler.set_counts(tokens.size(), generated.size());
 

@@ -61,6 +61,26 @@
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
+### dflash-qwen3-0.6b-markov（2026-09-14，Android 正确性与首轮性能）
+
+- **是什么**：接入 DFlash 专用 FP16 exporter、DFlare 目标层融合、3 层非因果块草稿、
+  rank-128 Markov chain 修正、目标隐藏层捕获和精确 greedy verify/rollback。
+- **模型**：Qwen3-0.6B FP16 target + `qwen3-0.6b-block8-9tli-ab-markov`
+  `epoch_2_step_18152`，目标层 `0,3,...,24`，最大 block=8。
+- **PyTorch 对齐**：中文提示首块在相同动态块长 3 下，原 checkpoint 与 C++ 草稿
+  均给出 `108386,13`；证明块长相关的非因果 noise attention 和 Markov 链语义一致。
+- **greedy 正确性**：PLK110 上普通解码和 DFlash 的 16 个输出 token 逐位相同。
+- **接受行为**：43-token 英文代码提示，block=2 接受 6/8（75%），target call
+  15→9；block=8 接受 10/32（31.2%），5 个 block 生成 16 token，平均 3.2 token/block。
+- **性能结论（负结果）**：去掉 DFlash attention/norm 热路径临时分配后，较干净轮
+  普通 decode 412–422 ms，block=2 为 507–555 ms（慢约 20%–23%），block=8
+  为 1040 ms。后台污染会把普通轮放大到 1.2–1.3 秒，不能拿污染轮宣称加速。
+  调用次数下降，但当前可归因延迟没有下降。
+- **根因**：Android FP16 matmul 仍回退为 N 次 matvec，块验证没有批量收益；草稿的
+  共享 lm_head 与 Markov W2 也逐位置扫权重。下一刀是 FP16 batched GEMM / batched
+  lm_head，完成前不能外推论文服务器 GPU speedup。
+- **复现与完整口径**：见 `docs/dflash.md`。
+
 ---
 
 ## 详细记录
