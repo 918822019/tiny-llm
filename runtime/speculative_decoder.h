@@ -14,6 +14,10 @@ namespace tinyqwen {
         int max_new_tokens = 16;
         int draft_tokens = 4;
         int eos_token_id = -1;
+        // EAGLE3 normally verifies root + proposals in one batched target pass.
+        // Disable only for causal performance ablations: the same tokens are
+        // verified one at a time while preserving exact greedy semantics.
+        bool batch_target_verify = true;
     };
 
     struct SpeculativeStats {

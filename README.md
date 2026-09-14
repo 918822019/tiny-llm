@@ -182,7 +182,9 @@ greedy proposal chain，并在拒绝后用已确认的 target hidden 重建草�
 EAGLE3 的 `--speculative-tokens` 是包含 pending root 的验证块宽度，所以宽度 2/4
 分别提出最多 1/3 个 token。当前 CPU 路径完整可用；Android `--backend vulkan`
 只把 target 放到通用逐算子 Vulkan 后端，drafter 仍在 CPU。转换格式、状态语义、
-原始权重对齐和 PLK110 实测见 `docs/eagle3.md`。
+原始权重对齐和 PLK110 实测见 `docs/eagle3.md`。需要区分投机调度与批量 token tile
+贡献时，可用诊断参数 `--no-eagle3-batch-verify` 和
+`scripts/bench_eagle3_ablation_android.sh`；该参数不是部署推荐配置。
 
 ## 不需要真模型的验证
 

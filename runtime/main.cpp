@@ -173,6 +173,7 @@ namespace {
         std::string eagle3_model;      // EAGLE3 target-feature 草稿 checkpoint
         int speculative_tokens = 4;    // AR: proposal 数；DFlash/EAGLE3: 含 root 的块宽
         std::string speculative_stats_out; // 投机统计 JSON
+        bool no_eagle3_batch_verify = false; // EAGLE3 逐 token 验证，仅用于消融
         std::string draft_matvec_impl; // 草稿模型独立 dtype 注册表的 kernel
         std::string tokens_csv;        // CSV 格式 token 列表（如 "1,2,3"）
         std::string tokens_json;       // JSON 格式 token 文件
@@ -216,6 +217,9 @@ namespace {
                      "                          width including pending root (default 4)\n"
                      "  --speculative-stats-out PATH\n"
                      "                          write acceptance/rollback/timing JSON\n"
+                     "  --no-eagle3-batch-verify\n"
+                     "                          verify EAGLE3 target inputs one by one\n"
+                     "                          (correctness/performance ablation only)\n"
                      "  --draft-matvec-impl NAME\n"
                      "                          matvec kernel for the draft model dtype\n"
                      "  --tokens CSV            comma separated token ids\n"
@@ -279,6 +283,7 @@ namespace {
             else if (a == "--eagle3-model") out->eagle3_model = value("--eagle3-model");
             else if (a == "--speculative-tokens") out->speculative_tokens = std::atoi(value("--speculative-tokens").c_str());
             else if (a == "--speculative-stats-out") out->speculative_stats_out = value("--speculative-stats-out");
+            else if (a == "--no-eagle3-batch-verify") out->no_eagle3_batch_verify = true;
             else if (a == "--draft-matvec-impl") out->draft_matvec_impl = value("--draft-matvec-impl");
             else if (a == "--tokens") out->tokens_csv = value("--tokens");
             else if (a == "--tokens-json") out->tokens_json = value("--tokens-json");
@@ -324,7 +329,8 @@ namespace {
         }
         if (out->draft_model.empty() && out->dflash_model.empty() &&
             out->eagle3_model.empty() &&
-            (!out->speculative_stats_out.empty() || !out->draft_matvec_impl.empty())) {
+            (!out->speculative_stats_out.empty() || !out->draft_matvec_impl.empty() ||
+             out->no_eagle3_batch_verify)) {
             std::fprintf(stderr,
                          "error: speculative options require a draft model option\n");
             return false;
@@ -391,6 +397,11 @@ namespace {
                              "error: --eagle3-model requires single-prompt CPU/Vulkan inference\n");
                 return false;
             }
+        }
+        if (out->no_eagle3_batch_verify && out->eagle3_model.empty()) {
+            std::fprintf(stderr,
+                         "error: --no-eagle3-batch-verify requires --eagle3-model\n");
+            return false;
         }
         if (has_batch) {
             if (out->topk > 0 || !out->dump_logits.empty() || out->verbose ||
@@ -1325,6 +1336,7 @@ int main(int argc, char **argv) {
         spec_cfg.max_new_tokens = args.max_new_tokens;
         spec_cfg.draft_tokens = args.speculative_tokens;
         spec_cfg.eos_token_id = args.eos;
+        spec_cfg.batch_target_verify = !args.no_eagle3_batch_verify;
         tinyqwen::SpeculativeResult spec;
         std::string serr;
         bool ok = false;
@@ -1376,6 +1388,7 @@ int main(int argc, char **argv) {
                          "  \"generated_tokens\": %zu,\n"
                          "  \"hit_eos\": %s,\n"
                          "  \"draft_tokens_per_block\": %d,\n"
+                         "  \"target_verify_mode\": \"%s\",\n"
                          "  \"blocks\": %d,\n"
                          "  \"draft_proposed\": %d,\n"
                          "  \"draft_accepted\": %d,\n"
@@ -1393,7 +1406,9 @@ int main(int argc, char **argv) {
                          "  \"decode_ms\": %.6f\n"
                          "}\n",
                          spec.generated_ids.size(), spec.hit_eos ? "true" : "false",
-                         args.speculative_tokens, s.blocks, s.draft_proposed,
+                         args.speculative_tokens,
+                         args.no_eagle3_batch_verify ? "sequential" : "batched",
+                         s.blocks, s.draft_proposed,
                          s.draft_accepted, s.acceptance_rate(), s.corrections,
                          s.bonus_tokens, s.rollbacks, s.target_verify_calls,
                          s.target_input_tokens, s.draft_forward_calls,

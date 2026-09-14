@@ -68,6 +68,57 @@ namespace {
         return target_forward(model, metal, verified_inputs.data(), keep,
                               &replay_next, err);
     }
+
+    bool eagle3_target_verify(QwenModel &target,
+                              const std::vector<int> &inputs,
+                              const std::vector<int> &capture_layer_ids,
+                              size_t capture_row, bool batch,
+                              std::vector<int> *target_after,
+                              std::vector<float> *verified_hidden,
+                              int *forward_calls, std::string *err) {
+        if (!target_after || !verified_hidden || !forward_calls || inputs.empty()) {
+            if (err) *err = "invalid EAGLE3 target verification arguments";
+            return false;
+        }
+        target_after->clear();
+        verified_hidden->clear();
+        *forward_calls = 0;
+
+        if (batch) {
+            if (target.forward_verify_capture(inputs.data(),
+                                              static_cast<int>(inputs.size()),
+                                              capture_layer_ids, target_after,
+                                              verified_hidden) < 0) {
+                if (err) *err = "EAGLE3 batched target verification/capture failed";
+                return false;
+            }
+            *forward_calls = 1;
+        } else {
+            target_after->reserve(inputs.size());
+            verified_hidden->reserve(inputs.size() * capture_row);
+            for (int token : inputs) {
+                std::vector<int> step_after;
+                std::vector<float> step_hidden;
+                if (target.forward_verify_capture(&token, 1, capture_layer_ids,
+                                                  &step_after, &step_hidden) < 0 ||
+                    step_after.size() != 1 || step_hidden.size() != capture_row) {
+                    if (err) *err = "EAGLE3 sequential target verification/capture failed";
+                    return false;
+                }
+                target_after->push_back(step_after[0]);
+                verified_hidden->insert(verified_hidden->end(),
+                                        step_hidden.begin(), step_hidden.end());
+                ++*forward_calls;
+            }
+        }
+
+        if (target_after->size() != inputs.size() ||
+            verified_hidden->size() != inputs.size() * capture_row) {
+            if (err) *err = "EAGLE3 target verification returned an invalid shape";
+            return false;
+        }
+        return true;
+    }
 } // namespace
 
 bool decide_speculative(const std::vector<int> &draft,
@@ -516,18 +567,16 @@ bool eagle3_speculative_generate(QwenModel &target, Eagle3Model &draft,
         const QwenModel::StateCheckpoint target_checkpoint = target.checkpoint();
         std::vector<int> target_after;
         std::vector<float> verified_hidden;
+        int target_forward_calls = 0;
         const Clock::time_point target_begin = Clock::now();
-        if (target.forward_verify_capture(inputs.data(), static_cast<int>(inputs.size()),
-                                          draft.target_layer_ids(), &target_after,
-                                          &verified_hidden) < 0 ||
-            target_after.size() != inputs.size() ||
-            verified_hidden.size() != inputs.size() * capture_row) {
-            if (err) *err = "EAGLE3 target verification/capture failed";
+        if (!eagle3_target_verify(target, inputs, draft.target_layer_ids(), capture_row,
+                                  config.batch_target_verify, &target_after,
+                                  &verified_hidden, &target_forward_calls, err)) {
             return false;
         }
         result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
         ++result->stats.blocks;
-        ++result->stats.target_verify_calls;
+        result->stats.target_verify_calls += target_forward_calls;
         result->stats.target_input_tokens += static_cast<int>(inputs.size());
 
         SpeculativeDecision decision;

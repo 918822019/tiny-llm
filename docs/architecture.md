@@ -177,6 +177,9 @@ drafter 都走 CPU；追加 `--backend vulkan` 时只有 target 的 FP16 matrix 
 通用逐算子 Vulkan，EAGLE3 仍显式创建 CPUBackend。该混合模式用于数值/功能 A/B；
 若要成为性能后端，需要把 target feature capture、EAGLE3 recurrent layer、32K
 lm_head、accept/rollback 串成少量 command buffer，并让两侧权重/KV 常驻同一 device。
+EAGLE3 默认把 root 与 proposals 一次交给 target，从而让 FP16 matmul 的 token 维 tile
+复用权重；诊断参数 `--no-eagle3-batch-verify` 会改为逐 token 调用，但保持相同输入、
+capture、接受决策与回滚语义，用于隔离这种批量收益。
 
 ## 数据流
 

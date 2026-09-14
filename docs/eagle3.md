@@ -142,6 +142,24 @@ Host 上可直接运行同样的自动门禁：
 Vulkan 后端；EAGLE3 drafter 仍明确使用 CPU。该路径每个矩阵算子都会 submit + wait，
 主要用于功能/正确性 A/B，不代表已经完成 EAGLE3 整图 GPU 后端。
 
+`--no-eagle3-batch-verify` 是专门用于因果消融的诊断开关。默认路径把
+`[pending, proposals...]` 一次交给 target；打开该开关后，保持 proposal、接受/拒绝、
+rollback 和输出语义不变，但让 target 每次只验证一个 token。这样可以在相同接受率和
+相同 target 输入数下，直接测出多 token matrix tile、权重复用与提交合并的贡献。该模式
+只用于测量，不是推荐部署配置。
+
+Android 上的四路径消融可以自动运行：
+
+```bash
+./scripts/bench_eagle3_ablation_android.sh \
+  model_qwen3_06b_f16_ctx2048.tqwen \
+  eagle3_qwen3_06b_specforge_f16.tqwen \
+  prompt.json 3 64 2
+```
+
+脚本先预热，再正反序交错执行三轮，比较全部 `generated_ids`，并保存每轮输出、统计和
+汇总 JSON 到 `artifacts/eagle3-ablation-*`。
+
 ## 5. PLK110 真机结果（2026-09-14）
 
 设备：OnePlus PLK110 / Android 16 / Adreno 840。target 与 draft 权重均为 FP16，
@@ -188,6 +206,48 @@ target 和 SpecForge/EAGLE3 方程独立复算，前几块第一 proposal 与 C+
 例如首块 root 为 `151667` 时两边都提案 `151668`，而 target 选择 `198`。这更符合
 checkpoint 训练域/单样本差异，而不是运行时把层号、拼接顺序或 token shift 写错。
 
+### 5.3 投机调度与 token tile 因果消融（2026-09-15）
+
+greedy 无法预知未来 token，因此“关闭投机、但仍让多 token tile 满载”在算法上不存在：
+没有 drafter 提供候选，就没有第二个 token 可以与当前 token 一起验证。这里采用四路径
+阶梯，而不伪造一个不存在的完全正交 2×2：
+
+1. CPU greedy：手机当前实用基线；
+2. Vulkan greedy：同一通用 Vulkan target 的单 token 基线；
+3. Vulkan EAGLE3 sequential：开启同一 drafter，但用
+   `--no-eagle3-batch-verify` 逐 token 验证；
+4. Vulkan EAGLE3 batched：开启 drafter 与默认的两 token 批量 tile。
+
+测试仍使用 41-token 英文 prompt、强制生成 64 token、width=2、FP16 target/draft/KV、
+6 个 CPU worker。每条路径预热一次后正反序交错三轮。三轮中所有四条路径的 64 个
+`generated_ids` 完全相同；两种 EAGLE3 路径也都有相同的 22/41（53.66%）接受率和
+82 个 target 输入，因此性能差异不是 drafter 质量或接受决策变化造成的。
+
+| 路径 | decode 三轮（ms） | 中位（ms） | target 调用 / 输入 | Vulkan dispatch（含 prefill） |
+|---|---:|---:|---:|---:|
+| CPU greedy | 2105.50 / 2390.29 / 2146.54 | 2146.54 | 63 / 63 | — |
+| Vulkan greedy | 11496.85 / 11647.11 / 11771.06 | 11647.11 | 63 / 63 | 13524 |
+| Vulkan EAGLE3 sequential | 14755.52 / 15226.92 / 14831.30 | 14831.30 | 82 / 82 | 17248 |
+| Vulkan EAGLE3 batched | 8128.70 / 8379.11 / 8372.49 | 8372.49 | 41 / 82 | 9253 |
+
+按同轮比值取中位数，归因结果是：
+
+- **只有投机、没有批量验证：0.779x**。相对 Vulkan greedy 反而慢 28.3%；drafter 与
+  多验证的 19 个 target 输入都是净开销。
+- **投机场景内打开批量 token tile：1.815x**。输入仍是 82 个，但 target 调用
+  82→41、dispatch 17248→9253；target verify 三轮中位约 14654.03→8106.90 ms。
+- **完整投机路径相对 Vulkan greedy：1.406x**，即 decode 延迟约下降 28.9%。这与
+  llama.cpp 同机测得的约 1.41x 一致。
+- **通用 Vulkan 相对 CPU 仍只有 0.183x**。绝对值比前一轮 6.28 秒的 Vulkan 测量更慢，
+  且 queue wait 占绝大多数时间；所以这里只使用同轮配对比值做归因，不能把 8.37 秒
+  当作稳定的 GPU 性能基线，更不能说它已经胜过手机 CPU。
+
+因此，1.4x 不能归为“drafter 单独带来的加速”，也不能说成“不需要投机、tile 自己就能
+加速”。准确说法是：**drafter 的有效预测提供了可并行验证的未来 token，投机调度把
+63 个串行 target step 变成 41 个验证块，而 token tile 才把每块的两个输入合并执行；
+二者是乘法交互。**在当前实现上，禁用 tile 后投机是负收益，所以执行层面的决定性收益
+来自批量/tile；但没有投机提案，tile 也没有第二个 token 可用。
+
 ## 6. 如何解读“是否符合论文预期”
 
 当前结果分成三层：
@@ -201,6 +261,10 @@ checkpoint 训练域/单样本差异，而不是运行时把层号、拼接顺�
    小且 ARM FP16 matvec 已优化；EAGLE3 每个确认 token 仍要支付一层 recurrent network
    和 32K lm_head。服务器结果使用 SGLang、BF16 GPU、CUDA graph、批量 benchmark 与
    多种数据集，不能把其推荐宽度 4 直接套到手机 CPU。
+4. **Vulkan 内部约 1.4x 是投机与 tile 的交互**：逐 token 消融证明 drafter 单独运行
+   是负收益，而批量验证把相同的 82 个 target 输入从 82 次调用合并为 41 次，才兑现
+   1.406x。它不属于 TinyLLM tile 或 drafter 任一方可独占的收益，更不改变通用 Vulkan
+   仍明显慢于 CPU 的事实。
 
 当前手机建议使用宽度 2 做实验；正式决定是否启用前，应在目标业务数据集上报告
 `generated_ids` 一致率、`draft_ms`、`target_verify_ms`、decode 和接受长度分布。下一步

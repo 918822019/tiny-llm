@@ -44,16 +44,33 @@ fi
   --speculative-tokens "$VERIFY_WIDTH" \
   --speculative-stats-out "$TMP_ROOT/eagle3.json" \
   >"$TMP_ROOT/eagle3.out" 2>"$TMP_ROOT/eagle3.err"
+"$BIN" "${COMMON[@]}" --eagle3-model "$EAGLE_MODEL" \
+  --speculative-tokens "$VERIFY_WIDTH" --no-eagle3-batch-verify \
+  --speculative-stats-out "$TMP_ROOT/eagle3_sequential.json" \
+  >"$TMP_ROOT/eagle3_sequential.out" 2>"$TMP_ROOT/eagle3_sequential.err"
 
 greedy_ids="$(grep '^generated_ids:' "$TMP_ROOT/greedy.out")"
 eagle3_ids="$(grep '^generated_ids:' "$TMP_ROOT/eagle3.out")"
-if [[ -z "$greedy_ids" || "$greedy_ids" != "$eagle3_ids" ]]; then
+sequential_ids="$(grep '^generated_ids:' "$TMP_ROOT/eagle3_sequential.out")"
+if [[ -z "$greedy_ids" || "$greedy_ids" != "$eagle3_ids" ||
+      "$greedy_ids" != "$sequential_ids" ]]; then
   echo "EAGLE3 exact-greedy output: FAIL" >&2
   diff -u "$TMP_ROOT/greedy.out" "$TMP_ROOT/eagle3.out" >&2 || true
+  diff -u "$TMP_ROOT/greedy.out" "$TMP_ROOT/eagle3_sequential.out" >&2 || true
   exit 1
 fi
 grep -q '"draft_proposed": [1-9]' "$TMP_ROOT/eagle3.json"
+grep -q '"target_verify_mode": "batched"' "$TMP_ROOT/eagle3.json"
+grep -q '"target_verify_mode": "sequential"' "$TMP_ROOT/eagle3_sequential.json"
+batch_calls="$(sed -n 's/.*"target_verify_calls": \([0-9][0-9]*\).*/\1/p' "$TMP_ROOT/eagle3.json")"
+sequential_calls="$(sed -n 's/.*"target_verify_calls": \([0-9][0-9]*\).*/\1/p' "$TMP_ROOT/eagle3_sequential.json")"
+if [[ -z "$batch_calls" || -z "$sequential_calls" ||
+      "$sequential_calls" -le "$batch_calls" ]]; then
+  echo "EAGLE3 verifier call-count ablation: FAIL" >&2
+  exit 1
+fi
 
-echo "EAGLE3 exact-greedy output: PASS"
+echo "EAGLE3 batched/sequential exact-greedy output: PASS"
 grep '^\[timing\]' "$TMP_ROOT/greedy.err"
 grep '^\[speculative\]' "$TMP_ROOT/eagle3.err"
+grep '^\[speculative\]' "$TMP_ROOT/eagle3_sequential.err"
