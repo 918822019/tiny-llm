@@ -304,6 +304,10 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
         if (err) *err = "DFlash target prefill/capture failed";
         return false;
     }
+    if (draft.using_vulkan() && !draft.initialize_vulkan_target(err)) {
+        if (err && err->empty()) *err = "DFlash Vulkan target KV import failed";
+        return false;
+    }
     result->stats.prefill_ms = elapsed_ms(prefill_begin, Clock::now());
     int ctx_tokens = static_cast<int>(prompt.size());
 
@@ -320,8 +324,14 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
         if (remaining == 1) {
             std::vector<int> after;
             const Clock::time_point target_begin = Clock::now();
-            if (target.forward_verify(&pending, 1, &after) < 0 || after.size() != 1) {
-                if (err) *err = "DFlash target tail step failed";
+            bool target_ok = false;
+            if (draft.using_vulkan()) {
+                target_ok = draft.verify_vulkan_target(&pending, 1, &after, nullptr, err);
+            } else {
+                target_ok = target.forward_verify(&pending, 1, &after) >= 0 && after.size() == 1;
+            }
+            if (!target_ok || after.size() != 1) {
+                if (err && err->empty()) *err = "DFlash target tail step failed";
                 return false;
             }
             result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
@@ -345,14 +355,24 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
         inputs.reserve(verify_size);
         inputs.push_back(pending);
         inputs.insert(inputs.end(), proposals.begin(), proposals.end());
-        const QwenModel::StateCheckpoint checkpoint = target.checkpoint();
+        const int checkpoint_seq = draft.using_vulkan()
+            ? draft.vulkan_target_seq_len()
+            : target.checkpoint().seq_len;
         std::vector<int> target_after;
         std::vector<float> verified_hidden;
         const Clock::time_point target_begin = Clock::now();
-        if (target.forward_verify_capture(inputs.data(), static_cast<int>(inputs.size()),
-                                          draft.target_layer_ids(), &target_after,
-                                          &verified_hidden) < 0) {
-            if (err) *err = "DFlash target verification/capture failed";
+        bool target_ok = false;
+        if (draft.using_vulkan()) {
+            target_ok = draft.verify_vulkan_target(inputs.data(), static_cast<int>(inputs.size()),
+                                                   &target_after, &verified_hidden, err);
+        } else {
+            target_ok = target.forward_verify_capture(inputs.data(),
+                                                      static_cast<int>(inputs.size()),
+                                                      draft.target_layer_ids(), &target_after,
+                                                      &verified_hidden) >= 0;
+        }
+        if (!target_ok) {
+            if (err && err->empty()) *err = "DFlash target verification/capture failed";
             return false;
         }
         result->stats.target_verify_ms += elapsed_ms(target_begin, Clock::now());
@@ -371,7 +391,11 @@ bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
         }
         result->stats.draft_accepted += decision.accepted;
         const int keep = 1 + decision.accepted;
-        if (!target.truncate(checkpoint.seq_len + keep, err)) return false;
+        if (draft.using_vulkan()) {
+            if (!draft.truncate_vulkan_target(checkpoint_seq + keep, err)) return false;
+        } else if (!target.truncate(checkpoint_seq + keep, err)) {
+            return false;
+        }
         if (decision.all_accepted) ++result->stats.bonus_tokens;
         else {
             ++result->stats.corrections;

@@ -40,6 +40,8 @@
 #include "profiler.h"
 
 namespace tinyqwen {
+    class DFlashVulkanEngine;
+
     // -------------------------------------------------------------------------
     // TopKResult: top-k 结果
     //
@@ -329,6 +331,11 @@ namespace tinyqwen {
         const float *last_logits() const { return logits_.data(); }
 
     private:
+        // Android DFlash 在同一个 Vulkan device 内执行 target verification。
+        // 该整段执行器需要一次性上传稠密 Qwen3 权重，并把 CPU prefill 后的
+        // KV 前缀转成 GPU 的 token-major 布局；不向通用后端暴露这些内部细节。
+        friend class DFlashVulkanEngine;
+
         // 默认构造函数，通过 create() 工厂方法创建实例
         QwenModel() = default;
 

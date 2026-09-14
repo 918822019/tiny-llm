@@ -40,6 +40,7 @@ namespace tinyqwen {
     constexpr uint32_t kElementResidualAdd = 1;
     constexpr uint32_t kElementSwiGlu = 2;
     constexpr uint32_t kElementStoreKv = 3;
+    constexpr uint32_t kElementCapture = 4;
     constexpr uint32_t kElementThreads = 256;
     constexpr uint32_t kMatmulRowsPerGroup = 8;
     constexpr uint32_t kMatmulMaxTokens = 8;
@@ -160,7 +161,7 @@ namespace tinyqwen {
       uint32_t kv_heads;
       uint32_t head_dim;
       float attention_scale;
-      uint32_t pad0;
+      uint32_t causal;
       uint32_t pad1;
       uint32_t pad2;
     };
@@ -203,6 +204,20 @@ namespace tinyqwen {
       std::vector<float> fusion_alpha;
     };
 
+    struct HostTargetLayer {
+      const float *input_norm = nullptr;
+      const uint16_t *q_proj = nullptr;
+      const uint16_t *k_proj = nullptr;
+      const uint16_t *v_proj = nullptr;
+      const float *q_norm = nullptr;
+      const float *k_norm = nullptr;
+      const uint16_t *o_proj = nullptr;
+      const float *post_norm = nullptr;
+      const uint16_t *gate = nullptr;
+      const uint16_t *up = nullptr;
+      const uint16_t *down = nullptr;
+    };
+
     struct HostConfig {
       QwenModel *target = nullptr;
       int layers = 0;
@@ -227,6 +242,19 @@ namespace tinyqwen {
       const uint16_t *markov_w2 = nullptr;
       const uint16_t *lm_head = nullptr;
       std::vector<HostLayer> layer;
+
+      int target_layers = 0;
+      int target_intermediate = 0;
+      int target_query_dim = 0;
+      int target_kv_dim = 0;
+      int target_query_heads = 0;
+      int target_kv_heads = 0;
+      int target_head_dim = 0;
+      float target_rms_epsilon = 0.0f;
+      float target_rope_theta = 0.0f;
+      const float *target_final_norm = nullptr;
+      std::vector<int> target_layer_ids;
+      std::vector<HostTargetLayer> target_layer;
     };
 
     struct LayerGpu {
@@ -246,6 +274,20 @@ namespace tinyqwen {
       Buffer fusion_alpha;
     };
 
+    struct TargetLayerGpu {
+      Buffer input_norm;
+      Buffer q_proj;
+      Buffer k_proj;
+      Buffer v_proj;
+      Buffer q_norm;
+      Buffer k_norm;
+      Buffer o_proj;
+      Buffer post_norm;
+      Buffer gate;
+      Buffer up;
+      Buffer down;
+    };
+
   } // namespace
 
   struct DFlashVulkanEngine::Impl {
@@ -261,10 +303,12 @@ namespace tinyqwen {
         return false;
       trace = std::getenv("TINYQWEN_VULKAN_TRACE") != nullptr;
       std::fprintf(stderr,
-                   "[vulkan] DFlash weights resident: %.1f MB, cache %.1f MB, "
-                   "one submit/block\n",
+                   "[vulkan] DFlash + target weights resident: %.1f MB, cache %.1f MB, "
+                   "one submit/pass, shared lm_head\n",
                    static_cast<double>(weight_bytes) / 1048576.0,
-                   static_cast<double>(key_cache.size + value_cache.size) / 1048576.0);
+                   static_cast<double>(key_cache.size + value_cache.size +
+                                       target_key_cache.size + target_value_cache.size) /
+                       1048576.0);
       return true;
     }
 
@@ -621,6 +665,391 @@ namespace tinyqwen {
       return true;
     }
 
+    bool initialize_target_from_cpu(std::string *err) {
+      if (!cfg.target) {
+        if (err)
+          *err = "missing target model for Vulkan KV import";
+        return false;
+      }
+      const KvCache &source = cfg.target->kv_;
+      const int seq = source.seq_len();
+      if (seq <= 0 || seq > cfg.max_seq || source.n_layers() != cfg.target_layers ||
+          source.n_kv_heads() != cfg.target_kv_heads ||
+          source.head_dim() != cfg.target_head_dim ||
+          source.max_seq_len() != cfg.max_seq) {
+        if (err)
+          *err = "CPU target KV shape does not match Vulkan target cache";
+        return false;
+      }
+
+      auto *dst_k = static_cast<float *>(target_key_cache.mapped);
+      auto *dst_v = static_cast<float *>(target_value_cache.mapped);
+      const int source_max_seq = source.max_seq_len();
+      for (int layer = 0; layer < cfg.target_layers; ++layer) {
+        const float *source_k_f32 = source.use_fp16() ? nullptr : source.k(layer);
+        const float *source_v_f32 = source.use_fp16() ? nullptr : source.v(layer);
+        const uint16_t *source_k_f16 = source.use_fp16() ? source.k_f16(layer) : nullptr;
+        const uint16_t *source_v_f16 = source.use_fp16() ? source.v_f16(layer) : nullptr;
+        for (int position = 0; position < seq; ++position) {
+          for (int head = 0; head < cfg.target_kv_heads; ++head) {
+            const size_t src =
+                (static_cast<size_t>(head) * source_max_seq + position) * cfg.target_head_dim;
+            const size_t dst =
+                (static_cast<size_t>(layer) * cfg.max_seq + position) * cfg.target_kv_dim +
+                static_cast<size_t>(head) * cfg.target_head_dim;
+            for (int dim = 0; dim < cfg.target_head_dim; ++dim) {
+              dst_k[dst + dim] = source.use_fp16()
+                                      ? half_to_float(source_k_f16[src + dim])
+                                      : source_k_f32[src + dim];
+              dst_v[dst + dim] = source.use_fp16()
+                                      ? half_to_float(source_v_f16[src + dim])
+                                      : source_v_f32[src + dim];
+            }
+          }
+        }
+      }
+      if (!flush(target_key_cache, err) || !flush(target_value_cache, err))
+        return false;
+      target_seq = seq;
+      target_initialized = true;
+      if (trace) {
+        std::fprintf(stderr, "[vulkan-target] imported CPU prefill KV: seq=%d dtype=%s\n", seq,
+                     source.use_fp16() ? "fp16" : "fp32");
+      }
+      return true;
+    }
+
+    bool verify_target(const int *tokens, int n, std::vector<int> *all_next,
+                       std::vector<float> *captured_hidden_host, std::string *err) {
+      if (!target_initialized || !tokens || !all_next || n <= 0 || n > cfg.block_size ||
+          target_seq < 0 || target_seq + n > cfg.max_seq) {
+        if (err)
+          *err = "invalid Vulkan target verification dimensions or uninitialized KV";
+        return false;
+      }
+
+      const size_t hidden_count = static_cast<size_t>(n) * cfg.hidden;
+      auto *hidden_host = static_cast<float *>(hidden.mapped);
+      for (int token = 0; token < n; ++token) {
+        if (!cfg.target->copy_embedding(tokens[token],
+                                        hidden_host + static_cast<size_t>(token) * cfg.hidden)) {
+          if (err)
+            *err = "failed to read target embedding for Vulkan verification";
+          return false;
+        }
+      }
+      if (!flush(hidden, err))
+        return false;
+
+      commands_this_block = 0;
+      if (!vk_ok(vkResetDescriptorPool(device, descriptor_pool, 0), "vkResetDescriptorPool", err) ||
+          !vk_ok(vkResetCommandBuffer(command_buffer, 0), "vkResetCommandBuffer", err)) {
+        return false;
+      }
+      VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      if (!vk_ok(vkBeginCommandBuffer(command_buffer, &begin), "vkBeginCommandBuffer", err))
+        return false;
+
+      VkMemoryBarrier host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      host_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+      host_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &host_barrier, 0, nullptr, 0,
+                           nullptr);
+
+      for (int layer_index = 0; layer_index < cfg.target_layers; ++layer_index) {
+        TargetLayerGpu &weights = target_gpu_layers[static_cast<size_t>(layer_index)];
+        RmsPush input_norm{static_cast<uint32_t>(n),
+                           static_cast<uint32_t>(cfg.hidden),
+                           static_cast<uint32_t>(cfg.hidden),
+                           static_cast<uint32_t>(cfg.hidden),
+                           0,
+                           0,
+                           cfg.target_rms_epsilon,
+                           0};
+        if (!record(rmsnorm_pipeline, {{&hidden}, {&weights.input_norm}, {&normed}}, &input_norm,
+                    sizeof(input_norm), static_cast<uint32_t>(n), err) ||
+            !record_matmul(weights.q_proj, normed, query, cfg.target_query_dim, cfg.hidden, n, 0,
+                           0, err) ||
+            !record_matmul(weights.k_proj, normed, noise_key, cfg.target_kv_dim, cfg.hidden, n, 0,
+                           0, err) ||
+            !record_matmul(weights.v_proj, normed, noise_value, cfg.target_kv_dim, cfg.hidden, n, 0,
+                           0, err)) {
+          return false;
+        }
+
+        RmsPush query_norm{static_cast<uint32_t>(n * cfg.target_query_heads),
+                           static_cast<uint32_t>(cfg.target_head_dim),
+                           static_cast<uint32_t>(cfg.target_head_dim),
+                           static_cast<uint32_t>(cfg.target_head_dim),
+                           0,
+                           0,
+                           cfg.target_rms_epsilon,
+                           0};
+        RmsPush key_norm{static_cast<uint32_t>(n * cfg.target_kv_heads),
+                         static_cast<uint32_t>(cfg.target_head_dim),
+                         static_cast<uint32_t>(cfg.target_head_dim),
+                         static_cast<uint32_t>(cfg.target_head_dim),
+                         0,
+                         0,
+                         cfg.target_rms_epsilon,
+                         0};
+        if (!record(rmsnorm_pipeline, {{&query}, {&weights.q_norm}, {&query}}, &query_norm,
+                    sizeof(query_norm), static_cast<uint32_t>(n * cfg.target_query_heads), err) ||
+            !record(rmsnorm_pipeline, {{&noise_key}, {&weights.k_norm}, {&noise_key}}, &key_norm,
+                    sizeof(key_norm), static_cast<uint32_t>(n * cfg.target_kv_heads), err)) {
+          return false;
+        }
+
+        RopePush query_rope{static_cast<uint32_t>(cfg.target_query_heads),
+                            static_cast<uint32_t>(cfg.target_head_dim),
+                            static_cast<uint32_t>(n),
+                            static_cast<uint32_t>(target_seq),
+                            cfg.target_rope_theta,
+                            0,
+                            0,
+                            0};
+        RopePush key_rope{static_cast<uint32_t>(cfg.target_kv_heads),
+                          static_cast<uint32_t>(cfg.target_head_dim),
+                          static_cast<uint32_t>(n),
+                          static_cast<uint32_t>(target_seq),
+                          cfg.target_rope_theta,
+                          0,
+                          0,
+                          0};
+        if (!record(rope_pipeline, {{&query}}, &query_rope, sizeof(query_rope),
+                    ceil_div_u32(static_cast<uint64_t>(n) * cfg.target_query_heads *
+                                     (cfg.target_head_dim / 2),
+                                 256),
+                    err) ||
+            !record(rope_pipeline, {{&noise_key}}, &key_rope, sizeof(key_rope),
+                    ceil_div_u32(static_cast<uint64_t>(n) * cfg.target_kv_heads *
+                                     (cfg.target_head_dim / 2),
+                                 256),
+                    err)) {
+          return false;
+        }
+
+        ElementPush store{kElementStoreKv,
+                          static_cast<uint32_t>(n),
+                          static_cast<uint32_t>(cfg.target_kv_dim),
+                          static_cast<uint32_t>(layer_index),
+                          static_cast<uint32_t>(cfg.max_seq),
+                          static_cast<uint32_t>(target_seq),
+                          0,
+                          0};
+        if (!record(elementwise_pipeline,
+                    {{&noise_key}, {&noise_value}, {&target_key_cache}, {&target_value_cache}},
+                    &store, sizeof(store),
+                    ceil_div_u32(static_cast<uint64_t>(n) * cfg.target_kv_dim, kElementThreads),
+                    err)) {
+          return false;
+        }
+
+        AttentionPush attention_params{static_cast<uint32_t>(layer_index),
+                                       static_cast<uint32_t>(cfg.max_seq),
+                                       static_cast<uint32_t>(cfg.target_kv_dim),
+                                       static_cast<uint32_t>(target_seq),
+                                       static_cast<uint32_t>(n),
+                                       static_cast<uint32_t>(cfg.target_query_heads),
+                                       static_cast<uint32_t>(cfg.target_kv_heads),
+                                       static_cast<uint32_t>(cfg.target_head_dim),
+                                       1.0f / std::sqrt(static_cast<float>(cfg.target_head_dim)),
+                                       1,
+                                       0,
+                                       0};
+        if (!record(attention_pipeline,
+                    {{&query},
+                     {&noise_key},
+                     {&noise_value},
+                     {&target_key_cache},
+                     {&target_value_cache},
+                     {&attention}},
+                    &attention_params, sizeof(attention_params),
+                    static_cast<uint32_t>(n * cfg.target_query_heads), err) ||
+            !record_matmul(weights.o_proj, attention, projected, cfg.hidden,
+                           cfg.target_query_dim, n, 0, 0, err)) {
+          return false;
+        }
+
+        ElementPush add_attention{kElementResidualAdd,
+                                  static_cast<uint32_t>(hidden_count),
+                                  0,
+                                  0,
+                                  0,
+                                  0,
+                                  0,
+                                  0};
+        if (!record(elementwise_pipeline, {{&hidden}, {&projected}, {&dummy}, {&dummy}},
+                    &add_attention, sizeof(add_attention),
+                    ceil_div_u32(hidden_count, kElementThreads), err)) {
+          return false;
+        }
+
+        RmsPush post_norm{static_cast<uint32_t>(n),
+                          static_cast<uint32_t>(cfg.hidden),
+                          static_cast<uint32_t>(cfg.hidden),
+                          static_cast<uint32_t>(cfg.hidden),
+                          0,
+                          0,
+                          cfg.target_rms_epsilon,
+                          0};
+        if (!record(rmsnorm_pipeline, {{&hidden}, {&weights.post_norm}, {&normed}}, &post_norm,
+                    sizeof(post_norm), static_cast<uint32_t>(n), err) ||
+            !record_matmul(weights.gate, normed, gate, cfg.target_intermediate, cfg.hidden, n, 0,
+                           0, err) ||
+            !record_matmul(weights.up, normed, up, cfg.target_intermediate, cfg.hidden, n, 0, 0,
+                           err)) {
+          return false;
+        }
+
+        ElementPush swiglu{kElementSwiGlu,
+                           static_cast<uint32_t>(static_cast<size_t>(n) *
+                                                 cfg.target_intermediate),
+                           0,
+                           0,
+                           0,
+                           0,
+                           0,
+                           0};
+        if (!record(elementwise_pipeline, {{&gate}, {&up}, {&dummy}, {&dummy}}, &swiglu,
+                    sizeof(swiglu),
+                    ceil_div_u32(static_cast<uint64_t>(n) * cfg.target_intermediate,
+                                 kElementThreads),
+                    err) ||
+            !record_matmul(weights.down, gate, feed_forward, cfg.hidden,
+                           cfg.target_intermediate, n, 0, 0, err)) {
+          return false;
+        }
+
+        ElementPush add_ffn{kElementResidualAdd,
+                            static_cast<uint32_t>(hidden_count),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0};
+        if (!record(elementwise_pipeline, {{&hidden}, {&feed_forward}, {&dummy}, {&dummy}},
+                    &add_ffn, sizeof(add_ffn), ceil_div_u32(hidden_count, kElementThreads), err)) {
+          return false;
+        }
+
+        if (captured_hidden_host) {
+          const auto selected =
+              std::find(cfg.target_layer_ids.begin(), cfg.target_layer_ids.end(), layer_index);
+          if (selected != cfg.target_layer_ids.end()) {
+            const uint32_t slot =
+                static_cast<uint32_t>(selected - cfg.target_layer_ids.begin());
+            ElementPush capture{kElementCapture,
+                                static_cast<uint32_t>(n),
+                                static_cast<uint32_t>(cfg.hidden),
+                                slot,
+                                static_cast<uint32_t>(cfg.selected_layers),
+                                0,
+                                0,
+                                0};
+            if (!record(elementwise_pipeline,
+                        {{&hidden}, {&dummy}, {&captured_hidden}, {&dummy}}, &capture,
+                        sizeof(capture), ceil_div_u32(hidden_count, kElementThreads), err)) {
+              return false;
+            }
+          }
+        }
+      }
+
+      RmsPush final_norm_params{static_cast<uint32_t>(n),
+                                static_cast<uint32_t>(cfg.hidden),
+                                static_cast<uint32_t>(cfg.hidden),
+                                static_cast<uint32_t>(cfg.hidden),
+                                0,
+                                0,
+                                cfg.target_rms_epsilon,
+                                0};
+      if (!record(rmsnorm_pipeline, {{&hidden}, {&target_final_norm}, {&normed}},
+                  &final_norm_params, sizeof(final_norm_params), static_cast<uint32_t>(n), err) ||
+          !record_matmul(lm_head, normed, logits, cfg.vocab, cfg.hidden, n, 0, 0, err)) {
+        return false;
+      }
+
+      const uint32_t argmax_groups =
+          ceil_div_u32(cfg.vocab, kArgmaxThreads * kArgmaxValuesPerLane);
+      for (int position = 0; position < n; ++position) {
+        ArgmaxPush first{static_cast<uint32_t>(cfg.vocab), static_cast<uint32_t>(position),
+                         kArgmaxValuesPerLane, 0};
+        if (!record(argmax_stage1_pipeline, {{&logits}, {&argmax_values}, {&argmax_indices}},
+                    &first, sizeof(first), argmax_groups, err)) {
+          return false;
+        }
+        FinalArgmaxPush final{argmax_groups, static_cast<uint32_t>(position), 0, 0};
+        if (!record(argmax_stage2_pipeline,
+                    {{&argmax_values}, {&argmax_indices}, {&target_ids}}, &final, sizeof(final), 1,
+                    err)) {
+          return false;
+        }
+      }
+
+      if (!vk_ok(vkEndCommandBuffer(command_buffer), "vkEndCommandBuffer", err) ||
+          !vk_ok(vkResetFences(device, 1, &fence), "vkResetFences", err)) {
+        return false;
+      }
+      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      submit.commandBufferCount = 1;
+      submit.pCommandBuffers = &command_buffer;
+      const auto begin_time = std::chrono::steady_clock::now();
+      if (!vk_ok(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit", err) ||
+          !vk_ok(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", err)) {
+        return false;
+      }
+      const double elapsed = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - begin_time)
+                                 .count();
+      target_queue_wait_ms += elapsed;
+      ++target_verifies;
+
+      if (!invalidate(target_ids, err))
+        return false;
+      const auto *ids = static_cast<const int32_t *>(target_ids.mapped);
+      all_next->assign(ids, ids + n);
+      if (captured_hidden_host) {
+        if (!invalidate(captured_hidden, err))
+          return false;
+        const size_t capture_count =
+            static_cast<size_t>(n) * cfg.selected_layers * cfg.hidden;
+        const auto *capture = static_cast<const float *>(captured_hidden.mapped);
+        captured_hidden_host->assign(capture, capture + capture_count);
+      }
+      target_seq += n;
+      if (trace) {
+        std::fprintf(stderr,
+                     "[vulkan-target] seq=%d inputs=%d commands=%llu queue_wait=%.3f ms ids:",
+                     target_seq - n, n, static_cast<unsigned long long>(commands_this_block),
+                     elapsed);
+        for (int id : *all_next)
+          std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n");
+      }
+      commands += commands_this_block;
+      commands_this_block = 0;
+      return true;
+    }
+
+    bool truncate_target(int seq_len, std::string *err) {
+      if (!target_initialized || seq_len < 0 || seq_len > target_seq) {
+        if (err)
+          *err = "invalid Vulkan target KV truncate length";
+        return false;
+      }
+      target_seq = seq_len;
+      return true;
+    }
+
+    void reset_target() {
+      target_initialized = false;
+      target_seq = 0;
+    }
+
     bool init_device(std::string *err) {
       uint32_t loader_version = VK_API_VERSION_1_0;
       auto enumerate_version = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
@@ -808,9 +1237,12 @@ namespace tinyqwen {
     bool init_commands(std::string *err) {
       VkDescriptorPoolSize pool_size{};
       pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      pool_size.descriptorCount = 2048;
+      // A 28-layer target verification records roughly 450 dispatches in one
+      // command buffer.  Keep the whole pass submission-resident rather than
+      // splitting it merely because the old DFlash-only pool held 256 sets.
+      pool_size.descriptorCount = 8192;
       VkDescriptorPoolCreateInfo descriptor_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-      descriptor_info.maxSets = 256;
+      descriptor_info.maxSets = 1024;
       descriptor_info.poolSizeCount = 1;
       descriptor_info.pPoolSizes = &pool_size;
       if (!vk_ok(vkCreateDescriptorPool(device, &descriptor_info, nullptr, &descriptor_pool),
@@ -949,7 +1381,35 @@ namespace tinyqwen {
             !upload_f32(host.fusion_alpha.data(), host.fusion_alpha.size(), &gpu.fusion_alpha, err))
           return false;
       }
+      target_gpu_layers.resize(static_cast<size_t>(cfg.target_layers));
+      for (int i = 0; i < cfg.target_layers; ++i) {
+        const HostTargetLayer &host = cfg.target_layer[static_cast<size_t>(i)];
+        TargetLayerGpu &gpu = target_gpu_layers[static_cast<size_t>(i)];
+        if (!upload_f32(host.input_norm, cfg.hidden, &gpu.input_norm, err) ||
+            !upload_f16(host.q_proj, static_cast<size_t>(cfg.target_query_dim) * cfg.hidden,
+                        &gpu.q_proj, err) ||
+            !upload_f16(host.k_proj, static_cast<size_t>(cfg.target_kv_dim) * cfg.hidden,
+                        &gpu.k_proj, err) ||
+            !upload_f16(host.v_proj, static_cast<size_t>(cfg.target_kv_dim) * cfg.hidden,
+                        &gpu.v_proj, err) ||
+            !upload_f32(host.q_norm, cfg.target_head_dim, &gpu.q_norm, err) ||
+            !upload_f32(host.k_norm, cfg.target_head_dim, &gpu.k_norm, err) ||
+            !upload_f16(host.o_proj, static_cast<size_t>(cfg.hidden) * cfg.target_query_dim,
+                        &gpu.o_proj, err) ||
+            !upload_f32(host.post_norm, cfg.hidden, &gpu.post_norm, err) ||
+            !upload_f16(host.gate, static_cast<size_t>(cfg.target_intermediate) * cfg.hidden,
+                        &gpu.gate, err) ||
+            !upload_f16(host.up, static_cast<size_t>(cfg.target_intermediate) * cfg.hidden,
+                        &gpu.up, err) ||
+            !upload_f16(host.down, static_cast<size_t>(cfg.hidden) * cfg.target_intermediate,
+                        &gpu.down, err)) {
+          return false;
+        }
+      }
+      // lm_head is uploaded exactly once and is shared by DFlash projection and
+      // target verification on this device.
       return upload_f32(cfg.final_norm, cfg.hidden, &final_norm, err) &&
+             upload_f32(cfg.target_final_norm, cfg.hidden, &target_final_norm, err) &&
              upload_f16(cfg.lm_head, static_cast<size_t>(cfg.vocab) * cfg.hidden, &lm_head, err) &&
              upload_f16(cfg.markov_w1, static_cast<size_t>(cfg.vocab) * cfg.markov_rank, &markov_w1,
                         err) &&
@@ -959,25 +1419,34 @@ namespace tinyqwen {
 
     bool allocate_fixed_buffers(std::string *err) {
       const size_t block = static_cast<size_t>(cfg.block_size);
-      const size_t proposals = block - 1;
       const uint32_t argmax_groups = ceil_div_u32(cfg.vocab, kArgmaxThreads * kArgmaxValuesPerLane);
       const size_t cache_values = static_cast<size_t>(cfg.layers) * cfg.max_seq * cfg.kv_dim;
+      const size_t target_cache_values =
+          static_cast<size_t>(cfg.target_layers) * cfg.max_seq * cfg.target_kv_dim;
+      const int workspace_query_dim = std::max(cfg.query_dim, cfg.target_query_dim);
+      const int workspace_kv_dim = std::max(cfg.kv_dim, cfg.target_kv_dim);
+      const int workspace_intermediate = std::max(cfg.intermediate, cfg.target_intermediate);
       return create_buffer(block * cfg.hidden * sizeof(float), nullptr, &hidden, err) &&
              create_buffer(block * cfg.hidden * sizeof(float), nullptr, &normed, err) &&
-             create_buffer(block * cfg.query_dim * sizeof(float), nullptr, &query, err) &&
-             create_buffer(block * cfg.kv_dim * sizeof(float), nullptr, &noise_key, err) &&
-             create_buffer(block * cfg.kv_dim * sizeof(float), nullptr, &noise_value, err) &&
-             create_buffer(block * cfg.query_dim * sizeof(float), nullptr, &attention, err) &&
+             create_buffer(block * workspace_query_dim * sizeof(float), nullptr, &query, err) &&
+             create_buffer(block * workspace_kv_dim * sizeof(float), nullptr, &noise_key, err) &&
+             create_buffer(block * workspace_kv_dim * sizeof(float), nullptr, &noise_value, err) &&
+             create_buffer(block * workspace_query_dim * sizeof(float), nullptr, &attention, err) &&
              create_buffer(block * cfg.hidden * sizeof(float), nullptr, &projected, err) &&
-             create_buffer(block * cfg.intermediate * sizeof(float), nullptr, &gate, err) &&
-             create_buffer(block * cfg.intermediate * sizeof(float), nullptr, &up, err) &&
+             create_buffer(block * workspace_intermediate * sizeof(float), nullptr, &gate, err) &&
+             create_buffer(block * workspace_intermediate * sizeof(float), nullptr, &up, err) &&
              create_buffer(block * cfg.hidden * sizeof(float), nullptr, &feed_forward, err) &&
-             create_buffer(proposals * cfg.vocab * sizeof(float), nullptr, &logits, err) &&
-             create_buffer(proposals * sizeof(int32_t), nullptr, &proposal_ids, err) &&
+             create_buffer(block * cfg.vocab * sizeof(float), nullptr, &logits, err) &&
+             create_buffer(block * sizeof(int32_t), nullptr, &proposal_ids, err) &&
+             create_buffer(block * sizeof(int32_t), nullptr, &target_ids, err) &&
              create_buffer(argmax_groups * sizeof(float), nullptr, &argmax_values, err) &&
              create_buffer(argmax_groups * sizeof(uint32_t), nullptr, &argmax_indices, err) &&
              create_buffer(cache_values * sizeof(float), nullptr, &key_cache, err) &&
              create_buffer(cache_values * sizeof(float), nullptr, &value_cache, err) &&
+             create_buffer(target_cache_values * sizeof(float), nullptr, &target_key_cache, err) &&
+             create_buffer(target_cache_values * sizeof(float), nullptr, &target_value_cache, err) &&
+             create_buffer(block * cfg.selected_layers * cfg.hidden * sizeof(float), nullptr,
+                           &captured_hidden, err) &&
              create_buffer(sizeof(float), nullptr, &dummy, err);
     }
 
@@ -1139,21 +1608,42 @@ namespace tinyqwen {
       destroy_buffer(&layer->fusion_alpha);
     }
 
+    void destroy_target_layer(TargetLayerGpu *layer) {
+      destroy_buffer(&layer->input_norm);
+      destroy_buffer(&layer->q_proj);
+      destroy_buffer(&layer->k_proj);
+      destroy_buffer(&layer->v_proj);
+      destroy_buffer(&layer->q_norm);
+      destroy_buffer(&layer->k_norm);
+      destroy_buffer(&layer->o_proj);
+      destroy_buffer(&layer->post_norm);
+      destroy_buffer(&layer->gate);
+      destroy_buffer(&layer->up);
+      destroy_buffer(&layer->down);
+    }
+
     void shutdown() {
       if (device != VK_NULL_HANDLE)
         vkDeviceWaitIdle(device);
       if (device != VK_NULL_HANDLE && (blocks || weight_bytes)) {
         std::fprintf(stderr,
-                     "[vulkan-dflash] summary: blocks=%llu commands=%llu "
-                     "queue_wait=%.2f ms weights=%.1f MB\n",
+                     "[vulkan-dflash] summary: draft_blocks=%llu target_verifies=%llu "
+                     "commands=%llu draft_queue_wait=%.2f ms target_queue_wait=%.2f ms "
+                     "weights=%.1f MB\n",
                      static_cast<unsigned long long>(blocks),
+                     static_cast<unsigned long long>(target_verifies),
                      static_cast<unsigned long long>(commands), queue_wait_ms,
+                     target_queue_wait_ms,
                      static_cast<double>(weight_bytes) / 1048576.0);
       }
       for (LayerGpu &layer : gpu_layers)
         destroy_layer(&layer);
       gpu_layers.clear();
+      for (TargetLayerGpu &layer : target_gpu_layers)
+        destroy_target_layer(&layer);
+      target_gpu_layers.clear();
       destroy_buffer(&final_norm);
+      destroy_buffer(&target_final_norm);
       destroy_buffer(&lm_head);
       destroy_buffer(&markov_w1);
       destroy_buffer(&markov_w2);
@@ -1173,10 +1663,14 @@ namespace tinyqwen {
       destroy_buffer(&feed_forward);
       destroy_buffer(&logits);
       destroy_buffer(&proposal_ids);
+      destroy_buffer(&target_ids);
       destroy_buffer(&argmax_values);
       destroy_buffer(&argmax_indices);
       destroy_buffer(&key_cache);
       destroy_buffer(&value_cache);
+      destroy_buffer(&target_key_cache);
+      destroy_buffer(&target_value_cache);
+      destroy_buffer(&captured_hidden);
       destroy_buffer(&dummy);
 
       destroy_pipeline(&matmul_pipeline);
@@ -1226,7 +1720,9 @@ namespace tinyqwen {
     Pipeline argmax_stage2_pipeline;
 
     std::vector<LayerGpu> gpu_layers;
+    std::vector<TargetLayerGpu> target_gpu_layers;
     Buffer final_norm;
+    Buffer target_final_norm;
     Buffer lm_head;
     Buffer markov_w1;
     Buffer markov_w2;
@@ -1246,18 +1742,26 @@ namespace tinyqwen {
     Buffer feed_forward;
     Buffer logits;
     Buffer proposal_ids;
+    Buffer target_ids;
     Buffer argmax_values;
     Buffer argmax_indices;
     Buffer key_cache;
     Buffer value_cache;
+    Buffer target_key_cache;
+    Buffer target_value_cache;
+    Buffer captured_hidden;
     Buffer dummy;
 
     bool trace = false;
+    bool target_initialized = false;
+    int target_seq = 0;
     uint64_t weight_bytes = 0;
     uint64_t blocks = 0;
+    uint64_t target_verifies = 0;
     uint64_t commands = 0;
     uint64_t commands_this_block = 0;
     double queue_wait_ms = 0.0;
+    double target_queue_wait_ms = 0.0;
   };
 
   std::unique_ptr<DFlashVulkanEngine> DFlashVulkanEngine::create(const DFlashModel &model,
@@ -1285,8 +1789,26 @@ namespace tinyqwen {
     cfg.markov_w1 = model.markov_w1_;
     cfg.markov_w2 = model.markov_w2_;
 
+    if (!cfg.target) {
+      if (err)
+        *err = "missing target model for Vulkan DFlash";
+      return nullptr;
+    }
+    const QwenModel &target = *cfg.target;
+    cfg.target_layers = static_cast<int>(target.cfg_.n_layers);
+    cfg.target_intermediate = static_cast<int>(target.cfg_.intermediate_size);
+    cfg.target_query_heads = static_cast<int>(target.cfg_.n_heads);
+    cfg.target_kv_heads = static_cast<int>(target.cfg_.n_kv_heads);
+    cfg.target_head_dim = static_cast<int>(target.cfg_.head_dim);
+    cfg.target_query_dim = cfg.target_query_heads * cfg.target_head_dim;
+    cfg.target_kv_dim = cfg.target_kv_heads * cfg.target_head_dim;
+    cfg.target_rms_epsilon = target.cfg_.rms_norm_eps;
+    cfg.target_rope_theta = target.cfg_.rope_theta;
+    cfg.target_final_norm = target.final_norm_;
+    cfg.target_layer_ids = model.target_layer_ids_;
+
     WeightTensor target_lm_head{};
-    if (!cfg.target || !cfg.target->lm_head_weight(&target_lm_head) ||
+    if (!cfg.target->lm_head_weight(&target_lm_head) ||
         target_lm_head.quant_type != QuantType::kF16 || target_lm_head.rows != cfg.vocab ||
         target_lm_head.cols != cfg.hidden) {
       if (err)
@@ -1303,6 +1825,29 @@ namespace tinyqwen {
       if (err)
         *err = "unsupported Vulkan DFlash model configuration";
       return nullptr;
+    }
+
+    if (target.dtype_ != Dtype::kF16 || target.cfg_.uses_qwen35_attention() ||
+        target.cfg_.is_moe() || target.rotated_ || target.cfg_.hidden_size != model.cfg_.hidden_size ||
+        target.cfg_.vocab_size != model.cfg_.vocab_size || cfg.target_layers <= 0 ||
+        cfg.target_intermediate <= 0 || cfg.target_head_dim <= 0 || cfg.target_head_dim > 128 ||
+        cfg.target_query_heads <= 0 || cfg.target_kv_heads <= 0 ||
+        cfg.target_query_heads % cfg.target_kv_heads != 0 || cfg.target_query_dim <= 0 ||
+        cfg.target_kv_dim <= 0 || (cfg.target_query_dim & 1) || (cfg.target_kv_dim & 1) ||
+        (cfg.target_intermediate & 1) || target.max_seq_len_ != cfg.max_seq ||
+        target.kv_.n_layers() != cfg.target_layers || !cfg.target_final_norm) {
+      if (err)
+        *err = "Vulkan target verification requires a dense, unrotated FP16 Qwen3 target";
+      return nullptr;
+    }
+    std::vector<bool> selected(static_cast<size_t>(cfg.target_layers), false);
+    for (int layer : cfg.target_layer_ids) {
+      if (layer < 0 || layer >= cfg.target_layers || selected[static_cast<size_t>(layer)]) {
+        if (err)
+          *err = "DFlash target layer ids must be unique and in target range";
+        return nullptr;
+      }
+      selected[static_cast<size_t>(layer)] = true;
     }
 
     cfg.layer.resize(static_cast<size_t>(cfg.layers));
@@ -1341,6 +1886,31 @@ namespace tinyqwen {
         value /= sum;
     }
 
+    cfg.target_layer.resize(static_cast<size_t>(cfg.target_layers));
+    for (int i = 0; i < cfg.target_layers; ++i) {
+      const QwenModel::LayerWeights &source = target.layers_[static_cast<size_t>(i)];
+      if (!source.input_ln || !source.q_proj || !source.k_proj || !source.v_proj ||
+          !source.q_norm || !source.k_norm || !source.o_proj || !source.post_ln ||
+          !source.gate || !source.up || !source.down || source.q_bias || source.k_bias ||
+          source.v_bias || source.attn_dtype != Dtype::kF16) {
+        if (err)
+          *err = "Vulkan target verification requires bias-free FP16 Qwen3 layer weights";
+        return nullptr;
+      }
+      HostTargetLayer &dest = cfg.target_layer[static_cast<size_t>(i)];
+      dest.input_norm = source.input_ln;
+      dest.q_proj = static_cast<const uint16_t *>(source.q_proj);
+      dest.k_proj = static_cast<const uint16_t *>(source.k_proj);
+      dest.v_proj = static_cast<const uint16_t *>(source.v_proj);
+      dest.q_norm = source.q_norm;
+      dest.k_norm = source.k_norm;
+      dest.o_proj = static_cast<const uint16_t *>(source.o_proj);
+      dest.post_norm = source.post_ln;
+      dest.gate = static_cast<const uint16_t *>(source.gate);
+      dest.up = static_cast<const uint16_t *>(source.up);
+      dest.down = static_cast<const uint16_t *>(source.down);
+    }
+
     auto impl = std::make_unique<Impl>(std::move(cfg));
     if (!impl->init(err))
       return nullptr;
@@ -1356,6 +1926,30 @@ namespace tinyqwen {
                                    std::string *err) {
     return impl_ && impl_->propose(target_hidden, ctx_tokens, confirmed_seq, anchor, block_tokens,
                                    proposals, err);
+  }
+
+  bool DFlashVulkanEngine::initialize_target_from_cpu(std::string *err) {
+    return impl_ && impl_->initialize_target_from_cpu(err);
+  }
+
+  bool DFlashVulkanEngine::verify_target(const int *tokens, int n,
+                                         std::vector<int> *all_next,
+                                         std::vector<float> *captured_hidden,
+                                         std::string *err) {
+    return impl_ && impl_->verify_target(tokens, n, all_next, captured_hidden, err);
+  }
+
+  bool DFlashVulkanEngine::truncate_target(int seq_len, std::string *err) {
+    return impl_ && impl_->truncate_target(seq_len, err);
+  }
+
+  void DFlashVulkanEngine::reset_target() {
+    if (impl_)
+      impl_->reset_target();
+  }
+
+  int DFlashVulkanEngine::target_seq_len() const {
+    return impl_ ? impl_->target_seq : -1;
   }
 
   const std::string &DFlashVulkanEngine::device_name() const {

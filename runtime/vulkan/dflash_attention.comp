@@ -19,7 +19,7 @@ layout(push_constant) uniform AttentionParams {
     uint kv_heads;
     uint head_dim;
     float attention_scale;
-    uint pad0;
+    uint causal;
     uint pad1;
     uint pad2;
 } params;
@@ -43,7 +43,10 @@ void main() {
     float maximum = -1.0 / 0.0;
     float denominator = 0.0;
     float accumulated = 0.0;
-    const uint total = params.total_context + params.noise_tokens;
+    // DFlash 的 mask block 是双向的，所有 noise token 彼此可见；target
+    // verification 则是严格因果，第 token 个 query 只能看到本块 [0..token]。
+    const uint visible_noise = params.causal != 0u ? token + 1u : params.noise_tokens;
+    const uint total = params.total_context + visible_noise;
     for (uint position = 0u; position < total; ++position) {
         float key = 0.0;
         float value = 0.0;

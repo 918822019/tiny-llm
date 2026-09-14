@@ -23,6 +23,29 @@ namespace tinyqwen {
     return false;
   }
 
+  bool DFlashVulkanEngine::initialize_target_from_cpu(std::string *err) {
+    if (err)
+      *err = "DFlash Vulkan engine is unavailable";
+    return false;
+  }
+
+  bool DFlashVulkanEngine::verify_target(const int *, int, std::vector<int> *,
+                                         std::vector<float> *, std::string *err) {
+    if (err)
+      *err = "DFlash Vulkan engine is unavailable";
+    return false;
+  }
+
+  bool DFlashVulkanEngine::truncate_target(int, std::string *err) {
+    if (err)
+      *err = "DFlash Vulkan engine is unavailable";
+    return false;
+  }
+
+  void DFlashVulkanEngine::reset_target() {}
+
+  int DFlashVulkanEngine::target_seq_len() const { return -1; }
+
   const std::string &DFlashVulkanEngine::device_name() const {
     static const std::string empty;
     return empty;

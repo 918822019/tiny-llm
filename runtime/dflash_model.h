@@ -29,6 +29,14 @@ public:
     bool enable_vulkan(std::string *err);
     bool using_vulkan() const { return vulkan_ != nullptr; }
 
+    // With the dedicated Vulkan engine enabled, target decode/verification
+    // shares its device, allocator and lm_head with the DFlash proposal pass.
+    bool initialize_vulkan_target(std::string *err);
+    bool verify_vulkan_target(const int *tokens, int n, std::vector<int> *all_next,
+                              std::vector<float> *captured_hidden, std::string *err);
+    bool truncate_vulkan_target(int seq_len, std::string *err);
+    int vulkan_target_seq_len() const;
+
     // target_hidden is token-major [ctx_tokens, K, hidden]. The method first
     // commits those confirmed target features to the draft KV cache, then
     // proposes block_tokens-1 tokens after anchor. Noise K/V are never cached.

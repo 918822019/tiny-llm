@@ -22,6 +22,7 @@ const uint kFuse = 0u;
 const uint kResidualAdd = 1u;
 const uint kSwiGlu = 2u;
 const uint kStoreKv = 3u;
+const uint kCapture = 4u;
 
 void main() {
     const uint index = gl_GlobalInvocationID.x;
@@ -62,5 +63,17 @@ void main() {
         const uint dst = ((layer * max_seq + seq_start + token) * kv_dim) + dim;
         c.values[dst] = a.values[index];
         d.values[dst] = b.values[index];
+    } else if (params.op == kCapture) {
+        // Residual source: [tokens, hidden]. Destination is token-major
+        // [tokens, selected_layers, hidden], matching QwenModel's CPU hook.
+        const uint tokens = params.p0;
+        const uint hidden = params.p1;
+        const uint selected_slot = params.p2;
+        const uint selected_layers = params.p3;
+        if (index >= tokens * hidden) return;
+        const uint token = index / hidden;
+        const uint dim = index - token * hidden;
+        const uint dst = (token * selected_layers + selected_slot) * hidden + dim;
+        c.values[dst] = a.values[index];
     }
 }

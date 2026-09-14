@@ -130,8 +130,8 @@ namespace {
 #endif
     }
 
-    // DFlash Vulkan 会复制 draft 权重，并额外复制 target 的共享 lm_head。预检阶段
-    // 尚未 load 模型，直接读取固定 192B header 即可把这部分统一内存算进预算。
+    // Vulkan FP16 路径的 header 校验与 lm_head 尺寸计算。DFlash 整段执行器会
+    // 同时复制 target + draft 权重，但 target/draft 共用唯一一份 target lm_head。
     bool f16_lm_head_bytes(const std::string &path, uint64_t *out,
                            std::string *err) {
         if (!out) return false;
@@ -546,16 +546,18 @@ int main(int argc, char **argv) {
         uint64_t vulkan_extra = 0;
         if (args.backend == "vulkan") {
             if (!args.dflash_model.empty()) {
-                uint64_t lm_head_need = 0;
-                if (!f16_lm_head_bytes(args.model, &lm_head_need, &err)) {
+                uint64_t ignored_lm_head = 0;
+                if (!f16_lm_head_bytes(args.model, &ignored_lm_head, &err)) {
                     std::fprintf(stderr, "error: %s\n", err.c_str());
                     return 1;
                 }
-                if (dflash_need > std::numeric_limits<uint64_t>::max() - lm_head_need) {
+                if (dflash_need > std::numeric_limits<uint64_t>::max() - target_need) {
                     std::fprintf(stderr, "error: Vulkan DFlash memory estimate overflow\n");
                     return 1;
                 }
-                vulkan_extra = dflash_need + lm_head_need;
+                // 安全上界：GPU 常驻完整 target + 完整 DFlash。实际 lm_head 只
+                // 上传一次，target/draft 的文件元数据也不会进入 GPU，因此略保守。
+                vulkan_extra = dflash_need + target_need;
             } else {
                 // 通用 VulkanBackend 会在首次访问时把 FP16 matrix weights 逐个
                 // 缓存到 GPU。用完整 target resident 大小作安全上界。
@@ -821,11 +823,11 @@ int main(int argc, char **argv) {
 #endif
     } else if (use_vulkan_backend) {
         if (use_vulkan_dflash) {
-            // DFlash 场景中目标验证的 ARM batch 已经快于逐算子 Vulkan；GPU
-            // 留给整段常驻的 drafter，避免每层四次 CPU/GPU 同步。
+            // Prompt prefill 仍由 CPU 完成并作为精确基线；随后把 KV 前缀同步
+            // 一次，DFlash proposal 与 target verify 都在同一 Vulkan device。
             backend = tinyqwen::create_cpu_backend();
             std::fprintf(stderr,
-                         "[init] backend: CPU target + Vulkan DFlash drafter\n");
+                         "[init] backend: CPU prefill + Vulkan DFlash/target decode\n");
         } else {
             std::string verr;
             backend = tinyqwen::create_vulkan_backend(&verr);

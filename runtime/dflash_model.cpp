@@ -130,14 +130,48 @@ bool DFlashModel::create(const ModelFile &file, int max_seq_len, QwenModel &targ
     return true;
 }
 
-void DFlashModel::reset() { seq_len_ = 0; }
+void DFlashModel::reset() {
+    seq_len_ = 0;
+    if (vulkan_) vulkan_->reset_target();
+}
 
 bool DFlashModel::enable_vulkan(std::string *err) {
     vulkan_ = DFlashVulkanEngine::create(*this, err);
     if (!vulkan_) return false;
-    std::fprintf(stderr, "[vulkan] DFlash GPU-resident drafter: %s\n",
+    std::fprintf(stderr, "[vulkan] DFlash + target GPU-resident decode: %s\n",
                  vulkan_->device_name().c_str());
     return true;
+}
+
+bool DFlashModel::initialize_vulkan_target(std::string *err) {
+    if (!vulkan_) {
+        if (err) *err = "DFlash Vulkan engine is not enabled";
+        return false;
+    }
+    return vulkan_->initialize_target_from_cpu(err);
+}
+
+bool DFlashModel::verify_vulkan_target(const int *tokens, int n,
+                                       std::vector<int> *all_next,
+                                       std::vector<float> *captured_hidden,
+                                       std::string *err) {
+    if (!vulkan_) {
+        if (err) *err = "DFlash Vulkan engine is not enabled";
+        return false;
+    }
+    return vulkan_->verify_target(tokens, n, all_next, captured_hidden, err);
+}
+
+bool DFlashModel::truncate_vulkan_target(int seq_len, std::string *err) {
+    if (!vulkan_) {
+        if (err) *err = "DFlash Vulkan engine is not enabled";
+        return false;
+    }
+    return vulkan_->truncate_target(seq_len, err);
+}
+
+int DFlashModel::vulkan_target_seq_len() const {
+    return vulkan_ ? vulkan_->target_seq_len() : -1;
 }
 
 void DFlashModel::mv(const uint16_t *w, const float *x, float *y,
