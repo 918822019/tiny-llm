@@ -93,3 +93,13 @@ TEST (kv_cache_k_v_independent) {
     // 验证 K 和 V 的指针确实不同（独立内存）
     EXPECT_TRUE(cache.k(0) != cache.v(0));
 }
+
+TEST (kv_cache_truncate_keeps_prefix_and_rejects_growth) {
+    KvCache cache(1, 1, 8, 2);
+    cache.advance(6);
+    EXPECT_TRUE(cache.truncate(3));
+    EXPECT_EQ(cache.seq_len(), 3);
+    EXPECT_TRUE(!cache.truncate(4));
+    EXPECT_TRUE(!cache.truncate(-1));
+    EXPECT_EQ(cache.seq_len(), 3);
+}

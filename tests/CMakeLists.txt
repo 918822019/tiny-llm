@@ -29,6 +29,7 @@ add_executable(tinyqwen_tests
         test_gdn_ops.cpp        # GDN 算子（ref）正确性测试
         test_gdn_ops_neon.cpp   # GDN 算子 NEON vs ref 对齐测试
         test_backend.cpp        # Backend 抽象层测试
+        test_speculative_decoder.cpp # 投机解码接受/拒绝/bonus 决策
         test_quantization.cpp   # 量化子系统测试
 )
 

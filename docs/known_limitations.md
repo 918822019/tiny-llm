@@ -22,7 +22,11 @@
   fp16→fp32 转换抵消读带宽减半——是内存特性不是提速，见优化日志
   `fp16_kv_fused`）；fp16-KV 仅 CPU（CUDA 后端调用即 abort）；
 - 超出 max_seq_len / KV 溢出直接 abort（fail loud）；
-- speculative rollback / KV truncate 未实现；
+- speculative decoding 目前仅支持 greedy；两个模型必须使用同一 tokenizer，
+  运行时只能自动校验 vocab/EOS 元数据，无法识别 vocab 大小相同但词表映射不同的模型；
+- Qwen2/3 dense 的 CPU verify 主体走批量 GEMM；带 GDN 的 Qwen3.5 和 MoE 在 CPU
+  上为保证递归状态正确暂走逐 token verify。Metal 支持 continuation batch，拒绝时
+  GDN 需要 checkpoint 恢复与已接受前缀重放；
 - **i4 稠密 decode 段错误（已知未修，见 AGENTS.md 坑 #35）**：`model_qwen35_i4.tqwen`
   在 `--matvec-impl sdot4_mt --ops-impl neon` 下 prefill 正常、第一个 decode token
   崩溃（exit 139）。f16 同命令正常。预存在 bug，回归区间 cefae4b..5d8c6b4（MoE/GPTQ
@@ -108,7 +112,7 @@
   风格）待 Phase C；
 - MoE 批量 prefill（同批 token 路由到不同专家的 gather/scatter GEMM）——当前 MoE
   强制逐 token prefill；专家异步预取 overlap（Phase B）待补；
-- Speculative decoding（draft/verify/rollback）；
+- 采样式 speculative decoding（当前已实现精确 greedy draft/verify/rollback）；
 - 多 LoRA adapter 调度；
 - mmap 加载、Android App。
 

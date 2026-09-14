@@ -28,10 +28,19 @@ namespace tinyqwen {
     void metal_prefill_destroy(MetalPrefillEngine *) {}
 
     int metal_prefill_run(MetalPrefillEngine *, const int *, int, float *, bool, KvCache *,
-                          GdnState *, std::string *err) {
+                          GdnState *, std::string *err, int *) {
         if (err) *err = "Metal prefill 仅在 Apple 平台可用";
         return -1;
     }
+
+    bool metal_prefill_rewind(MetalPrefillEngine *, int, const GdnState *, std::string *err) {
+        if (err) *err = "Metal prefill 仅在 Apple 平台可用";
+        return false;
+    }
+
+    void metal_prefill_reset_kv(MetalPrefillEngine *) {}
+
+    int metal_prefill_kv_len(const MetalPrefillEngine *) { return 0; }
 
     std::string metal_prefill_device_name(const MetalPrefillEngine *) { return std::string(); }
 } // namespace tinyqwen

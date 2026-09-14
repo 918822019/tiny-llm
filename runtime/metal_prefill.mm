@@ -992,11 +992,49 @@ std::string metal_prefill_device_name(const MetalPrefillEngine *engine) {
 // reset 只需把长度归零：attention 永远只读 [0, pos0+qi)，旧数据留在 buffer 里
 // 也不会被读到，所以不需要真正清零那片内存（省一次 ~235MB 的写）。
 void metal_prefill_reset_kv(MetalPrefillEngine *engine) {
-    if (engine) engine->kv_len = 0;
+    if (!engine) return;
+    engine->kv_len = 0;
+    // KV 只需改长度；GDN 是递归状态，新序列必须真正清零。此前这里只重置
+    // kv_len，第二次运行 Qwen3.5 会悄悄继承上一条序列的状态。
+    if (engine->gdn_conv_state.buf)
+        std::memset(engine->gdn_conv_state.cpu(), 0,
+                    engine->gdn_conv_state.count * sizeof(float));
+    if (engine->gdn_recurrent.buf)
+        std::memset(engine->gdn_recurrent.cpu(), 0,
+                    engine->gdn_recurrent.count * sizeof(float));
 }
 
 int metal_prefill_kv_len(const MetalPrefillEngine *engine) {
     return engine ? engine->kv_len : 0;
+}
+
+bool metal_prefill_rewind(MetalPrefillEngine *engine, int kv_len,
+                          const GdnState *gdn, std::string *err) {
+    if (!engine) {
+        if (err) *err = "null Metal prefill engine";
+        return false;
+    }
+    if (kv_len < 0 || kv_len > engine->kv_len) {
+        if (err) *err = "Metal rewind length is outside the current prefix";
+        return false;
+    }
+
+    const int n_gdn = static_cast<int>(engine->cfg.n_layers) -
+                      engine->cfg.n_full_layers();
+    if (n_gdn > 0) {
+        const size_t rec_elems = engine->gdn_rec_layer_stride * n_gdn;
+        const size_t conv_elems = engine->gdn_conv_layer_stride * n_gdn;
+        if (!gdn || !gdn->initialized() || gdn->size() != rec_elems + conv_elems) {
+            if (err) *err = "Metal rewind needs a matching GDN checkpoint";
+            return false;
+        }
+        std::memcpy(engine->gdn_recurrent.cpu(), gdn->data(),
+                    rec_elems * sizeof(float));
+        std::memcpy(engine->gdn_conv_state.cpu(), gdn->data() + rec_elems,
+                    conv_elems * sizeof(float));
+    }
+    engine->kv_len = kv_len;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,7 +1422,8 @@ void metal_prefill_destroy(MetalPrefillEngine *engine) {
 // run
 // ---------------------------------------------------------------------------
 int metal_prefill_run(MetalPrefillEngine *e, const int *tokens, int n, float *logits_out,
-                      bool all_logits, KvCache *kv, GdnState *gdn, std::string *err) {
+                      bool all_logits, KvCache *kv, GdnState *gdn, std::string *err,
+                      int *all_argmax_out) {
     if (!e || !tokens || n <= 0) {
         *err = "invalid argument";
         return -1;
@@ -1912,6 +1951,19 @@ int metal_prefill_run(MetalPrefillEngine *e, const int *tokens, int n, float *lo
                                 static_cast<size_t>(V) * sizeof(float));
             } else {
                 std::memcpy(logits_out, last, static_cast<size_t>(V) * sizeof(float));
+            }
+        }
+        if (all_argmax_out) {
+            if (!all_logits) {
+                *err = "all_argmax_out requires all_logits=true";
+                return -1;
+            }
+            for (int s = 0; s < n; ++s) {
+                const float *row = src + static_cast<size_t>(s) * lmstride;
+                int row_best = 0;
+                for (int i = 1; i < V; ++i)
+                    if (row[i] > row[row_best]) row_best = i;
+                all_argmax_out[s] = row_best;
             }
         }
 

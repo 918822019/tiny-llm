@@ -51,6 +51,7 @@
 #include "model_loader.h"
 #include "profiler.h"
 #include "qwen_model.h"
+#include "speculative_decoder.h"
 
 #ifdef TINYQWEN_HAS_CUDA
 #include "backend_cuda.h"
@@ -111,6 +112,10 @@ namespace {
     // 命令行参数结构体：集中存储所有 CLI 选项
     struct Args {
         std::string model;             // 模型文件路径（.tqwen），必选
+        std::string draft_model;       // 草稿模型；非空时启用投机解码
+        int speculative_tokens = 4;    // 每个验证块的草稿 token 数
+        std::string speculative_stats_out; // 投机统计 JSON
+        std::string draft_matvec_impl; // 草稿模型独立 dtype 注册表的 kernel
         std::string tokens_csv;        // CSV 格式 token 列表（如 "1,2,3"）
         std::string tokens_json;       // JSON 格式 token 文件
         std::string batch_tokens_jsonl; // 批量输入 JSONL 文件路径
@@ -146,6 +151,12 @@ namespace {
     void usage(const char *prog) {
         std::fprintf(stderr,
                      "usage: %s --model <model.tqwen> [options]\n"
+                     "  --draft-model PATH      enable exact greedy speculative decoding\n"
+                     "  --speculative-tokens K draft tokens per verify block (default 4)\n"
+                     "  --speculative-stats-out PATH\n"
+                     "                          write acceptance/rollback/timing JSON\n"
+                     "  --draft-matvec-impl NAME\n"
+                     "                          matvec kernel for the draft model dtype\n"
                      "  --tokens CSV            comma separated token ids\n"
                      "  --tokens-json PATH      JSON with a \"tokens\" array (tokenize_prompt.py)\n"
                      "  --batch-tokens-jsonl PATH\n"
@@ -202,6 +213,10 @@ namespace {
                 return argv[++i];
             };
             if (a == "--model") out->model = value("--model");
+            else if (a == "--draft-model") out->draft_model = value("--draft-model");
+            else if (a == "--speculative-tokens") out->speculative_tokens = std::atoi(value("--speculative-tokens").c_str());
+            else if (a == "--speculative-stats-out") out->speculative_stats_out = value("--speculative-stats-out");
+            else if (a == "--draft-matvec-impl") out->draft_matvec_impl = value("--draft-matvec-impl");
             else if (a == "--tokens") out->tokens_csv = value("--tokens");
             else if (a == "--tokens-json") out->tokens_json = value("--tokens-json");
             else if (a == "--batch-tokens-jsonl") out->batch_tokens_jsonl = value("--batch-tokens-jsonl");
@@ -244,6 +259,12 @@ namespace {
             std::fprintf(stderr, "error: --model is required\n");
             return false;
         }
+        if (out->draft_model.empty() &&
+            (!out->speculative_stats_out.empty() || !out->draft_matvec_impl.empty())) {
+            std::fprintf(stderr,
+                         "error: speculative draft options require --draft-model\n");
+            return false;
+        }
         // 三种输入模式必须且只能提供一个
         const bool has_batch = !out->batch_tokens_jsonl.empty();
         const int modes = (!out->tokens_csv.empty()) + (!out->tokens_json.empty()) + has_batch;
@@ -253,6 +274,19 @@ namespace {
                                  "--tokens / --tokens-json / --batch-tokens-jsonl"
                                  "（--ppl --ppl-jsonl 可单独使用）\n");
             return false;
+        }
+        if (!out->draft_model.empty()) {
+            if (out->speculative_tokens <= 0) {
+                std::fprintf(stderr, "error: --speculative-tokens must be positive\n");
+                return false;
+            }
+            if (has_batch || out->ppl || out->topk > 0 || !out->dump_logits.empty() ||
+                !out->profile_out.empty() || out->engine == "cuda") {
+                std::fprintf(stderr,
+                             "error: --draft-model currently cannot be combined with batch/PPL/"
+                             "top-k/logit dump/profile/CUDA decode engine\n");
+                return false;
+            }
         }
         if (has_batch) {
             if (out->topk > 0 || !out->dump_logits.empty() || out->verbose ||
@@ -401,9 +435,19 @@ int main(int argc, char **argv) {
     {
         std::string err;
         uint64_t need = 0;
-        if (!tinyqwen::ModelFile::estimate_resident_bytes(args.model, args.moe_ssd, &need, &err)) {
+        if (!tinyqwen::ModelFile::estimate_resident_bytes(args.model, args.moe_ssd,
+                                                           &need, &err)) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
             return 1;
+        }
+        if (!args.draft_model.empty()) {
+            uint64_t draft_need = 0;
+            if (!tinyqwen::ModelFile::estimate_resident_bytes(args.draft_model, false,
+                                                               &draft_need, &err)) {
+                std::fprintf(stderr, "error: draft model: %s\n", err.c_str());
+                return 1;
+            }
+            need += draft_need;
         }
         const uint64_t avail = available_memory_bytes();
         const uint64_t budget = avail ? avail - avail / 10 : 0;  // 可用 × 90%
@@ -437,6 +481,35 @@ int main(int argc, char **argv) {
     if (!file.load(args.model, &err, args.moe_ssd)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
+    }
+    tinyqwen::ModelFile draft_file;
+    if (!args.draft_model.empty()) {
+        if (!draft_file.load(args.draft_model, &err, false)) {
+            std::fprintf(stderr, "error: draft model: %s\n", err.c_str());
+            return 1;
+        }
+        if (draft_file.config().is_moe()) {
+            std::fprintf(stderr,
+                         "error: MoE draft model is not supported; use a dense draft model\n");
+            return 2;
+        }
+        if (draft_file.config().vocab_size != file.config().vocab_size) {
+            std::fprintf(stderr,
+                         "error: target/draft vocab mismatch (%u vs %u); they must use "
+                         "the same tokenizer\n",
+                         file.config().vocab_size, draft_file.config().vocab_size);
+            return 2;
+        }
+        const uint32_t teos = file.config().eos_token_id;
+        const uint32_t deos = draft_file.config().eos_token_id;
+        if (teos != 0 && deos != 0 && teos != deos) {
+            std::fprintf(stderr,
+                         "error: target/draft eos mismatch (%u vs %u); tokenizer metadata differs\n",
+                         teos, deos);
+            return 2;
+        }
+        std::fprintf(stderr, "[init] speculative draft: %s (K=%d)\n",
+                     args.draft_model.c_str(), args.speculative_tokens);
     }
     if (args.verbose) file.print_summary();
     if (file.offloaded_count() > 0) {
@@ -541,6 +614,38 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[init] matvec impl: %s\n", tinyqwen::matvec_impl_name());
     }
 
+    // 各 dtype 有独立注册表。目标 f16 + 草稿 i4 时可分别选 kernel；若两者
+    // dtype 相同，这个选项会覆盖该 dtype 的全局实现（两边共同使用）。
+    if (!args.draft_model.empty() && !args.draft_matvec_impl.empty()) {
+        const char *name = args.draft_matvec_impl.c_str();
+        const auto dt = static_cast<tinyqwen::Dtype>(draft_file.header().dtype);
+        bool ok = false;
+        const char *available = "";
+        if (dt == tinyqwen::Dtype::kF16) {
+            ok = tinyqwen::set_matvec_f16_impl_by_name(name);
+            available = tinyqwen::available_matvec_f16_impls();
+        } else if (dt == tinyqwen::Dtype::kI4) {
+            ok = tinyqwen::set_matvec_i4_impl_by_name(name);
+            available = tinyqwen::available_matvec_i4_impls();
+        } else if (dt == tinyqwen::Dtype::kVQ2) {
+            ok = tinyqwen::set_matvec_vq2_impl_by_name(name);
+            available = tinyqwen::available_matvec_vq2_impls();
+        } else if (dt == tinyqwen::Dtype::kGPTQ4) {
+            ok = tinyqwen::set_matvec_gptq_impl_by_name(name);
+            available = tinyqwen::available_matvec_gptq_impls();
+        } else {
+            ok = tinyqwen::set_matvec_impl_by_name(name);
+            available = tinyqwen::available_matvec_impls();
+        }
+        if (!ok) {
+            std::fprintf(stderr,
+                         "error: unknown draft matvec impl '%s' (available: %s)\n",
+                         name, available);
+            return 2;
+        }
+        std::fprintf(stderr, "[init] draft matvec impl: %s\n", name);
+    }
+
     // ---- 选择非 matvec 算子实现（与 dtype 无关，五算子共用一个名）----
     std::string ops_name = args.ops_impl;
     if (ops_name.empty()) ops_name = config.get("ops_impl", "ref");
@@ -555,6 +660,7 @@ int main(int argc, char **argv) {
 
     // profiling 按需开启：没有 --profile-out 时所有 ScopedTimer 都是空操作
     tinyqwen::Profiler profiler(!args.profile_out.empty());
+    tinyqwen::Profiler draft_profiler(false);
     const bool is_qwen35 = file.config().uses_qwen35_attention();
     profiler.set_meta(is_qwen35 ? "qwen3.5-hybrid" : "qwen2.5-like", "cpu_ref",
                       is_f16 ? "f16w_fp32a" : "fp32");
@@ -593,6 +699,15 @@ int main(int argc, char **argv) {
                                      file.config().is_moe() ? &expert_store : nullptr)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
+    }
+    std::unique_ptr<tinyqwen::QwenModel> draft_model;
+    if (!args.draft_model.empty()) {
+        if (!tinyqwen::QwenModel::create(draft_file, args.max_seq_len, draft_profiler,
+                                         &err, &draft_model,
+                                         tinyqwen::create_cpu_backend(), args.kv_fp16)) {
+            std::fprintf(stderr, "error: draft model: %s\n", err.c_str());
+            return 1;
+        }
     }
     if (file.config().is_moe()) {
         model->set_moe_ssd(args.moe_ssd);
@@ -883,11 +998,19 @@ int main(int argc, char **argv) {
                            : config.get("fuse_qkv", "true") != "false";
     model->set_fuse_gate_up(fuse_gate_up);
     model->set_fuse_qkv(fuse_qkv);
+    if (draft_model) {
+        draft_model->set_fuse_gate_up(fuse_gate_up);
+        draft_model->set_fuse_qkv(fuse_qkv);
+    }
     // Qwen3.5 批量 prefill 开关：CLI > 配置文件 > 默认 true
     const bool batch_prefill = args.no_batch_prefill ? false
                                : config.get("batch_prefill", "true") != "false";
     model->set_batch_prefill(batch_prefill);
     model->set_prompt_len(static_cast<int>(tokens.size()));
+    if (draft_model) {
+        draft_model->set_batch_prefill(batch_prefill);
+        draft_model->set_prompt_len(static_cast<int>(tokens.size()));
+    }
 
     // 打开 logits 输出文件（如果指定了 --dump-logits）
     FILE *logits_out = nullptr;
@@ -952,6 +1075,80 @@ int main(int argc, char **argv) {
         std::printf("ppl %.6f\n", std::exp(mean_nll));
         std::printf("ppl_tokens %ld\n", total_count);
         if (logits_out) std::fclose(logits_out);
+        return 0;
+    }
+
+    // ---- 精确 greedy 投机解码 ----
+    if (draft_model) {
+        tinyqwen::SpeculativeConfig spec_cfg;
+        spec_cfg.max_new_tokens = args.max_new_tokens;
+        spec_cfg.draft_tokens = args.speculative_tokens;
+        spec_cfg.eos_token_id = args.eos;
+        tinyqwen::SpeculativeResult spec;
+        std::string serr;
+        if (!tinyqwen::speculative_generate(*model, *draft_model, metal_engine,
+                                            tokens, spec_cfg, &spec, &serr)) {
+            std::fprintf(stderr, "error: speculative decoding failed: %s\n", serr.c_str());
+            if (metal_engine) tinyqwen::metal_prefill_destroy(metal_engine);
+            return 1;
+        }
+
+        for (size_t i = 0; i < spec.generated_ids.size(); ++i)
+            std::printf("gen %zu %d\n", i, spec.generated_ids[i]);
+        std::printf("generated_ids:");
+        for (int id : spec.generated_ids) std::printf(" %d", id);
+        std::printf("\n");
+
+        const tinyqwen::SpeculativeStats &s = spec.stats;
+        std::fprintf(stderr,
+                     "[speculative] generated=%zu blocks=%d proposed=%d accepted=%d "
+                     "acceptance=%.1f%% corrections=%d bonus=%d rollbacks=%d\n"
+                     "[speculative] target_calls=%d target_inputs=%d draft_calls=%d "
+                     "prefill=%.2f ms decode=%.2f ms\n",
+                     spec.generated_ids.size(), s.blocks, s.draft_proposed,
+                     s.draft_accepted, s.acceptance_rate() * 100.0,
+                     s.corrections, s.bonus_tokens, s.rollbacks,
+                     s.target_verify_calls, s.target_input_tokens,
+                     s.draft_forward_calls, s.prefill_ms, s.decode_ms);
+
+        if (!args.speculative_stats_out.empty()) {
+            FILE *sf = std::fopen(args.speculative_stats_out.c_str(), "w");
+            if (!sf) {
+                std::fprintf(stderr, "error: cannot write %s\n",
+                             args.speculative_stats_out.c_str());
+                if (metal_engine) tinyqwen::metal_prefill_destroy(metal_engine);
+                return 1;
+            }
+            std::fprintf(sf,
+                         "{\n"
+                         "  \"generated_tokens\": %zu,\n"
+                         "  \"hit_eos\": %s,\n"
+                         "  \"draft_tokens_per_block\": %d,\n"
+                         "  \"blocks\": %d,\n"
+                         "  \"draft_proposed\": %d,\n"
+                         "  \"draft_accepted\": %d,\n"
+                         "  \"acceptance_rate\": %.8f,\n"
+                         "  \"corrections\": %d,\n"
+                         "  \"bonus_tokens\": %d,\n"
+                         "  \"rollbacks\": %d,\n"
+                         "  \"target_verify_calls\": %d,\n"
+                         "  \"target_input_tokens\": %d,\n"
+                         "  \"draft_forward_calls\": %d,\n"
+                         "  \"baseline_tail_steps\": %d,\n"
+                         "  \"prefill_ms\": %.6f,\n"
+                         "  \"decode_ms\": %.6f\n"
+                         "}\n",
+                         spec.generated_ids.size(), spec.hit_eos ? "true" : "false",
+                         args.speculative_tokens, s.blocks, s.draft_proposed,
+                         s.draft_accepted, s.acceptance_rate(), s.corrections,
+                         s.bonus_tokens, s.rollbacks, s.target_verify_calls,
+                         s.target_input_tokens, s.draft_forward_calls,
+                         s.baseline_tail_steps, s.prefill_ms, s.decode_ms);
+            std::fclose(sf);
+            std::fprintf(stderr, "[speculative-stats] %s\n",
+                         args.speculative_stats_out.c_str());
+        }
+        if (metal_engine) tinyqwen::metal_prefill_destroy(metal_engine);
         return 0;
     }
 

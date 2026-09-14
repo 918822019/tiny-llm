@@ -13,7 +13,7 @@
 | ④ 计算   | `qwen_model.*` + `qwen_forward_*.cpp`         | 真正的前向：一个 token 进、下一个 token 出             |
 | ⑤ 后端   | `backend.h` + `backend_cpu.*` + `backend_cuda.*` | 算子抽象层：模型只调 IBackend，不关心 dtype/量化/硬件      |
 | ⑥ 测量   | `profiler.*`                                  | 记录每步耗时（可关，关了零开销）                         |
-| ⑦ 编排   | `main.cpp`                                    | CLI：选后端/engine、prefill + decode 循环       |
+| ⑦ 编排   | `main.cpp` + `speculative_decoder.*`          | CLI、普通生成与 draft/verify/rollback 循环       |
 | ⑧ GPU prefill | `metal_prefill.*`（Apple only）          | `--engine metal`：整批 prompt 跑在 Apple GPU，绕过 IBackend |
 | 配置     | `config.*`                                    | key=value 配置解析（供 ⑦ 用）                    |
 
@@ -57,7 +57,8 @@
 - `--engine cuda`（`../kernels/cuda/gpu_engine.cu`）：**整段 decode forward**
   常驻显存、单 stream 跑完，每步仅 4B argmax 过 PCIe。decode 性能路径，
   但不走 IBackend。**没有批量 prefill 入口**，prefill 只能逐 token 喂。
-- `--engine metal`（`metal_prefill.*`）：**整批 prompt prefill** 跑在 Apple GPU，
+- `--engine metal`（`metal_prefill.*`）：整批 prompt prefill 和投机解码的
+  **continuation verify** 跑在 Apple GPU，
   GEMM 走 MPS、其余算子走自写 Metal compute kernel。与上面两条互斥。
   prefill 完把 post-RoPE 的 K/V 写进 `KvCache` 并 `advance(n)`，
   **所以 decode 仍走 CPU 且能正确接续** —— 这正是 cuda engine 缺的那一半。
@@ -78,6 +79,19 @@
   数字与归因见 `../docs/optimization_log.md`，测速用
   `../scripts/bench_metal_prefill.sh`（带离散度列，离散度 >1.5 的行不可用于归因）。
   改 `metal_prefill.mm` 后必须跑接续等价性：`../benchmarks/test_metal_continuation.cpp`。
+
+## 投机解码状态约定
+
+`speculative_decoder.cpp` 始终让目标/草稿 cache 只包含已确认前缀，`pending` 是
+目标模型选出但尚未写入 cache 的下一个 token。每块把 `pending + K 个草稿` 一次
+交给目标验证：首个不一致之前全部接受；不一致处保留目标 token 作为新的 pending；
+全部一致则末行 logits 提供 bonus token。
+
+- full-attention 模型拒绝时只缩短 KV 的逻辑长度，旧槽位随后覆盖；
+- Qwen3.5 GDN 是不可裁剪的递归状态，验证前完整快照，拒绝后恢复并只重放已接受前缀；
+- Metal 同步回退自身 `kv_len`，并在 GDN 模型上把 CPU checkpoint 写回 GPU；
+- `forward_verify()` 对 Qwen2/3 dense 主体走批量 GEMM，再逐位置做 lm_head；
+  Qwen3.5/MoE 的 CPU 验证暂走逐 token 正确性路径。
 
 ## 建议阅读顺序（由浅入深）
 

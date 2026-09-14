@@ -72,9 +72,15 @@ namespace tinyqwen {
     //       批量 prefill 的算子结构与逐 token 不同，不做 op 级拆分——整批
     //       作为一条 prefill 记录计时。
     int QwenModel::forward_prefill(const int *token_ids, int n,
-                                   TopKResult *topk, int topk_k) {
+                                   TopKResult *topk, int topk_k,
+                                   std::vector<int> *all_next) {
+        if (all_next) all_next->clear();
         if (n <= 0) return -1; // 空 prompt，直接返回
-        if (n == 1) return forward_token(token_ids[0], topk, topk_k); // 单 token 回退
+        if (n == 1) {
+            const int next = forward_token(token_ids[0], topk, topk_k);
+            if (all_next) all_next->push_back(next);
+            return next;
+        }
 
         // 提取配置参数（转为 int 便于循环中使用）
         const int hidden = static_cast<int>(cfg_.hidden_size);
@@ -93,15 +99,18 @@ namespace tinyqwen {
         // 不报错但结果全错。
         if (cfg_.is_moe()) {
             // 批量路径优先：按专家分组，每专家只加载一次（省 ~50% I/O）
-            if (batch_prefill_enabled_) {
+            if (batch_prefill_enabled_ && !all_next) {
                 const int r = forward_prefill_moe_batch(token_ids, n, nullptr, 0);
                 if (r != -2) return r;
                 // fallthrough：逐 token 回退
             }
             int last = -1;
-            for (int i = 0; i < n; ++i)
+            for (int i = 0; i < n; ++i) {
+                const bool need_logits = all_next || i == n - 1;
                 last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k,
-                                     /*need_logits=*/i == n - 1);
+                                     need_logits);
+                if (all_next) all_next->push_back(last);
+            }
             return last;
         }
 
@@ -112,15 +121,17 @@ namespace tinyqwen {
         // 无法处理时（无 BLAS 后端 / dtype 不支持 / 开关关闭 / token 太少）
         // 返回 -2，回退到逐 token。
         if (is_qwen35) {
-            if (batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35) {
+            if (batch_prefill_enabled_ && n >= kBatchPrefillMinQwen35 && !all_next) {
                 const int r = forward_prefill_qwen35_batch(token_ids, n, topk, topk_k);
                 if (r != -2) return r;
                 // fallthrough：逐 token 回退
             }
             int last = -1;
-            for (int i = 0; i < n; ++i)
+            for (int i = 0; i < n; ++i) {
                 last = forward_token(token_ids[i], (i == n - 1) ? topk : nullptr, topk_k,
-                                     /*need_logits=*/i == n - 1);
+                                     /*need_logits=*/true);
+                if (all_next) all_next->push_back(last);
+            }
             return last;
         }
 
@@ -345,6 +356,36 @@ namespace tinyqwen {
             return 0; // PPL 模式不产出下一 token
         }
 
+        // 投机验证需要每个输入位置之后的 greedy token。Transformer 的主体仍然
+        // 是上面的一次批量 GEMM；这里只逐行做 final norm + lm_head。最后一行
+        // 留在 logits_ 中，因此 last_logits / top-k 的既有语义保持不变。
+        if (all_next) {
+            ScopedTimer t(prof, "verify_all_positions");
+            all_next->reserve(n);
+            for (int i = 0; i < n; ++i) {
+                const float *h = hid_batch.data() + static_cast<size_t>(i) * hidden;
+                backend_->rmsnorm(h, final_norm_, normed_.data(), hidden,
+                                  cfg_.rms_norm_eps);
+                if (lm_head_is_f32_) {
+                    matvec_f32(static_cast<const float *>(lm_head_), normed_.data(),
+                               logits_.data(), vocab, hidden);
+                } else if (lm_head_is_f16_) {
+                    matvec_f16(static_cast<const uint16_t *>(lm_head_), normed_.data(),
+                               logits_.data(), vocab, hidden);
+                } else if (lm_head_is_i4_) {
+                    matvec_i4(static_cast<const uint8_t *>(lm_head_), normed_.data(),
+                              logits_.data(), vocab, hidden, group_size_);
+                } else {
+                    mv(lm_head_, normed_.data(), logits_.data(), vocab, hidden);
+                }
+                all_next->push_back(argmax(logits_.data(), vocab));
+            }
+            if (topk) top_k_logits(logits_.data(), vocab, topk_k, topk);
+            kv_.advance(n);
+            token_count_ += n;
+            return all_next->back();
+        }
+
         // =====================================================================
         // Step 3: 最终 norm + lm_head（仅取最后一个 token 的 hidden state）
         // =====================================================================
@@ -393,6 +434,12 @@ namespace tinyqwen {
         kv_.advance(n);
         token_count_ += n;
         return next;
+    }
+
+    int QwenModel::forward_verify(const int *token_ids, int n,
+                                  std::vector<int> *all_next) {
+        if (!all_next) return -1;
+        return forward_prefill(token_ids, n, nullptr, 0, all_next);
     }
     // =========================================================================
     // QwenModel::forward_ppl() — 批量 prefill + 全位置交叉熵（困惑度）

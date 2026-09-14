@@ -117,6 +117,32 @@ Android NDK 交叉编译与真机运行流程见 `docs/android.md`。
 
    对齐口径和容差见 `docs/pytorch_alignment.md`。
 
+### 投机解码
+
+目标模型保持最终裁决权，较小的草稿模型先提出 K 个 token；目标模型用一次
+continuation batch 验证，接受首个不一致位置之前的前缀，并在拒绝点改用目标
+token。当前实现是精确 greedy 语义，包含 KV truncate、Qwen3.5 GDN 快照恢复、
+全接受 bonus token 和统计输出：
+
+```bash
+./build/runtime/tinyqwen \
+  --model target.tqwen \
+  --draft-model draft.tqwen \
+  --tokens-json prompt_tokens.json \
+  --speculative-tokens 4 \
+  --max-new-tokens 32 \
+  --speculative-stats-out spec.json
+```
+
+两个模型必须使用同一 tokenizer（运行时会校验 vocab 和 EOS 元数据）。在 Apple
+上可加 `--engine metal`，目标验证走 Metal continuation；其他平台走 CPU。
+正确性验收应把 `generated_ids` 与不带 `--draft-model` 的目标模型 greedy 输出逐位比较。
+仓库内置的快速门禁会同时覆盖全接受与首拒绝回退：
+
+```bash
+./scripts/verify_speculative.sh
+```
+
 ## 不需要真模型的验证
 
 用随机权重小模型打通并数值验证整条链路（loader → forward → KV cache →
@@ -166,6 +192,10 @@ tinyqwen --model <model.tqwen> [options]
 | 参数                        | 默认     | 说明                                                                          |
 |---------------------------|--------|-----------------------------------------------------------------------------|
 | `--model PATH`            | 必填     | .tqwen 权重文件                                                                 |
+| `--draft-model PATH`      | 无      | 启用精确 greedy 投机解码；草稿模型须与目标模型共用 tokenizer                              |
+| `--speculative-tokens K`  | 4      | 每个 verify block 的草稿 token 数                                                  |
+| `--speculative-stats-out PATH` | 无 | 写接受率、拒绝/回退、目标调用数和耗时 JSON                                                |
+| `--draft-matvec-impl NAME` | 无 | 单独选择草稿模型 dtype 的 matvec kernel；目标/草稿同 dtype 时两边共享该选择                      |
 | `--tokens CSV`            | 三选一    | 逗号分隔的 token ids                                                             |
 | `--tokens-json PATH`      | 三选一    | `tokenize_prompt.py` 输出的 JSON                                               |
 | `--batch-tokens-jsonl PATH` | 三选一  | 批量模式（数据集测试）：JSONL 每行一条 `{"tokens": [...]}`，需配 `--batch-out`；与 topk/dump-logits/engine/profile-out 互斥 |
@@ -180,7 +210,7 @@ tinyqwen --model <model.tqwen> [options]
 | `--matvec-impl NAME`      | ref    | matvec kernel 实现：任意已注册名；f32/f16/i4 三套独立注册表，按模型 dtype 解析，未知值报错并列出可用          |
 | `--ops-impl NAME`         | ref    | 非 matvec 算子（rmsnorm/rope/attention/swiglu/argmax + GDN 四算子）：`ref` / `neon` |
 | `--backend NAME`          | CPU    | 计算后端（IBackend 实现）：空 = CPU；`cuda` = 逐算子 CUDA 后端（需 CUDA 构建）                   |
-| `--engine NAME`           | 无      | engine：`cuda` = GPU-resident 整段 **decode**（需 CUDA 构建；仅 Qwen2.x + greedy）；`metal` = Apple GPU 整批 **prefill**（仅 Apple；两者互斥） |
+| `--engine NAME`           | 无      | engine：`cuda` = GPU-resident 整段 **decode**（需 CUDA 构建；仅 Qwen2.x + greedy）；`metal` = Apple GPU 整批 prefill，并可用于投机 continuation verify（仅 Apple；两者互斥） |
 | `--no-fuse-gate-up`       | 关      | 禁用 FFN gate/up 成对融合（A/B 用）                                                  |
 | `--no-fuse-qkv`           | 关      | 禁用 q/k/v 三路融合（A/B 用）                                                        |
 | `--kv-f16`                | 关      | KV cache 存 fp16（内存减半，长上下文用；解码慢 ~8%，内存特性非提速）                                    |
@@ -250,6 +280,6 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 ## 边界声明
 
 本项目刻意**不做**：通用 graph executor、C++ tokenizer、safetensors C++ parser、
-Android App / JNI。speculative decoding 策略、多 LoRA 调度不在 v1 范围内。
+Android App / JNI、采样式 speculative decoding、多 LoRA 调度不在 v1 范围内。
 v1 提供：正确的多精度推理路径（f32 reference + f16/i4 优化 kernel）、可插拔的
 后端/量化抽象（IBackend / WeightTensor）和 profiling + 可复现基准设施。

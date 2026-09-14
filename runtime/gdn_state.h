@@ -128,6 +128,11 @@ namespace tinyqwen {
         // ---------------------------------------------------------------------
         size_t memory_bytes() const { return data_.size() * sizeof(float); }
 
+        // 连续 arena 访问：Metal 状态回退时把 CPU 快照整体写回 GPU。
+        const float *data() const { return data_.data(); }
+        float *data() { return data_.data(); }
+        size_t size() const { return data_.size(); }
+
     private:
         int n_linear_layers_ = 0;  // GDN 层的数量
         int num_v_heads_ = 0;      // 每个 GDN 层的 V 头数

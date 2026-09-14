@@ -98,6 +98,21 @@ vocab 个 fp32，行序 = 位置序；完整语义见 README「CLI 参考」）�
 
 字段含义见 `profiling_schema.md`。
 
+### Android 投机解码
+
+把目标、草稿两个 `.tqwen` 文件推到同一目录后直接使用同一个二进制：
+
+```bash
+adb shell "cd /data/local/tmp/tinyqwen && \
+  ./tinyqwen --model target.tqwen --draft-model draft.tqwen \
+    --tokens-json tokens.json --speculative-tokens 4 --max-new-tokens 32 \
+    --speculative-stats-out spec.json"
+```
+
+Android 没有 Metal，目标验证走 CPU。Qwen2/3 dense 会批量验证；Qwen3.5/MoE
+当前走逐 token 正确性路径。上线前先用同一目标模型、不带 `--draft-model` 跑一遍，
+确认两次 `generated_ids` 完全一致，再比较 `spec.json` 的接受率和总耗时。
+
 ## 5. 常见坑
 
 | 现象                       | 处理                                                                  |

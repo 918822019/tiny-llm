@@ -155,4 +155,10 @@ namespace tinyqwen {
         }
         seq_len_ += n;
     }
+
+    bool KvCache::truncate(int new_seq_len) {
+        if (new_seq_len < 0 || new_seq_len > seq_len_) return false;
+        seq_len_ = new_seq_len;
+        return true;
+    }
 } // namespace tinyqwen

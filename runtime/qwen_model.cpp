@@ -713,6 +713,45 @@ namespace tinyqwen {
         token_count_ = 0; // 重置 token 计数
     }
 
+    QwenModel::StateCheckpoint QwenModel::checkpoint() const {
+        StateCheckpoint state;
+        state.seq_len = kv_.seq_len();
+        state.token_count = token_count_;
+        state.gdn = gdn_state_;
+        return state;
+    }
+
+    bool QwenModel::restore(const StateCheckpoint &state, std::string *err) {
+        if (state.seq_len < 0 || state.seq_len > kv_.seq_len()) {
+            if (err) *err = "checkpoint KV length is outside the current prefix";
+            return false;
+        }
+        if (state.gdn.size() != gdn_state_.size()) {
+            if (err) *err = "checkpoint GDN shape does not match model state";
+            return false;
+        }
+        if (!kv_.truncate(state.seq_len)) {
+            if (err) *err = "failed to truncate KV cache to checkpoint";
+            return false;
+        }
+        gdn_state_ = state.gdn;
+        token_count_ = state.token_count;
+        return true;
+    }
+
+    bool QwenModel::truncate(int seq_len, std::string *err) {
+        if (gdn_state_.initialized()) {
+            if (err) *err = "cannot truncate recurrent GDN state without a checkpoint";
+            return false;
+        }
+        if (!kv_.truncate(seq_len)) {
+            if (err) *err = "KV truncate target is outside the current prefix";
+            return false;
+        }
+        token_count_ = seq_len;
+        return true;
+    }
+
     // =========================================================================
     // QwenModel::mm() — 批量矩阵乘法（GEMM，用于 prefill）
     // =========================================================================

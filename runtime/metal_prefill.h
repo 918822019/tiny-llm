@@ -108,6 +108,8 @@ namespace tinyqwen {
     //               **混合架构（Qwen3.5）必须传** —— 不传的话 CPU decode 会从
     //               零状态开始（实测：prefill 首 token 正确但 decode 立刻发散）。
     //   err:        输出参数；失败时写入原因
+    //   all_argmax_out: 可选，容量至少 n；all_logits=true 时写每一行的
+    //                   argmax，投机验证可避免再复制 n*vocab 个 logits。
     //
     // 返回值:
     //   最后一个位置（第 n-1 行）logits 的 argmax，也就是下一个 token id；
@@ -129,10 +131,10 @@ namespace tinyqwen {
     // ---------------------------------------------------------------------
     int metal_prefill_run(MetalPrefillEngine *engine, const int *tokens, int n,
                           float *logits_out, bool all_logits, KvCache *kv, GdnState *gdn,
-                          std::string *err);
+                          std::string *err, int *all_argmax_out = nullptr);
 
     // ---------------------------------------------------------------------
-    // metal_prefill_reset_kv: 清空引擎的 GPU KV cache，回到位置 0
+    // metal_prefill_reset_kv: 清空引擎的 GPU KV/GDN 状态，回到位置 0
     //
     // 参数:
     //   engine: 引擎
@@ -140,8 +142,7 @@ namespace tinyqwen {
     // 说明:
     //   开始一段新序列前必须调用。不清空的话下一次 run 会把新 token 追加到旧
     //   上下文后面，attention 会读到上一段序列的历史。
-    //   注意：本函数只清引擎的 GPU cache，调用方若还用了 CPU 的 KvCache，
-    //   需要自己另行 reset。
+    //   调用方若还用了 CPU 的 KvCache/GdnState，需要自己另行 reset。
     // ---------------------------------------------------------------------
     void metal_prefill_reset_kv(MetalPrefillEngine *engine);
 
@@ -149,6 +150,11 @@ namespace tinyqwen {
     // metal_prefill_kv_len: 引擎当前已缓存的位置数
     // ---------------------------------------------------------------------
     int metal_prefill_kv_len(const MetalPrefillEngine *engine);
+
+    // 将 Metal 引擎回退到已验证前缀。KV buffer 不清零，只缩短可见长度；
+    // Qwen3.5 的 GDN 递归状态从 CPU checkpoint 整体恢复。
+    bool metal_prefill_rewind(MetalPrefillEngine *engine, int kv_len,
+                              const GdnState *gdn, std::string *err);
 
     // ---------------------------------------------------------------------
     // metal_prefill_device_name: 返回 Metal 设备名（日志用）

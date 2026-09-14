@@ -166,7 +166,12 @@ namespace tinyqwen {
         //     - 一次处理多个 token 的 attention 和 FFN
         //     - prefill 结束后 KV cache 中已有 n 个 token 的 K/V
         // ---------------------------------------------------------------------
-        int forward_prefill(const int *token_ids, int n, TopKResult *topk = nullptr, int topk_k = 5);
+        int forward_prefill(const int *token_ids, int n, TopKResult *topk = nullptr,
+                            int topk_k = 5, std::vector<int> *all_next = nullptr);
+
+        // 批量验证 token，并返回每个输入位置之后的 greedy token：
+        // all_next[i] = argmax P(next | prefix, token_ids[0..i])。
+        int forward_verify(const int *token_ids, int n, std::vector<int> *all_next);
 
         // ---------------------------------------------------------------------
         // forward_ppl: 批量 prefill + 全位置 lm_head + 交叉熵，计算困惑度
@@ -234,6 +239,24 @@ namespace tinyqwen {
         // ---------------------------------------------------------------------
         void reset();
 
+        struct StateCheckpoint {
+            int seq_len = 0;
+            int token_count = 0;
+            GdnState gdn;
+        };
+
+        // 投机验证前保存/恢复状态。KV 内容不用复制，只裁短逻辑长度；
+        // GDN 是递归状态，拒绝时必须恢复完整快照。
+        StateCheckpoint checkpoint() const;
+        bool restore(const StateCheckpoint &state, std::string *err = nullptr);
+
+        // 仅适用于没有 GDN 递归状态的模型，保留当前 KV 的指定前缀。
+        bool truncate(int seq_len, std::string *err = nullptr);
+
+        // Metal 等外部引擎直接推进 KV 后，同步模型的逻辑 token 计数。
+        void sync_external_state() { token_count_ = kv_.seq_len(); }
+        bool has_recurrent_state() const { return gdn_state_.initialized(); }
+
         // 让 profiler 知道哪些是 prefill token（用于性能分析）
         void set_prompt_len(int n) { prompt_len_ = n; }
 
@@ -275,6 +298,7 @@ namespace tinyqwen {
         // 必须把 recurrent/conv 状态写回这里，否则后续 CPU decode 会从零状态开始
         // （实测：prefill 首 token 正确但 decode 立刻发散）。
         GdnState &gdn_state() { return gdn_state_; }
+        const GdnState &gdn_state() const { return gdn_state_; }
 
         // GDN 状态总字节数（Qwen3.5 专用；Qwen2.x 恒为 0）
         size_t gdn_state_bytes() const { return gdn_state_.memory_bytes(); }
