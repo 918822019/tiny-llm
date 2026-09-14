@@ -5,9 +5,10 @@
 DFlare 为每个草稿层学习目标层融合权重，DSpark Markov 头再把前一个草稿 token
 的信息按低秩残差加到下一个位置的 logits。
 
-当前范围刻意固定为：Qwen3 稠密目标、batch=1、greedy、单链、FP16 权重。目标
-验证当前走 CPU；草稿可走 CPU，或在 Android 上用 Vulkan GPU-resident 执行器。
-树搜索和采样式 rejection sampling 尚未接入。
+当前范围刻意固定为：Qwen3 稠密目标、batch=1、greedy、单链、FP16 权重。CPU
+模式的 proposal/verification 都走 CPU；Android `--backend vulkan` 模式在 CPU
+prefill 后，让 DFlash proposal 与 Qwen3 target verification/capture 共用同一 GPU
+执行器。树搜索和采样式 rejection sampling 尚未接入。
 
 ## 1. 已验证 checkpoint
 
@@ -98,9 +99,10 @@ adb shell "cd /data/local/tmp/tinyqwen && ./tinyqwen \
   --speculative-tokens 2 --matvec-impl neon_mt_kv_nt --ops-impl neon --kv-f16"
 ```
 
-让 DFlash drafter 走 Vulkan，只需在同一命令追加 `--backend vulkan`。不要把它和
-普通 Qwen 的逐算子 Vulkan 路径混为一谈：DFlash 专用执行器把整个 proposal block
-录进一条 command buffer，权重和 KV 常驻 GPU，每块只等待一次 fence。
+让 DFlash 与 target decode 走 Vulkan，只需在同一命令追加 `--backend vulkan`。不要
+把它和普通 Qwen 的逐算子 Vulkan 路径混为一谈：DFlash 专用执行器先导入 CPU prefill
+产生的 target KV，再分别把整个 proposal block 和 target verification block 录进
+command buffer；两套 decode 权重/KV 常驻同一个 device，lm_head 只上传一份。
 
 首次部署应分别跑普通 greedy 与 DFlash，比较两行 `generated_ids` 必须完全相同。
 随后再看 `blocks`、`accepted`、`target_calls` 与 `decode`，不能只看接受率。
@@ -162,7 +164,7 @@ DFlare + rank-128 Markov drafter 在 CPU 上的额外权重读取。尤其 Marko
 问答/代码/数学样本为 19%–31%（block=8）。这说明单条 prompt 不能代表论文报告的
 多数据集均值；评估 drafter 质量应复现相同数据集和 prompt 模板。
 
-### 5.3 Android Vulkan FP16 drafter
+### 5.3 Android Vulkan FP16 drafter（第一阶段历史结果）
 
 Vulkan 实现分成两层：
 
@@ -199,9 +201,9 @@ GPU 确实执行并且一次块提交已生效；开发过程中的朴素 whole-
 上约 579 ms，打包读取 + subgroup 归约的最好轮为 140 ms。但与已经高度优化的 ARM
 CPU drafter 配对后，GPU draft 目前只是同量级，且 GPU 权重流会影响随后 CPU target
 验证的频率/内存状态，端到端反而慢约 16%–18%。因此当前结论是：**GPU 后端功能与
-正确性成立，论文式端到端加速尚未成立**。下一步的高价值工作是让 target verify 也
-GPU-resident（并与 drafter 共用 device/lm_head），或提高 checkpoint 接受率以减少
-block=8 的 37 个 target 输入；继续优化单个逐算子 submit 不会解决结构性瓶颈。
+正确性成立，论文式端到端加速尚未成立**。本阶段暴露出的下一步是让 target verify
+也 GPU-resident；该项已在 5.4 完成。提高 checkpoint 接受率仍是决定能否超过 greedy
+的核心因素。
 
 诊断时可用：
 
@@ -214,3 +216,55 @@ TINYQWEN_VULKAN_TRACE=1 ./tinyqwen ... --dflash-model draft.tqwen \
 stderr I/O，正式 benchmark 不应开启。设备要求 Vulkan 1.2、FP16 shader、16-bit
 storage、compute clustered subgroup；不满足时初始化会 fail-fast，而不会静默声称
 正在使用 GPU。
+
+### 5.4 同设备 Vulkan target verification
+
+第二阶段把 dense Qwen3 target 的 decode/verification 也放进
+`DFlashVulkanEngine`，但保留 CPU prefill 作为数值锚点：
+
+1. CPU 对 prompt 做一次正常 prefill，并捕获第一块所需的 selected residual；
+2. 把 CPU KV 从 `[layer, head, seq, dim]` 转成 GPU 的
+   `[layer, seq, kv_dim]`，只同步确认前缀一次；
+3. target 每层在 GPU 执行 RMSNorm、FP16 weight-only Q/K/V、QK norm、RoPE、
+   causal attention、O projection、SwiGLU FFN；
+4. selected layer 的 residual 由 shader 写成 `[token, selected_layer, hidden]`，
+   target final norm、共享 lm_head 和每位置 argmax 也在同一 verification pass；
+5. 拒绝时只缩短 target 的逻辑 KV 长度，已写但未接受的槽位在下一块覆盖。
+
+DFlash 与 target 共用一个 Vulkan device、同一套 buffer 分配逻辑和唯一一份 target
+lm_head。当前 proposal 与 target verification 仍各提交一次；selected residual 会读回
+CPU，经过既有编排裁出接受前缀后，在下一次 proposal 上传。后续可以把裁剪索引也放到
+GPU，以消掉这次小数据往返，但它已不再触发任何 target CPU matrix 计算。
+
+实现有意只接受无 bias、无旋转、稠密 FP16 Qwen3，避免把不支持的 Qwen2/Qwen3.5/MoE
+静默套进错误图。GPU 权重为 FP16、激活和当前 GPU KV 为 FP32；`--kv-f16` 决定 CPU
+prefill cache 的存储格式，导入时转换回 FP32。
+
+PLK110 / Adreno 840、43-token code prompt、6 CPU workers、block=8 的相邻结果：
+
+| 生成长度 | 路径 | 接受情况 | draft | target verify | decode |
+|---:|---|---:|---:|---:|---:|
+| 16 | CPU DFlash | 10/32（31.2%） | 181.78 ms | 428.11 ms | 610.02 ms |
+| 16 | Vulkan DFlash + target，轮 1 | 10/32（31.2%） | 137.35 ms | 231.96 ms | 369.71 ms |
+| 16 | Vulkan DFlash + target，轮 2 | 10/32（31.2%） | 133.05 ms | 229.83 ms | 363.24 ms |
+| 16 | Vulkan DFlash + target，最终构建 | 10/32（31.2%） | 137.15 ms | 224.38 ms | 361.68 ms |
+| 16 | 普通 greedy | — | — | — | 313.31 ms |
+| 64 | Vulkan DFlash + target | 36/171（21.1%） | 701.51 ms | 1279.08 ms | 1981.69 ms |
+| 64 | 普通 greedy | — | — | — | 1768.85 ms |
+
+16-token GPU 版相对同场 CPU DFlash 缩短约 39%–41%，target verify 本身缩短约
+46%–48%；三轮 GPU 结果的极差约 2.2%。16-token 和 64-token 的 `generated_ids` 都与普通 greedy 逐位
+一致，16-token 的 blocks/proposed/accepted/rollback/bonus 仍为
+`5/32/10/4/1`。host 206 tests 与 Android 208 tests 均为 0 failed。
+
+因此结论分两层：**同设备 GPU target 后端已经成立，并修复了第一阶段 GPU/CPU 切换
+导致的端到端倒退；但当前 checkpoint 仍不符合论文的端到端加速预期。** 16-token
+比 greedy 慢约 15%–18%，64-token 慢约 12%。长样本接受率只有 21.1%，使 target
+实际验证 198 个输入才能生成 64 token，drafter 的 702 ms 开销无法被省下的 target
+工作抵消。下一步应优先评估论文同数据集/模板下的 checkpoint 接受率，并把 proposal
+与 verification/selected-hidden 裁剪进一步串成 GPU 内链路。
+
+资源口径也随之变化：当前 target + DFlash GPU 权重为 1313.2 MB，
+`max_seq_len=256` 时两套 GPU FP32 KV 合计 62.0 MB；CPU 侧两个模型文件仍常驻。
+启动内存门禁按完整 target + DFlash GPU 副本计入 1313 MB，不再沿用第一阶段只估
+473 MB drafter/lm_head 的口径。

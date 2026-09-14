@@ -162,11 +162,13 @@ CPU 主线没有这个区分：CPUBackend 就是唯一路径。
 
 Android 的 `--backend vulkan` 也有两种执行形态。普通 Qwen 走
 `VulkanBackend`：仅 FP16 matrix op 在 GPU 上，每次算子都同步回 CPU，定位是单算子
-正确性和 bring-up，不是性能路径。若同时传入 `--dflash-model`，CLI 会保留 CPU target，
-并改用 `DFlashVulkanEngine`：DFlare backbone、共享 target lm_head、顺序 Markov 修正和
-argmax 全部常驻 GPU，一个 speculative block 只提交一次 command buffer。该路径需要
-Vulkan 1.2、`shaderFloat16`、16-bit storage 和 compute clustered subgroup；当前块长上限
-为 8。目标 verify 尚未 GPU-resident，所以它仍是 CPU target + Vulkan drafter 的混合路径。
+正确性和 bring-up，不是性能路径。若同时传入 `--dflash-model`，CLI 会改用
+`DFlashVulkanEngine`：CPU prefill 完成后，把 target KV 前缀从 head-major 转成 GPU
+token-major 布局；此后 DFlare proposal 与 Qwen3 target verification/capture 共享一个
+Vulkan device、buffer 分配器和唯一一份 lm_head。两段各自录成一条 command buffer，
+拒绝时只回退 target 的逻辑 KV 长度。该路径需要 Vulkan 1.2、`shaderFloat16`、16-bit
+storage 和 compute clustered subgroup；当前块长上限为 8，目标仅支持无 bias、无旋转、
+稠密 FP16 Qwen3。
 
 ## 数据流
 

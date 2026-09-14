@@ -17,7 +17,7 @@ tinyqwen/
 │   ├── backend_cpu.h/.cpp  # CPUBackend：按 quant_type 包装 kernels/dispatch 通用入口（主线）
 │   ├── backend_cuda.h/.cpp # CUDABackend：逐算子 CUDA（需 CUDA 构建；A/B 用，非性能路径）
 │   ├── backend_vulkan.h/.cpp # Android FP16 逐算子 Vulkan（正确性 / bring-up）
-│   ├── dflash_vulkan.h/.cpp  # DFlash GPU-resident 整块 Vulkan 执行器
+│   ├── dflash_vulkan.h/.cpp  # 同设备 DFlash proposal + Qwen3 target Vulkan 执行器
 │   ├── vulkan/*.comp         # 构建时编译、嵌入 binary 的 compute shader
 │   ├── config.h/.cpp       # key=value 配置解析（零依赖，不引 YAML）
 │   ├── qwen_model.h/.cpp   # create()：权重绑定/校验 + KV/workspace 分配 + 公共逻辑
@@ -115,7 +115,7 @@ main.cpp ──> QwenModel ──> IBackend ──> CPUBackend ──> dispatch 
      │           │             │
      │           │             ├─> CUDABackend（逐算子，--backend cuda）
      │           │             └─> VulkanBackend（Android FP16；逐算子 A/B）
-     │           ├─> DFlashVulkanEngine（Android；一 proposal block 一次提交）
+     │           ├─> DFlashVulkanEngine（Android；同设备 proposal + target verify）
      │           └─> tiny_format.h <── tools/*.py（二进制契约）
      └─> --engine cuda ──> gpu_decode engine（kernels/cuda/gpu_engine.cu，整段 forward）
 ```

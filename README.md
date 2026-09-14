@@ -160,7 +160,8 @@ Qwen3 目标模型的指定层残差流、并行构造 mask block、应用低秩
   --speculative-tokens 2 --max-new-tokens 32
 ```
 
-当前支持 FP16、greedy、单链，以及 CPU / Android Vulkan GPU-resident drafter；
+当前支持 FP16、greedy、单链，以及 CPU 路径 / Android Vulkan GPU-resident
+DFlash + target decode；GPU 模式仍用 CPU prefill 作为数值锚点，随后一次导入 KV。
 算法、导出、Android 真机结果与性能限制见 `docs/dflash.md`。Android 用法是在同一
 命令末尾加 `--backend vulkan`。
 

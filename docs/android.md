@@ -112,14 +112,14 @@ adb shell "cd /data/local/tmp/tinyqwen && \
     --speculative-stats-out spec.json"
 ```
 
-Android 没有 Metal，目标验证走 CPU。Qwen2/3 dense 会批量验证；Qwen3.5/MoE
-当前走逐 token 正确性路径。上线前先用同一目标模型、不带 `--draft-model` 跑一遍，
-确认两次 `generated_ids` 完全一致，再比较 `spec.json` 的接受率和总耗时。
+Android 没有 Metal；普通 `--draft-model` 投机路径的目标验证走 CPU。Qwen2/3 dense
+会批量验证；Qwen3.5/MoE 当前走逐 token 正确性路径。上线前先用同一目标模型、不带
+草稿跑一遍，确认两次 `generated_ids` 完全一致，再比较 `spec.json` 的接受率和总耗时。
 
 DFlash / DFlare + Markov 使用 `--dflash-model draft.tqwen`。加
-`--backend vulkan` 后，target 继续走已优化的 ARM FP16 batch，DFlash drafter 的三层
-backbone、共享 lm_head、Markov 修正和 argmax 则常驻 GPU；一个 proposal block 只做
-一次 queue submit / fence wait：
+`--backend vulkan` 后，CPU 只做 prefill 并把 target KV 前缀导入 GPU；DFlash drafter
+与 Qwen3 target verify/capture 共用同一 Vulkan device 和 lm_head。proposal pass 与
+target pass 各做一次 queue submit / fence wait：
 
 ```bash
 adb shell "cd /data/local/tmp/tinyqwen && \

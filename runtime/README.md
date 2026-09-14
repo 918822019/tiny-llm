@@ -81,9 +81,10 @@
   改 `metal_prefill.mm` 后必须跑接续等价性：`../benchmarks/test_metal_continuation.cpp`。
 - `--backend vulkan`（Android）：普通 Qwen 使用 `backend_vulkan.*` 的逐算子 FP16
   matrix 路径，每次都有 submit/fence，只用于正确性 A/B。与 `--dflash-model` 同时
-  使用时会自动改走 `dflash_vulkan.*`：DFlare、共享 lm_head、Markov 与 argmax 在
-  GPU 常驻，一个 proposal block 一次提交；target verify 仍走 CPU。设备要求与实测
-  结论见 `../docs/dflash.md`，当前尚未获得端到端加速。
+  使用时会自动改走 `dflash_vulkan.*`：CPU prefill 后一次导入 target KV；DFlare、
+  target verify/capture、共享 lm_head、Markov 与 argmax 都在同一 Vulkan device
+  常驻，proposal 与 verification 各一次提交。设备要求与实测结论见
+  `../docs/dflash.md`；相对 CPU DFlash 已提速，但当前 checkpoint 尚未超过 greedy。
 
 ## 投机解码状态约定
 
@@ -100,8 +101,9 @@
 
 `--dflash-model` 走另一种草稿约定：DFlash cache 只保存已确认目标隐藏状态投影出的
 context K/V，anchor/mask 的 noise K/V 每次提案后立即丢弃。目标验证同时捕获指定层
-残差流，拒绝后只把 `anchor + accepted` 对应的切片交给下一块。完整数学和真机结果
-见 `../docs/dflash.md`。
+残差流，拒绝后只把 `anchor + accepted` 对应的切片交给下一块。Vulkan 路径分别维护
+draft/target 逻辑 KV 长度，拒绝只裁短指针，旧槽位由下一次验证覆盖。完整数学和真机
+结果见 `../docs/dflash.md`。
 
 ## 建议阅读顺序（由浅入深）
 

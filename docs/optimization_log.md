@@ -60,6 +60,7 @@
 | sdot5_sym（macOS M4，对称量化） | 本次 | — | — | —（仅 0.8B 验证） | 0.8B decode **1.045×**（8.07→7.72 ms/tok） | sdot5：对称量化（zero=8）+ 无 zero 修正项 + 无前缀和，导出器加 `--symmetric`（--method rtn）。每 64 权重组省 ~7 条标量（zero 读/转/FSUB/C/xqsum×2/修正）。**部分证伪**：0.8B 只提 4.5%，远低于预期 1.5-2×——省下的标量指令大部分被 OoO 隐藏在内存加载延迟后，瓶颈是带宽/加载流水线不是标量。4B 对称导出未做（留作后续）。数值正确（对称单测 + 单测全过） |
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 | dflash-vulkan-f16（Android / Adreno 840） | 本次 | — | — | — | GPU draft 与 CPU 同量级（配对轮约 155–186 vs 161–166 ms） | Vulkan FP16 逐算子正确性后端 + DFlash GPU-resident 整块执行器；208 真机测试、真实输出逐 token 对齐。逐算子 2160 submit 的错误形态改为每 proposal block 一次 submit；端到端仍慢 16%–18%，target verify 尚在 CPU，属于功能落地而非提速结论 |
+| dflash-vulkan-target（Android / Adreno 840） | 本次 | — | — | — | **1.65× vs 同场 CPU DFlash**（610.02→369.71 ms） | CPU prefill 后导入 KV；DFlash proposal 与 dense Qwen3 target verify/capture 共用 device/allocator/lm_head。16/64 token 均与 greedy 逐位一致，target verify 428.11→231.96 ms；但 16-token 仍慢于 greedy 313.31 ms，低接受率下尚不符合论文端到端预期 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ### dflash-qwen3-0.6b-markov（2026-09-14，Android 正确性与首轮性能）
@@ -4187,8 +4188,37 @@ done; done
   (`max_seq_len=256`)；CPU 模型文件不释放。内存预检同步修复为 Android
   `MemAvailable`，不再把约 5.8 GB 可用内存误报成约 1 GB `MemFree`。
 - **下一步**：把 target verify 与 drafter 放进同一个 Vulkan device/allocator，复用
-  lm_head 并避免 GPU→CPU 阶段切换；同时用论文相同数据集/模板评估接受率。仅继续
-  优化通用逐算子 Vulkan submit 不会改变端到端结论。
+  lm_head 并避免 GPU→CPU 阶段切换；该项已在下一节完成。仍需用论文相同数据集/模板
+  评估接受率；仅继续优化通用逐算子 Vulkan submit 不会改变端到端结论。
+
+---
+
+### DFlash Android Vulkan target verification（2026-09-14）
+
+- **优化栈**：上一节 DFlash whole-block Vulkan drafter + 同 device 的 dense Qwen3
+  target verification/capture + 共享 lm_head。
+- **是什么**：保留 CPU prefill 作为数值锚点，把确认 KV 前缀一次性转成 GPU
+  token-major 布局；此后 target 的 QKV/QK norm/RoPE/因果 attention/FFN、selected
+  residual capture、final norm/lm_head/argmax 全部在单个 verification command buffer。
+  拒绝时仅回退 GPU target 的逻辑 KV 长度。
+- **16-token 配对**：同一 PLK110、43-token code prompt、block=8、6 workers。
+  CPU DFlash 为 draft 181.78 + verify 428.11 = decode 610.02 ms；Vulkan 两轮分别为
+  137.35 + 231.96 = 369.71 ms、133.05 + 229.83 = 363.24 ms。相对同场 CPU DFlash
+  缩短约 39%，target verify 缩短约 46%。最终重编译门禁为
+  137.15 + 224.38 = 361.68 ms；普通 greedy 为 313.31 ms。
+- **64-token长门禁**：Vulkan DFlash 为 draft 701.51 + verify 1279.08 = 1981.69 ms；
+  普通 greedy 为 1768.85 ms。接受率降到 36/171（21.1%），27 次 target call 验证
+  198 个输入，额外 draft 工作仍无法回收。
+- **正确性**：16 token 与 64 token 的 `generated_ids` 均与普通 greedy 逐位一致；
+  16-token 投机路径仍为 5 blocks / 32 proposed / 10 accepted / 4 rollback / 1 bonus。
+  host 206 tests、Android 208 tests 均为 0 failed。
+- **资源**：target + DFlash GPU 权重 1313.2 MB，lm_head 只有一份；
+  `max_seq_len=256` 时两套 GPU FP32 KV 合计 62.0 MB。CPU 两个模型文件仍常驻，
+  内存预检把完整 1313 MB GPU 副本纳入预算。
+- **判定**：GPU target 后端与相对 CPU DFlash 的端到端提速成立，第一阶段的混合
+  CPU/GPU 倒退已消失；但仍比 greedy 慢约 12%–18%，所以**尚不符合论文端到端加速
+  预期**。下一刀是把两次 submit 与 selected-hidden host 往返串成 GPU 内链路，同时
+  在论文相同数据集/模板上重新衡量 checkpoint 接受率。
 
 ---
 
