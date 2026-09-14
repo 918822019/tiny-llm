@@ -116,6 +116,25 @@ Android 没有 Metal；普通 `--draft-model` 投机路径的目标验证走 CPU
 会批量验证；Qwen3.5/MoE 当前走逐 token 正确性路径。上线前先用同一目标模型、不带
 草稿跑一遍，确认两次 `generated_ids` 完全一致，再比较 `spec.json` 的接受率和总耗时。
 
+Qwen3-0.6B 的 SpecForge EAGLE3 checkpoint 使用 `--eagle3-model`。它的
+`--speculative-tokens` 表示包含 pending root 的验证块宽度；手机 CPU 当前建议先用 2：
+
+```bash
+adb shell "cd /data/local/tmp/tinyqwen && \
+  TINYQWEN_MT_THREADS=6 ./tinyqwen \
+    --model models/model_qwen3_06b_f16_ctx2048.tqwen \
+    --eagle3-model models/eagle3_qwen3_06b_specforge_f16.tqwen \
+    --tokens-json tokens.json --speculative-tokens 2 --max-new-tokens 64 \
+    --matvec-impl neon_mt_kv_nt --ops-impl neon --kv-f16 \
+    --speculative-stats-out eagle3.json"
+```
+
+PLK110 上英文 64-token 样例的 proposal 接受率为 53.7%，target 调用从 63 降到
+41；但 CPU EAGLE3 三轮 decode 中位数 3021.45 ms，普通 greedy 为 2871.97 ms，
+仍慢 5.2%。追加 `--backend vulkan` 后，target 使用通用逐算子 Vulkan、drafter 仍在
+CPU；它相对 Vulkan greedy 有 1.30x decode 加速，但仍明显慢于 CPU greedy。完整
+转换命令、正确性校验、中文结果与原因分析见 `eagle3.md`。
+
 DFlash / DFlare + Markov 使用 `--dflash-model draft.tqwen`。加
 `--backend vulkan` 后，CPU 只做 prefill 并把 target KV 前缀导入 GPU；DFlash drafter
 与 Qwen3 target verify/capture 共用同一 Vulkan device 和 lm_head。proposal pass 与
@@ -135,10 +154,11 @@ adb shell "cd /data/local/tmp/tinyqwen && \
 还要求 compute clustered subgroup，且当前 checkpoint block 上限为 8。详细导出命令、
 块长语义和 PLK110 真机 A/B 见 `dflash.md`。
 
-`--backend vulkan` 不等于整条推理都上 GPU：普通 Qwen 的逐算子后端每个矩阵操作都
-同步一次，仅用于正确性 A/B；DFlash 专用路径虽把整段 drafter 合并成一次提交，target
-verify 仍在 CPU。必须同时比较 `draft_ms`、`target_verify_ms` 和最终 decode，不能用
-“接受率大于零”或“GPU 确实执行了”代替端到端加速结论。
+`--backend vulkan` 不等于所有投机路径都会整段上 GPU：普通 Qwen 与 EAGLE3 target
+使用逐算子后端，每个矩阵操作都同步一次，EAGLE3 drafter 仍在 CPU；DFlash 专用路径
+则已让 drafter 和 target verification/capture 共用 device，并各自整块提交。必须同时
+比较 `draft_ms`、`target_verify_ms` 和最终 decode，不能用“接受率大于零”或“GPU
+确实执行了”代替端到端加速结论。
 
 ## 5. 常见坑
 

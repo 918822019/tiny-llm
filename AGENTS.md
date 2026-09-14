@@ -344,6 +344,15 @@ ctest --test-dir build --output-on-failure     # 等价 ./build/tests/tinyqwen_t
     target verify 又在 GPU 轮变慢，最终仍慢 16%–18%。后续 GPU 工作的门槛是
     **target + draft 同 device 常驻、复用 lm_head、按整段计时**；继续打磨每算子
     H2D/D2H 或只报 kernel 时间不能作为性能结论。
+38. **EAGLE3 不是普通 draft LM，token shift 和拒绝后的 draft 重建都不能省。**
+    SpecForge Qwen3-0.6B checkpoint 使用 target 第 `1,13,24` 层后的 residual，先
+    concat 为 `3H` 再经 `fc`；位置 `i` 的 target feature 必须与 token `i+1` 的
+    embedding 配对。深层 proposal 又依赖未验证的 recurrent hidden/KV，所以拒绝后
+    不能只改长度继续跑：裁回块前 draft checkpoint，再用 confirmed target residual
+    和 accepted/correction token 重建 suffix。独立 BF16 reference 与 C++ 首块 proposal
+    一致才是实现判据。PLK110 英文 64-token width=2 接受率 53.7%、target call 63→41，
+    但 draft ~201 ms 大于 verify 节省 ~97 ms，端到端仍慢 3.6%–5.2%；width=4 更慢。
+    模型卡的 GPU width=4 不能直接当手机 CPU 最优参数，完整口径见 `docs/eagle3.md`。
 
 ## 权重 / 数据位置（均已被 .gitignore 忽略，不入库）
 

@@ -13,7 +13,7 @@
 | ④ 计算   | `qwen_model.*` + `qwen_forward_*.cpp`         | 真正的前向：一个 token 进、下一个 token 出             |
 | ⑤ 后端   | `backend.h` + `backend_cpu.*` + `backend_cuda.*` + `backend_vulkan.*` | 算子抽象层：模型只调 IBackend，不关心 dtype/量化/硬件 |
 | ⑥ 测量   | `profiler.*`                                  | 记录每步耗时（可关，关了零开销）                         |
-| ⑦ 编排   | `main.cpp` + `speculative_decoder.*` + `dflash_model.*` | CLI、普通生成、AR 草稿与 DFlash verify/rollback |
+| ⑦ 编排   | `main.cpp` + `speculative_decoder.*` + `dflash_model.*` + `eagle3_model.*` | CLI、普通生成、AR/DFlash/EAGLE3 verify/rollback |
 | ⑧ GPU 整段执行 | `metal_prefill.*` + `dflash_vulkan.*` | 绕过逐算子同步：Apple prefill / Android DFlash proposal block |
 | 配置     | `config.*`                                    | key=value 配置解析（供 ⑦ 用）                    |
 
@@ -85,6 +85,8 @@
   target verify/capture、共享 lm_head、Markov 与 argmax 都在同一 Vulkan device
   常驻，proposal 与 verification 各一次提交。设备要求与实测结论见
   `../docs/dflash.md`；相对 CPU DFlash 已提速，但当前 checkpoint 尚未超过 greedy。
+  与 `--eagle3-model` 同时使用时只有 target 走这个逐算子后端，EAGLE3 drafter 仍在
+  CPU；功能与输出已对齐，但不是整图 GPU 性能路径，见 `../docs/eagle3.md`。
 
 ## 投机解码状态约定
 
@@ -104,6 +106,12 @@ context K/V，anchor/mask 的 noise K/V 每次提案后立即丢弃。目标验�
 残差流，拒绝后只把 `anchor + accepted` 对应的切片交给下一块。Vulkan 路径分别维护
 draft/target 逻辑 KV 长度，拒绝只裁短指针，旧槽位由下一次验证覆盖。完整数学和真机
 结果见 `../docs/dflash.md`。
+
+`--eagle3-model` 从 target 第 `1,13,24` 层后的 residual 取特征，经 `fc(3H->H)`
+后与 next-token-shifted embedding 一起送入单层 recurrent drafter。草稿链中的深层
+proposal 依赖未验证的 draft hidden/KV，所以拒绝后先回到块前 checkpoint，再用
+target 已确认 residual 重建接受前缀；最后一行与 correction/bonus token 配对并准备
+下一块首 proposal。实现与真机门禁见 `../docs/eagle3.md`。
 
 ## 建议阅读顺序（由浅入深）
 

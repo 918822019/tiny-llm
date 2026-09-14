@@ -44,6 +44,8 @@ tinyqwen/
 │   ├── backend_cuda.h/cpp     # CUDABackend 实现（逐算子，需 CUDA 构建）
 │   ├── backend_vulkan.h/cpp   # Android Vulkan 逐算子 FP16 正确性后端
 │   ├── dflash_vulkan.h/cpp    # DFlash GPU 常驻整块执行器（性能路径）
+│   ├── eagle3_model.h/cpp     # EAGLE3 target-feature 单层 recurrent drafter
+│   ├── speculative_decoder.h/cpp # AR / DFlash / EAGLE3 精确验证与回退
 │   ├── vulkan/*.comp          # Vulkan compute shader（构建时嵌入二进制）
 │   ├── qwen_model.h           # QwenModel 接口
 │   ├── qwen_model.cpp         # create() + 公共逻辑
@@ -170,6 +172,12 @@ Vulkan device、buffer 分配器和唯一一份 lm_head。两段各自录成一�
 storage 和 compute clustered subgroup；当前块长上限为 8，目标仅支持无 bias、无旋转、
 稠密 FP16 Qwen3。
 
+`--eagle3-model` 当前不使用 DFlash 的专用整块执行器。默认模式下 target 与 EAGLE3
+drafter 都走 CPU；追加 `--backend vulkan` 时只有 target 的 FP16 matrix op 走上述
+通用逐算子 Vulkan，EAGLE3 仍显式创建 CPUBackend。该混合模式用于数值/功能 A/B；
+若要成为性能后端，需要把 target feature capture、EAGLE3 recurrent layer、32K
+lm_head、accept/rollback 串成少量 command buffer，并让两侧权重/KV 常驻同一 device。
+
 ## 数据流
 
 ### 导出（Python）
@@ -199,6 +207,27 @@ CPUBackend::matvec() → matvec_f32() / matvec_f16() / matvec_i4() / matvec_vq2(
     ↓
 具体 kernel（dispatch 按名字分发，未命中兜底 _ref）
 ```
+
+### EAGLE3 状态流
+
+```text
+Qwen3 target prefill/verify
+    │ 捕获执行第 1、13、24 层后的 residual（token-major [N,3,H]）
+    ▼
+fc(3H -> H) + next-token shifted embedding
+    ▼
+Eagle3Model recurrent layer + draft KV + 32K lm_head
+    │ proposal chain
+    ▼
+target block verification ──► accept prefix / correction / bonus
+    │
+    └─► target KV truncate + 用 confirmed target residual 重建 draft suffix
+```
+
+EAGLE3 的未验证 proposal 会参与后续 recurrent hidden 和 KV，因此拒绝时不能只缩短
+target KV。`speculative_decoder.cpp` 会先回到块前 draft checkpoint，再把 target 已确认
+的 residual 与接受 token（最后接 correction/bonus）按训练时 shift 重新送入 drafter。
+这条重建链路是保持精确 greedy 语义的关键，详见 `eagle3.md`。
 
 > **VQ2 + BiIP 旋转**：旋转量化模型（存在 `*.rot_sign`）在 `forward` 里每个量化
 > matvec 前先对激活做配对旋转（`mv_rot`/`mm_rot` → `biip_rotate_activation`），

@@ -27,7 +27,8 @@ tinyqwen/
 │   │                       #   反量化 fp32 走 Accelerate/AMX sgemm（权重每层读一遍），
 │   │                       #   GDN 递归/因果 attention 保留逐 token 顺序扫描
 │   ├── dflash_model.h/.cpp # DFlare 层融合 + 非因果 mask block + Markov chain 草稿
-│   ├── speculative_decoder.h/.cpp # AR 草稿与 DFlash 的 verify/accept/rollback 编排
+│   ├── eagle3_model.h/.cpp # EAGLE3 三层 target feature 融合 + 单层 recurrent drafter
+│   ├── speculative_decoder.h/.cpp # AR / DFlash / EAGLE3 的 verify/accept/rollback 编排
 │   ├── profiler.h/.cpp     # ScopedTimer + per-token/per-op 记录 + JSON 输出
 │   ├── metal_prefill.h     # Apple GPU prefill 引擎接口（纯 C++，main.cpp 不必碰 ObjC）
 │   ├── metal_prefill.mm    # 实现（ObjC++）：GEMM 走 MPS、其余算子走自写 Metal compute
@@ -61,6 +62,7 @@ tinyqwen/
 │   ├── export_qwen_to_tiny.py     # HF safetensors/bf16 -> .tqwen（f32/f16，v1/v2 格式）
 │   ├── export_qwen_to_tiny_i4.py  # INT4 量化导出（RTN/HQQ，per-group 打包；
 │   │                       #   --symmetric 对称量化配 sdot5，--no-lm-head-i4 对照）
+│   ├── export_eagle3_to_tiny.py   # SpecForge Qwen3-0.6B EAGLE3 -> 统一 FP16 .tqwen
 │   ├── tokenize_prompt.py         # prompt -> token ids JSON
 │   ├── tokenize_batch.py          # 数据集 -> 批量模式 JSONL
 │   ├── dump_qwen_reference.py     # PyTorch 参考值 dump（npz，对齐用）
@@ -85,6 +87,7 @@ tinyqwen/
 ├── tests/                  # 单元测试，自带最小测试框架（test_framework.h）
 ├── scripts/                # 优化 pipeline（verify/bench/record/set_baseline/commit_opt）
 │                           #   + Android 全家桶（build/run/pull/doctor/bench/record）
+│                           #   + verify_eagle3.sh（真 checkpoint 对比 exact greedy）
 │                           #   + bench_metal_prefill.sh（Metal prefill vs CPU 同场 A/B，带离散度列）
 ├── benchmarks/             # 测速数据：baseline*.json + history*.jsonl + jobs/ + series/
 ├── experiments/            # 预留：run_decode.cpp / run_layer_bench.cpp
@@ -105,6 +108,8 @@ tinyqwen/
 | `pytorch_alignment.md` | C++ 与 PyTorch 对齐流程                      |
 | `quantization_guide.md`| 量化算法接入指南（新量化类型怎么加 / INT4 布局）            |
 | `android.md`           | Android 端侧：NDK 编译 / adb 运行 / 常见坑        |
+| `dflash.md`            | DFlash / DFlare + Markov 投机解码              |
+| `eagle3.md`            | Qwen3-0.6B EAGLE3 转换、状态语义与真机结果          |
 | `known_limitations.md` | v1 已知限制                                 |
 | `project_structure.md` | 本文件                                     |
 
@@ -116,6 +121,7 @@ main.cpp ──> QwenModel ──> IBackend ──> CPUBackend ──> dispatch 
      │           │             ├─> CUDABackend（逐算子，--backend cuda）
      │           │             └─> VulkanBackend（Android FP16；逐算子 A/B）
      │           ├─> DFlashVulkanEngine（Android；同设备 proposal + target verify）
+     │           ├─> Eagle3Model（target 三层 residual + shifted token recurrent draft）
      │           └─> tiny_format.h <── tools/*.py（二进制契约）
      └─> --engine cuda ──> gpu_decode engine（kernels/cuda/gpu_engine.cu，整段 forward）
 ```

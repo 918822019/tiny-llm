@@ -165,6 +165,25 @@ DFlash + target decode；GPU 模式仍用 CPU prefill 作为数值锚点，随�
 算法、导出、Android 真机结果与性能限制见 `docs/dflash.md`。Android 用法是在同一
 命令末尾加 `--backend vulkan`。
 
+Qwen3-0.6B 也支持 SpecForge EAGLE3 target-feature drafter。它从目标模型第
+`1,13,24` 层捕获残差流，使用训练时的 next-token shifted embedding 约定生成
+greedy proposal chain，并在拒绝后用已确认的 target hidden 重建草稿状态：
+
+```bash
+.venv/bin/python tools/export_eagle3_to_tiny.py \
+  --model models/SGLang-EAGLE3-Qwen3-0.6B-SpecForge \
+  --out eagle3_qwen3_06b_specforge_f16.tqwen
+./build/runtime/tinyqwen --model model_qwen3_06b_f16_ctx2048.tqwen \
+  --eagle3-model eagle3_qwen3_06b_specforge_f16.tqwen \
+  --tokens-json prompt_tokens.json --speculative-tokens 2 --max-new-tokens 64 \
+  --matvec-impl neon_mt_kv_nt --ops-impl neon --kv-f16
+```
+
+EAGLE3 的 `--speculative-tokens` 是包含 pending root 的验证块宽度，所以宽度 2/4
+分别提出最多 1/3 个 token。当前 CPU 路径完整可用；Android `--backend vulkan`
+只把 target 放到通用逐算子 Vulkan 后端，drafter 仍在 CPU。转换格式、状态语义、
+原始权重对齐和 PLK110 实测见 `docs/eagle3.md`。
+
 ## 不需要真模型的验证
 
 用随机权重小模型打通并数值验证整条链路（loader → forward → KV cache →
@@ -216,7 +235,8 @@ tinyqwen --model <model.tqwen> [options]
 | `--model PATH`            | 必填     | .tqwen 权重文件                                                                 |
 | `--draft-model PATH`      | 无      | 启用精确 greedy 投机解码；草稿模型须与目标模型共用 tokenizer                              |
 | `--dflash-model PATH`     | 无      | 启用 DFlare + Markov 块草稿；当前为 Qwen3 稠密目标、FP16、greedy；Android 可用 Vulkan drafter |
-| `--speculative-tokens K`  | 4      | 每个 verify block 的草稿 token 数                                                  |
+| `--eagle3-model PATH`     | 无      | 启用 EAGLE3 target-feature 单链草稿；当前为 Qwen3-0.6B、FP16、greedy                        |
+| `--speculative-tokens K`  | 4      | AR 路径为 proposal 数；DFlash/EAGLE3 为包含 pending root 的 verify block 宽度                  |
 | `--speculative-stats-out PATH` | 无 | 写接受率、拒绝/回退、目标调用数及 `draft_ms`/`target_verify_ms` 分项耗时 JSON                  |
 | `--draft-matvec-impl NAME` | 无 | 单独选择草稿模型 dtype 的 matvec kernel；目标/草稿同 dtype 时两边共享该选择                      |
 | `--tokens CSV`            | 三选一    | 逗号分隔的 token ids                                                             |
@@ -288,6 +308,7 @@ generated_ids: 13 13 13 13     # 末尾汇总全部生成 ids
 | `docs/quantization_guide.md`| 量化算法接入指南（新量化类型怎么加；INT4 / VQ2 布局；BiIP 旋转两条路径） |
 | `docs/android.md`           | Android 端侧：NDK 编译 / adb 运行 / 常见坑               |
 | `docs/dflash.md`          | DFlash / DFlare + Markov：导出、算法、CLI 与 Android 实测  |
+| `docs/eagle3.md`          | Qwen3-0.6B EAGLE3：转换、状态语义、正确性与 Android 实测     |
 | `docs/project_structure.md` | 目录职责说明                                         |
 | `docs/known_limitations.md` | v1 已知限制                                        |
 | `kernels/README.md`         | kernels/ 导读：文件约定、已注册实现、_ref 的意义                |

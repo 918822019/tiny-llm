@@ -29,6 +29,11 @@
   采样拒绝、Metal/CUDA 仍未实现。Vulkan target 仅覆盖无 bias、无旋转的稠密 FP16
   Qwen3；CPU prefill 后需要一次 KV 导入。真机输出与 CPU 对齐，但当前 checkpoint
   的低接受率使其仍不比普通 greedy 快，实测见 `dflash.md`；
+- EAGLE3 当前固定支持 Qwen3-0.6B SpecForge checkpoint、FP16、greedy topk=1 单链，
+  目标残差层为 `1,13,24`。CPU drafter 已实现；Android `--backend vulkan` 只是通用
+  逐算子 Vulkan target + CPU drafter，并非 EAGLE3 整图 GPU 常驻后端。tree/top-k、
+  sampling rejection、Metal/CUDA drafter 尚未实现。PLK110 英文样例接受率 53.7%，
+  但 CPU decode 仍比 greedy 慢 3.6%–5.2%；中文单样例接受率更低，见 `eagle3.md`；
 - Qwen2/3 dense 的 CPU verify 主体走批量 GEMM；带 GDN 的 Qwen3.5 和 MoE 在 CPU
   上为保证递归状态正确暂走逐 token verify。Metal 支持 continuation batch，拒绝时
   GDN 需要 checkpoint 恢复与已接受前缀重放；

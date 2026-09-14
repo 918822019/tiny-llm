@@ -49,6 +49,7 @@
 #include "backend_vulkan.h"
 #include "config.h"
 #include "dflash_model.h"
+#include "eagle3_model.h"
 #include "dispatch.h"
 #include "metal_prefill.h"
 #include "model_loader.h"
@@ -169,7 +170,8 @@ namespace {
         std::string model;             // 模型文件路径（.tqwen），必选
         std::string draft_model;       // 草稿模型；非空时启用投机解码
         std::string dflash_model;      // DFlash/DFlare 草稿 checkpoint
-        int speculative_tokens = 4;    // 每个验证块的草稿 token 数
+        std::string eagle3_model;      // EAGLE3 target-feature 草稿 checkpoint
+        int speculative_tokens = 4;    // AR: proposal 数；DFlash/EAGLE3: 含 root 的块宽
         std::string speculative_stats_out; // 投机统计 JSON
         std::string draft_matvec_impl; // 草稿模型独立 dtype 注册表的 kernel
         std::string tokens_csv;        // CSV 格式 token 列表（如 "1,2,3"）
@@ -209,7 +211,9 @@ namespace {
                      "usage: %s --model <model.tqwen> [options]\n"
                      "  --draft-model PATH      enable exact greedy speculative decoding\n"
                      "  --dflash-model PATH     enable DFlare + Markov block decoding\n"
-                     "  --speculative-tokens K draft tokens per verify block (default 4)\n"
+                     "  --eagle3-model PATH     enable EAGLE3 greedy chain decoding\n"
+                     "  --speculative-tokens K AR proposal count; EAGLE3/DFlash verify\n"
+                     "                          width including pending root (default 4)\n"
                      "  --speculative-stats-out PATH\n"
                      "                          write acceptance/rollback/timing JSON\n"
                      "  --draft-matvec-impl NAME\n"
@@ -272,6 +276,7 @@ namespace {
             if (a == "--model") out->model = value("--model");
             else if (a == "--draft-model") out->draft_model = value("--draft-model");
             else if (a == "--dflash-model") out->dflash_model = value("--dflash-model");
+            else if (a == "--eagle3-model") out->eagle3_model = value("--eagle3-model");
             else if (a == "--speculative-tokens") out->speculative_tokens = std::atoi(value("--speculative-tokens").c_str());
             else if (a == "--speculative-stats-out") out->speculative_stats_out = value("--speculative-stats-out");
             else if (a == "--draft-matvec-impl") out->draft_matvec_impl = value("--draft-matvec-impl");
@@ -318,13 +323,16 @@ namespace {
             return false;
         }
         if (out->draft_model.empty() && out->dflash_model.empty() &&
+            out->eagle3_model.empty() &&
             (!out->speculative_stats_out.empty() || !out->draft_matvec_impl.empty())) {
             std::fprintf(stderr,
-                         "error: speculative options require --draft-model or --dflash-model\n");
+                         "error: speculative options require a draft model option\n");
             return false;
         }
-        if (!out->draft_model.empty() && !out->dflash_model.empty()) {
-            std::fprintf(stderr, "error: choose only one of --draft-model / --dflash-model\n");
+        const int draft_modes = !out->draft_model.empty() + !out->dflash_model.empty() +
+                                !out->eagle3_model.empty();
+        if (draft_modes > 1) {
+            std::fprintf(stderr, "error: choose only one draft model option\n");
             return false;
         }
         // 三种输入模式必须且只能提供一个
@@ -364,6 +372,23 @@ namespace {
                 !out->profile_out.empty() || !out->engine.empty() || out->backend == "cuda") {
                 std::fprintf(stderr,
                              "error: --dflash-model requires single-prompt CPU/Vulkan inference\n");
+                return false;
+            }
+        }
+        if (!out->eagle3_model.empty()) {
+            if (!out->draft_matvec_impl.empty()) {
+                std::fprintf(stderr,
+                             "error: --draft-matvec-impl applies only to --draft-model\n");
+                return false;
+            }
+            if (out->speculative_tokens < 2) {
+                std::fprintf(stderr, "error: EAGLE3 --speculative-tokens must be >= 2\n");
+                return false;
+            }
+            if (has_batch || out->ppl || out->topk > 0 || !out->dump_logits.empty() ||
+                !out->profile_out.empty() || !out->engine.empty() || out->backend == "cuda") {
+                std::fprintf(stderr,
+                             "error: --eagle3-model requires single-prompt CPU/Vulkan inference\n");
                 return false;
             }
         }
@@ -543,6 +568,15 @@ int main(int argc, char **argv) {
             }
             need += dflash_need;
         }
+        if (!args.eagle3_model.empty()) {
+            uint64_t eagle3_need = 0;
+            if (!tinyqwen::ModelFile::estimate_resident_bytes(args.eagle3_model, false,
+                                                               &eagle3_need, &err)) {
+                std::fprintf(stderr, "error: EAGLE3 model: %s\n", err.c_str());
+                return 1;
+            }
+            need += eagle3_need;
+        }
         uint64_t vulkan_extra = 0;
         if (args.backend == "vulkan") {
             if (!args.dflash_model.empty()) {
@@ -649,6 +683,15 @@ int main(int argc, char **argv) {
         }
         std::fprintf(stderr, "[init] DFlash draft: %s (block=%d)\n",
                      args.dflash_model.c_str(), args.speculative_tokens);
+    }
+    tinyqwen::ModelFile eagle3_file;
+    if (!args.eagle3_model.empty()) {
+        if (!eagle3_file.load(args.eagle3_model, &err, false)) {
+            std::fprintf(stderr, "error: EAGLE3 model: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "[init] EAGLE3 draft: %s (verify width=%d)\n",
+                     args.eagle3_model.c_str(), args.speculative_tokens);
     }
     if (args.verbose) file.print_summary();
     if (file.offloaded_count() > 0) {
@@ -891,6 +934,21 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "error: DFlash Vulkan engine: %s\n", err.c_str());
             return 1;
         }
+    }
+    std::unique_ptr<tinyqwen::Eagle3Model> eagle3_model;
+    if (!args.eagle3_model.empty()) {
+        if (!tinyqwen::Eagle3Model::create(eagle3_file, args.max_seq_len, *model,
+                                           &err, &eagle3_model,
+                                           tinyqwen::create_cpu_backend())) {
+            std::fprintf(stderr, "error: EAGLE3 model: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr,
+                     "[init] EAGLE3: draft_vocab=%d target_layers=%d,%d,%d\n",
+                     eagle3_model->draft_vocab_size(),
+                     eagle3_model->target_layer_ids()[0],
+                     eagle3_model->target_layer_ids()[1],
+                     eagle3_model->target_layer_ids()[2]);
     }
     if (file.config().is_moe()) {
         model->set_moe_ssd(args.moe_ssd);
@@ -1262,18 +1320,24 @@ int main(int argc, char **argv) {
     }
 
     // ---- 精确 greedy 投机解码 ----
-    if (draft_model || dflash_model) {
+    if (draft_model || dflash_model || eagle3_model) {
         tinyqwen::SpeculativeConfig spec_cfg;
         spec_cfg.max_new_tokens = args.max_new_tokens;
         spec_cfg.draft_tokens = args.speculative_tokens;
         spec_cfg.eos_token_id = args.eos;
         tinyqwen::SpeculativeResult spec;
         std::string serr;
-        const bool ok = dflash_model
-            ? tinyqwen::dflash_speculative_generate(*model, *dflash_model, tokens,
-                                                     spec_cfg, &spec, &serr)
-            : tinyqwen::speculative_generate(*model, *draft_model, metal_engine,
-                                              tokens, spec_cfg, &spec, &serr);
+        bool ok = false;
+        if (dflash_model) {
+            ok = tinyqwen::dflash_speculative_generate(*model, *dflash_model, tokens,
+                                                        spec_cfg, &spec, &serr);
+        } else if (eagle3_model) {
+            ok = tinyqwen::eagle3_speculative_generate(*model, *eagle3_model, tokens,
+                                                        spec_cfg, &spec, &serr);
+        } else {
+            ok = tinyqwen::speculative_generate(*model, *draft_model, metal_engine,
+                                                 tokens, spec_cfg, &spec, &serr);
+        }
         if (!ok) {
             std::fprintf(stderr, "error: speculative decoding failed: %s\n", serr.c_str());
             if (metal_engine) tinyqwen::metal_prefill_destroy(metal_engine);

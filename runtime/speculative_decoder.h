@@ -5,6 +5,7 @@
 
 #include "qwen_model.h"
 #include "dflash_model.h"
+#include "eagle3_model.h"
 
 namespace tinyqwen {
     struct MetalPrefillEngine;
@@ -68,6 +69,15 @@ namespace tinyqwen {
     // the drafter consumes selected target residual streams and proposes a
     // whole mask block with an optional Markov dependency between positions.
     bool dflash_speculative_generate(QwenModel &target, DFlashModel &draft,
+                                     const std::vector<int> &prompt,
+                                     const SpeculativeConfig &config,
+                                     SpeculativeResult *result, std::string *err);
+
+    // EAGLE3 greedy chain decoding. For this path draft_tokens is the total
+    // verification width (pending root + proposals), matching SGLang's
+    // --speculative-num-draft-tokens convention. Thus width 4 runs 3 recurrent
+    // proposal steps and can additionally yield the target bonus token.
+    bool eagle3_speculative_generate(QwenModel &target, Eagle3Model &draft,
                                      const std::vector<int> &prompt,
                                      const SpeculativeConfig &config,
                                      SpeculativeResult *result, std::string *err);

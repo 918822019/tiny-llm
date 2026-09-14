@@ -61,6 +61,7 @@
 | backend_refactor | ebca4db | 234.96 | 263.50 | 0.95× | — | 纯后端抽象重构（非优化）：IBackend 虚分发开销在 ~4% 运行波动内不可辨识，带宽瓶颈路径上抽象零成本                                                                              |
 | dflash-vulkan-f16（Android / Adreno 840） | 本次 | — | — | — | GPU draft 与 CPU 同量级（配对轮约 155–186 vs 161–166 ms） | Vulkan FP16 逐算子正确性后端 + DFlash GPU-resident 整块执行器；208 真机测试、真实输出逐 token 对齐。逐算子 2160 submit 的错误形态改为每 proposal block 一次 submit；端到端仍慢 16%–18%，target verify 尚在 CPU，属于功能落地而非提速结论 |
 | dflash-vulkan-target（Android / Adreno 840） | 本次 | — | — | — | **1.65× vs 同场 CPU DFlash**（610.02→369.71 ms） | CPU prefill 后导入 KV；DFlash proposal 与 dense Qwen3 target verify/capture 共用 device/allocator/lm_head。16/64 token 均与 greedy 逐位一致，target verify 428.11→231.96 ms；但 16-token 仍慢于 greedy 313.31 ms，低接受率下尚不符合论文端到端预期 |
+| eagle3-qwen3-0.6b（Android / PLK110） | 本次 | — | — | — | CPU **0.95×**（中位 2871.97→3021.45 ms）；逐算子 Vulkan 内部 **1.30×** | SpecForge EAGLE3 BF16→统一 FP16；三层 target residual + shifted embedding + recurrent rollback。英文 64-token 接受 22/41（53.7%）、target call 63→41，全部 CPU/Vulkan 输出与 greedy 逐位一致；CPU drafter 约 201 ms 吃掉 verify 收益，Vulkan 仍有 9253 次提交，功能成立但手机最佳后端尚未转正 |
 <!-- 新的优化按时间顺序往上表追加行（优化栈 = 上一行 + 本次优化），并在下面补一个详细小节 -->
 
 ### dflash-qwen3-0.6b-markov（2026-09-14，Android 正确性与首轮性能）
@@ -4219,6 +4220,45 @@ done; done
   CPU/GPU 倒退已消失；但仍比 greedy 慢约 12%–18%，所以**尚不符合论文端到端加速
   预期**。下一刀是把两次 submit 与 selected-hidden host 往返串成 GPU 内链路，同时
   在论文相同数据集/模板上重新衡量 checkpoint 接受率。
+
+---
+
+### Qwen3-0.6B SpecForge EAGLE3（2026-09-14）
+
+- **是什么**：新增 `export_eagle3_to_tiny.py`，把
+  `GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge` 的 BF16 checkpoint 转成统一
+  FP16；新增一层 EAGLE3 runtime、target 第 `1,13,24` 层 residual capture、训练时
+  next-token shifted embedding、greedy proposal chain、target verify、双方 KV
+  truncate，以及拒绝后用 confirmed target hidden 重建 draft suffix。
+- **模型与资源**：target 是 Qwen3-0.6B FP16（1192137280 bytes）；draft 是
+  111811648 bytes（106.63 MiB，target 文件的 9.38%），其中包含 32K lm_head 和
+  draft-to-target vocabulary map。映射 id 用两个 base-256 FP16 limb 精确保存，避免
+  151936 词表 id 直接写 FP16 时丢整数精度。
+- **独立对齐**：使用原始 BF16 checkpoint、官方 Qwen3-0.6B target 与
+  SpecForge/EAGLE3 方程复算首批 proposal；中文样例前几块与 C++ 完全一致。首块
+  root `151667` 时，两边均提案 `151668`，target 均选 `198`。因此低接受率不是
+  layer id、feature concat、token shift 或 FP16 词表映射错误。
+- **精确性门禁**：M4 host 与 PLK110 上，英文宽度 2/3/4、中文宽度 2/4，以及
+  Vulkan target 宽度 2 的全部 `generated_ids` 均与普通 greedy 逐 token 一致。
+- **PLK110 CPU 英文 64-token**：41-token chat prompt、6 worker、FP16 KV。
+  greedy 三轮 decode 2976.24 / 2857.92 / 2871.97 ms；EAGLE3 width=2 三轮
+  3021.45 / 3052.65 / 2962.18 ms。proposal 22/41（53.7%），target call 63→41、
+  input 63→82。最好轮 target verify 2761.04 ms，比 greedy 2857.92 ms 省 96.88 ms，
+  但 draft 200.78 ms，最终仍慢 3.6%；中位慢 5.2%。width=3/4 分别为 3346.40 /
+  3969.14 ms，链越长反而做更多无效输入。
+- **PLK110 中文 16-token**：36-token chat prompt。greedy 825.20 ms；width=2
+  接受 2/13（15.4%）、878.85 ms；width=4 接受 2/37（5.4%）、1379.21 ms。
+  与 checkpoint 的 ShareGPT/Vicuna 训练域和单样本差异一致，不能用该样例外推全部
+  中文任务，但足以否定“手机一律使用模型卡 width=4”的配置。
+- **Vulkan A/B**：通用逐算子 Vulkan greedy 为 6279.38 ms；Vulkan target + CPU
+  EAGLE3 width=2 为 4845.53 ms，相对该 Vulkan 基线 1.30×，接受统计与 CPU 相同。
+  但它仍比 CPU greedy 慢约 69%，且有 9253 次 dispatch；这是功能验证，不是整图
+  GPU-resident EAGLE3。
+- **判定**：算法和 drafter 在英文上的预测能力成立，target 调用确实减少；当前手机
+  负结果是“小 target + 已优化 ARM target”下约 201 ms draft recurrent/lm_head 成本
+  大于约 97 ms verify 节省。CPU 建议 width=2。要稳定越过 greedy，应让 target +
+  draft + lm_head/KV 同 device 常驻并按块提交，同时用业务数据集而非单 prompt 评估。
+- **完整复现**：checkpoint/hash、导出命令、状态数学、CLI 与真机表见 `docs/eagle3.md`。
 
 ---
 
