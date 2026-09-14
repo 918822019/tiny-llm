@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "backend_cpu.h"
+#include "dflash_vulkan.h"
 #include "ref_ops.h"
 
 namespace tinyqwen {
@@ -27,8 +29,11 @@ const uint16_t *need(const ModelFile &f, const std::string &name,
 }
 } // namespace
 
+DFlashModel::~DFlashModel() = default;
+
 bool DFlashModel::create(const ModelFile &file, int max_seq_len, QwenModel &target,
-                         std::string *err, std::unique_ptr<DFlashModel> *out) {
+                         std::string *err, std::unique_ptr<DFlashModel> *out,
+                         std::unique_ptr<IBackend> backend) {
     if (!out) return false;
     out->reset();
     const ModelConfig &c = file.config();
@@ -45,7 +50,7 @@ bool DFlashModel::create(const ModelFile &file, int max_seq_len, QwenModel &targ
 
     auto m = std::unique_ptr<DFlashModel>(new DFlashModel());
     m->target_ = &target;
-    m->backend_ = create_cpu_backend();
+    m->backend_ = backend ? std::move(backend) : create_cpu_backend();
     m->cfg_ = c;
     m->max_seq_len_ = max_seq_len;
     m->mask_token_id_ = static_cast<int>(c.eos_token_id);
@@ -127,6 +132,14 @@ bool DFlashModel::create(const ModelFile &file, int max_seq_len, QwenModel &targ
 
 void DFlashModel::reset() { seq_len_ = 0; }
 
+bool DFlashModel::enable_vulkan(std::string *err) {
+    vulkan_ = DFlashVulkanEngine::create(*this, err);
+    if (!vulkan_) return false;
+    std::fprintf(stderr, "[vulkan] DFlash GPU-resident drafter: %s\n",
+                 vulkan_->device_name().c_str());
+    return true;
+}
+
 void DFlashModel::mv(const uint16_t *w, const float *x, float *y,
                      int rows, int cols) const {
     backend_->matvec(WeightTensor{w, QuantType::kF16, rows, cols, 0},
@@ -206,6 +219,12 @@ bool DFlashModel::propose(const float *target_hidden, int ctx_tokens, int anchor
         block_tokens > block_size_ || seq_len_ + ctx_tokens + block_tokens > max_seq_len_) {
         if (err) *err = "invalid DFlash proposal dimensions";
         return false;
+    }
+    if (vulkan_) {
+        const bool ok = vulkan_->propose(target_hidden, ctx_tokens, seq_len_, anchor,
+                                         block_tokens, proposals, err);
+        if (ok) seq_len_ += ctx_tokens;
+        return ok;
     }
     proposals->clear();
     const int H = static_cast<int>(cfg_.hidden_size);

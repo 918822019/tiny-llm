@@ -1,0 +1,37 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer LogitsBuffer { float values[]; } logits;
+layout(set = 0, binding = 1, std430) readonly buffer MarkovW1Buffer { uint values[]; } w1;
+layout(set = 0, binding = 2, std430) readonly buffer MarkovW2Buffer { uint values[]; } w2;
+layout(set = 0, binding = 3, std430) readonly buffer ProposalBuffer { int values[]; } proposals;
+
+layout(push_constant) uniform MarkovParams {
+    uint vocab;
+    uint rank;
+    uint position;
+    int anchor;
+} params;
+
+void main() {
+    const uint vocab_index = gl_GlobalInvocationID.x;
+    if (vocab_index >= params.vocab) return;
+    const int previous = params.position == 0u
+                             ? params.anchor
+                             : proposals.values[params.position - 1u];
+    float bias = 0.0;
+    const uint packed_rank = params.rank / 2u;
+    const uint w1_base = uint(previous) * packed_rank;
+    const uint w2_base = vocab_index * packed_rank;
+    for (uint r = 0u; r < packed_rank; ++r) {
+        const vec2 left = unpackHalf2x16(w1.values[w1_base + r]);
+        const vec2 right = unpackHalf2x16(w2.values[w2_base + r]);
+        bias = fma(right.x, left.x, bias);
+        bias = fma(right.y, left.y, bias);
+    }
+    logits.values[params.position * params.vocab + vocab_index] += bias;
+}

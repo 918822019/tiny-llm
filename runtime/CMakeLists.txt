@@ -45,6 +45,62 @@ if (TINYQWEN_HAS_CUDA)
     target_sources(tinyqwen_runtime PRIVATE backend_cuda.cpp)
 endif ()
 
+# ---------------------------------------------------------------------------
+# Android Vulkan FP16 后端
+# ---------------------------------------------------------------------------
+# shader 由 NDK 的 glslc 编译为 SPIR-V，并转成 build 目录里的 aligned byte
+# array。这样 tinyqwen 仍是单文件 CLI，不依赖手机侧 asset 路径。
+if (TINYQWEN_HAS_VULKAN)
+    function(tinyqwen_embed_vulkan_shader shader_name symbol output_var)
+        set(shader ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/${shader_name}.comp)
+        set(spv ${CMAKE_CURRENT_BINARY_DIR}/vulkan_${shader_name}.spv)
+        set(header ${CMAKE_CURRENT_BINARY_DIR}/vulkan_${shader_name}_spv.h)
+        add_custom_command(
+                OUTPUT ${header}
+                COMMAND ${TINYQWEN_GLSLC}
+                        --target-env=vulkan1.2 -O -fshader-stage=compute
+                        ${shader} -o ${spv}
+                COMMAND ${CMAKE_COMMAND}
+                        -DINPUT=${spv}
+                        -DOUTPUT=${header}
+                        -DSYMBOL=${symbol}
+                        -P ${CMAKE_SOURCE_DIR}/cmake/embed_binary.cmake
+                DEPENDS ${shader} ${CMAKE_SOURCE_DIR}/cmake/embed_binary.cmake
+                VERBATIM)
+        set_source_files_properties(${header} PROPERTIES GENERATED TRUE)
+        set(${output_var} ${header} PARENT_SCOPE)
+    endfunction()
+
+    tinyqwen_embed_vulkan_shader(matmul_f16 kVulkanMatmulF16Spv VK_MATMUL_HEADER)
+    tinyqwen_embed_vulkan_shader(matmul_f16_packed kVulkanMatmulF16PackedSpv VK_MATMUL_PACKED_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_elementwise kDFlashElementwiseSpv VK_ELEMENTWISE_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_rmsnorm kDFlashRmsnormSpv VK_RMSNORM_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_rope kDFlashRopeSpv VK_ROPE_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_attention kDFlashAttentionSpv VK_ATTENTION_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_markov_add kDFlashMarkovAddSpv VK_MARKOV_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_argmax_stage1 kDFlashArgmaxStage1Spv VK_ARGMAX1_HEADER)
+    tinyqwen_embed_vulkan_shader(dflash_argmax_stage2 kDFlashArgmaxStage2Spv VK_ARGMAX2_HEADER)
+
+    target_sources(tinyqwen_runtime PRIVATE
+            backend_vulkan.cpp
+            dflash_vulkan.cpp
+            ${VK_MATMUL_HEADER}
+            ${VK_MATMUL_PACKED_HEADER}
+            ${VK_ELEMENTWISE_HEADER}
+            ${VK_RMSNORM_HEADER}
+            ${VK_ROPE_HEADER}
+            ${VK_ATTENTION_HEADER}
+            ${VK_MARKOV_HEADER}
+            ${VK_ARGMAX1_HEADER}
+            ${VK_ARGMAX2_HEADER})
+    target_include_directories(tinyqwen_runtime PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(tinyqwen_runtime PUBLIC ${TINYQWEN_VULKAN_LIBRARY})
+else ()
+    target_sources(tinyqwen_runtime PRIVATE
+            backend_vulkan_stub.cpp
+            dflash_vulkan_stub.cpp)
+endif ()
+
 # 设置头文件搜索路径：PUBLIC 表示使用此库的目标也自动获得该 include 路径
 target_include_directories(tinyqwen_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

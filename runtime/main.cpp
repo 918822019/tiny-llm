@@ -32,6 +32,7 @@
 #include <cstdio>        // 标准输入输出（fprintf, printf, fflush）
 #include <cstdlib>       // 标准库（atoi, exit）
 #include <cstring>       // C 字符串操作
+#include <limits>        // std::numeric_limits（GPU 内存预算溢出校验）
 #include <memory>        // 智能指针（std::unique_ptr, std::make_unique）
 #include <string>        // C++ 字符串
 #include <vector>        // 动态数组
@@ -45,6 +46,7 @@
 #endif
 
 #include "backend_cpu.h"
+#include "backend_vulkan.h"
 #include "config.h"
 #include "dflash_model.h"
 #include "dispatch.h"
@@ -81,7 +83,8 @@ namespace {
 #endif
     }
 
-    // 当前**可用**内存（字节）= free + inactive + purgeable。
+    // 当前**可用**内存（字节）。macOS 使用 free + inactive + purgeable；
+    // Linux 优先读取内核给出的 MemAvailable（无需 swap 即可分配的估算值）。
     // 为什么不能拿物理总量当上限：wired（内核与不可换出部分）+ 其他进程已占掉
     // 大半，实测 16 GB 机器上 wired 就有 8 GB、可用只剩 1.5 GB。按物理总量校验
     // 会宽松 7×，放行后照样把机器推进换页——而 swap 是**写**操作，消耗 SSD 寿命。
@@ -99,6 +102,23 @@ namespace {
                 static_cast<uint64_t>(vm.inactive_count) +
                 static_cast<uint64_t>(vm.purgeable_count)) * page;
 #elif defined(__linux__)
+        // _SC_AVPHYS_PAGES 在 Android/Bionic 上只对应完全空闲页，不包含可立即
+        // 回收的 page cache。模型 mmap/load 前用它会把 5~6 GB 的真实可用内存
+        // 误报成不足 1 GB。Linux 3.14+ 的 MemAvailable 正是“不触发 swap 还能
+        // 分配多少”的内核估算，与这里的 fail-fast 语义一致。
+        if (FILE *meminfo = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            unsigned long long available_kib = 0;
+            while (std::fgets(line, sizeof(line), meminfo)) {
+                if (std::sscanf(line, "MemAvailable: %llu kB", &available_kib) == 1)
+                    break;
+            }
+            std::fclose(meminfo);
+            if (available_kib > 0) {
+                return static_cast<uint64_t>(available_kib) * 1024u;
+            }
+        }
+        // 兼容没有 MemAvailable 的旧内核。
         const long avail = sysconf(_SC_AVPHYS_PAGES);
         const long page_size = sysconf(_SC_PAGESIZE);
         if (avail > 0 && page_size > 0) {
@@ -108,6 +128,40 @@ namespace {
 #else
         return 0;
 #endif
+    }
+
+    // DFlash Vulkan 会复制 draft 权重，并额外复制 target 的共享 lm_head。预检阶段
+    // 尚未 load 模型，直接读取固定 192B header 即可把这部分统一内存算进预算。
+    bool f16_lm_head_bytes(const std::string &path, uint64_t *out,
+                           std::string *err) {
+        if (!out) return false;
+        *out = 0;
+        FILE *file = std::fopen(path.c_str(), "rb");
+        if (!file) {
+            if (err) *err = "cannot open model header for Vulkan memory estimate: " + path;
+            return false;
+        }
+        tinyqwen::TinyHeader header{};
+        const bool read_ok = std::fread(&header, sizeof(header), 1, file) == 1;
+        std::fclose(file);
+        if (!read_ok || std::memcmp(header.magic, tinyqwen::kMagic,
+                                    sizeof(tinyqwen::kMagic)) != 0) {
+            if (err) *err = "invalid model header for Vulkan memory estimate: " + path;
+            return false;
+        }
+        if (header.dtype != static_cast<uint32_t>(tinyqwen::Dtype::kF16)) {
+            if (err) *err = "Android Vulkan backend currently requires an FP16 target model";
+            return false;
+        }
+        const uint64_t hidden = header.hidden_size;
+        const uint64_t vocab = header.vocab_size;
+        if (!hidden || !vocab ||
+            hidden > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t) / vocab) {
+            if (err) *err = "invalid target lm_head shape in Vulkan memory estimate";
+            return false;
+        }
+        *out = hidden * vocab * sizeof(uint16_t);
+        return true;
     }
 
     // 命令行参数结构体：集中存储所有 CLI 选项
@@ -195,8 +249,8 @@ namespace {
                      "                          default 4)\n"
                      "  --engine NAME           engine: '' = CPU forward (default) / cuda (decode) / metal (prefill)\n"
                      "                          (GPU-resident whole-forward; requires CUDA build)\n"
-                     "  --backend NAME          compute backend: '' = CPU (default) / cuda\n"
-                     "                          (per-operator CUDA; requires CUDA build)\n"
+                     "  --backend NAME          compute backend: '' = CPU (default) / cuda / vulkan\n"
+                     "                          (Vulkan: Android FP16 matrix ops, persistent weights)\n"
                      "  --verbose               model summary + per-token details\n",
                      prog);
     }
@@ -309,7 +363,7 @@ namespace {
             if (has_batch || out->ppl || out->topk > 0 || !out->dump_logits.empty() ||
                 !out->profile_out.empty() || !out->engine.empty() || out->backend == "cuda") {
                 std::fprintf(stderr,
-                             "error: --dflash-model requires single-prompt CPU inference\n");
+                             "error: --dflash-model requires single-prompt CPU/Vulkan inference\n");
                 return false;
             }
         }
@@ -430,6 +484,11 @@ namespace {
 int main(int argc, char **argv) {
     Args args;
     if (!parse_args(argc, argv, &args)) return 2;
+    if (args.backend == "vulkan" && !tinyqwen::vulkan_backend_available()) {
+        std::fprintf(stderr,
+                     "error: --backend vulkan requires an Android Vulkan build\n");
+        return 1;
+    }
 
     // ---- 读取配置文件（可选）----
     tinyqwen::Config config;
@@ -465,6 +524,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
             return 1;
         }
+        const uint64_t target_need = need;
         if (!args.draft_model.empty()) {
             uint64_t draft_need = 0;
             if (!tinyqwen::ModelFile::estimate_resident_bytes(args.draft_model, false,
@@ -474,14 +534,43 @@ int main(int argc, char **argv) {
             }
             need += draft_need;
         }
+        uint64_t dflash_need = 0;
         if (!args.dflash_model.empty()) {
-            uint64_t draft_need = 0;
             if (!tinyqwen::ModelFile::estimate_resident_bytes(args.dflash_model, false,
-                                                               &draft_need, &err)) {
+                                                               &dflash_need, &err)) {
                 std::fprintf(stderr, "error: DFlash model: %s\n", err.c_str());
                 return 1;
             }
-            need += draft_need;
+            need += dflash_need;
+        }
+        uint64_t vulkan_extra = 0;
+        if (args.backend == "vulkan") {
+            if (!args.dflash_model.empty()) {
+                uint64_t lm_head_need = 0;
+                if (!f16_lm_head_bytes(args.model, &lm_head_need, &err)) {
+                    std::fprintf(stderr, "error: %s\n", err.c_str());
+                    return 1;
+                }
+                if (dflash_need > std::numeric_limits<uint64_t>::max() - lm_head_need) {
+                    std::fprintf(stderr, "error: Vulkan DFlash memory estimate overflow\n");
+                    return 1;
+                }
+                vulkan_extra = dflash_need + lm_head_need;
+            } else {
+                // 通用 VulkanBackend 会在首次访问时把 FP16 matrix weights 逐个
+                // 缓存到 GPU。用完整 target resident 大小作安全上界。
+                uint64_t ignored_lm_head = 0;
+                if (!f16_lm_head_bytes(args.model, &ignored_lm_head, &err)) {
+                    std::fprintf(stderr, "error: %s\n", err.c_str());
+                    return 1;
+                }
+                vulkan_extra = target_need;
+            }
+            if (need > std::numeric_limits<uint64_t>::max() - vulkan_extra) {
+                std::fprintf(stderr, "error: Vulkan memory estimate overflow\n");
+                return 1;
+            }
+            need += vulkan_extra;
         }
         const uint64_t avail = available_memory_bytes();
         const uint64_t budget = avail ? avail - avail / 10 : 0;  // 可用 × 90%
@@ -502,8 +591,13 @@ int main(int argc, char **argv) {
                                  "可能换页，计时与 SSD 寿命均需自行评估。\n");
         } else {
             std::fprintf(stderr, "[init] mem preflight: need %.0f MB / available %.0f MB "
-                                 "(上限 %.0f MB) —— 通过\n",
+                         "(上限 %.0f MB) —— 通过\n",
                          need / 1048576.0, avail / 1048576.0, budget / 1048576.0);
+        }
+        if (vulkan_extra) {
+            std::fprintf(stderr,
+                         "[init] Vulkan unified-memory copy budget: %.0f MB (included above)\n",
+                         vulkan_extra / 1048576.0);
         }
     }
 
@@ -709,11 +803,14 @@ int main(int argc, char **argv) {
     tinyqwen::Profiler profiler(!args.profile_out.empty());
     tinyqwen::Profiler draft_profiler(false);
     const bool is_qwen35 = file.config().uses_qwen35_attention();
-    profiler.set_meta(is_qwen35 ? "qwen3.5-hybrid" : "qwen2.5-like", "cpu_ref",
+    profiler.set_meta(is_qwen35 ? "qwen3.5-hybrid" : "qwen2.5-like",
+                      args.backend == "vulkan" ? "vulkan_fp16_hybrid" : "cpu_ref",
                       is_f16 ? "f16w_fp32a" : "fp32");
 
-    // ---- 创建后端（默认 CPU，可选 CUDA）----
+    // ---- 创建后端（默认 CPU，可选 CUDA / Android Vulkan）----
     std::unique_ptr<tinyqwen::IBackend> backend;
+    const bool use_vulkan_backend = args.backend == "vulkan";
+    const bool use_vulkan_dflash = use_vulkan_backend && !args.dflash_model.empty();
     if (args.backend == "cuda") {
 #ifdef TINYQWEN_HAS_CUDA
         backend = tinyqwen::create_cuda_backend();
@@ -722,11 +819,30 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "error: --backend cuda requires CUDA build\n");
         return 1;
 #endif
-    } else {
-        backend = tinyqwen::create_cpu_backend();
-        if (!args.backend.empty()) {
-            std::fprintf(stderr, "[init] backend: CPU (default)\n");
+    } else if (use_vulkan_backend) {
+        if (use_vulkan_dflash) {
+            // DFlash 场景中目标验证的 ARM batch 已经快于逐算子 Vulkan；GPU
+            // 留给整段常驻的 drafter，避免每层四次 CPU/GPU 同步。
+            backend = tinyqwen::create_cpu_backend();
+            std::fprintf(stderr,
+                         "[init] backend: CPU target + Vulkan DFlash drafter\n");
+        } else {
+            std::string verr;
+            backend = tinyqwen::create_vulkan_backend(&verr);
+            if (!backend) {
+                std::fprintf(stderr, "error: Vulkan backend create failed: %s\n", verr.c_str());
+                return 1;
+            }
+            std::fprintf(stderr,
+                         "[init] backend: Vulkan FP16 matrices + CPU stateful ops\n");
         }
+    } else if (args.backend.empty()) {
+        backend = tinyqwen::create_cpu_backend();
+    } else {
+        std::fprintf(stderr,
+                     "error: unknown backend '%s' (available: cpu, cuda, vulkan)\n",
+                     args.backend.c_str());
+        return 2;
     }
 
     // ---- 建模：校验权重、分配 KV cache 和 workspace ----
@@ -768,6 +884,10 @@ int main(int argc, char **argv) {
                          "error: --speculative-tokens %d exceeds DFlash block size %d\n",
                          args.speculative_tokens, dflash_model->block_size());
             return 2;
+        }
+        if (use_vulkan_dflash && !dflash_model->enable_vulkan(&err)) {
+            std::fprintf(stderr, "error: DFlash Vulkan engine: %s\n", err.c_str());
+            return 1;
         }
     }
     if (file.config().is_moe()) {

@@ -11,16 +11,23 @@
 
 namespace tinyqwen {
 
+class DFlashVulkanEngine;
+
 class DFlashModel {
 public:
     static bool create(const ModelFile &file, int max_seq_len, QwenModel &target,
-                       std::string *err, std::unique_ptr<DFlashModel> *out);
+                       std::string *err, std::unique_ptr<DFlashModel> *out,
+                       std::unique_ptr<IBackend> backend = nullptr);
+
+    ~DFlashModel();
 
     void reset();
     int seq_len() const { return seq_len_; }
     int block_size() const { return block_size_; }
     int mask_token_id() const { return mask_token_id_; }
     const std::vector<int> &target_layer_ids() const { return target_layer_ids_; }
+    bool enable_vulkan(std::string *err);
+    bool using_vulkan() const { return vulkan_ != nullptr; }
 
     // target_hidden is token-major [ctx_tokens, K, hidden]. The method first
     // commits those confirmed target features to the draft KV cache, then
@@ -30,6 +37,7 @@ public:
                  std::string *err);
 
 private:
+    friend class DFlashVulkanEngine;
     struct Layer {
         const float *input_norm = nullptr;
         const uint16_t *q_proj = nullptr;
@@ -76,6 +84,7 @@ private:
     // token-major [layer, max_seq, kv_dim], fp16 storage / fp32 compute.
     std::vector<uint16_t> k_cache_;
     std::vector<uint16_t> v_cache_;
+    std::unique_ptr<DFlashVulkanEngine> vulkan_;
 };
 
 } // namespace tinyqwen

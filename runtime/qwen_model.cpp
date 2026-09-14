@@ -91,6 +91,17 @@ namespace tinyqwen {
         backend_->matmul(WeightTensor{lm_head_, qt, vocab, width, group_size_},
                          hidden, logits, vocab, width, n);
     }
+
+    bool QwenModel::lm_head_weight(WeightTensor *out) const {
+        if (!out || !lm_head_) return false;
+        QuantType qt = QuantType::kF32;
+        if (lm_head_is_f16_ || lm_head_dtype_ == Dtype::kF16) qt = QuantType::kF16;
+        else if (lm_head_is_i4_ || lm_head_dtype_ == Dtype::kI4) qt = QuantType::kI4;
+        else if (lm_head_dtype_ == Dtype::kGPTQ4) qt = QuantType::kGPTQ;
+        *out = WeightTensor{lm_head_, qt, static_cast<int>(cfg_.vocab_size),
+                            static_cast<int>(cfg_.hidden_size), group_size_};
+        return true;
+    }
     namespace {
         // =====================================================================
         // quant_type_of() — Dtype -> QuantType 的安全映射

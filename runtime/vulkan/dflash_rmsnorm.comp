@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float values[];
+} input_data;
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float values[];
+} weight_data;
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float values[];
+} output_data;
+
+layout(push_constant) uniform RmsParams {
+    uint vectors;
+    uint vector_length;
+    uint input_stride;
+    uint output_stride;
+    uint input_offset;
+    uint output_offset;
+    float epsilon;
+    uint pad0;
+} params;
+
+shared float reductions[256];
+shared float scale_value;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint vector_id = gl_WorkGroupID.x;
+    if (vector_id >= params.vectors) return;
+    const uint input_base = params.input_offset + vector_id * params.input_stride;
+    const uint output_base = params.output_offset + vector_id * params.output_stride;
+
+    float sum = 0.0;
+    for (uint i = lane; i < params.vector_length; i += 256u) {
+        const float value = input_data.values[input_base + i];
+        sum = fma(value, value, sum);
+    }
+    reductions[lane] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) reductions[lane] += reductions[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) {
+        scale_value = inversesqrt(reductions[0] / float(params.vector_length) + params.epsilon);
+    }
+    barrier();
+    for (uint i = lane; i < params.vector_length; i += 256u) {
+        output_data.values[output_base + i] =
+            input_data.values[input_base + i] * scale_value * weight_data.values[i];
+    }
+}

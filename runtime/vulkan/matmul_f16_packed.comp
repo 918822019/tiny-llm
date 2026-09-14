@@ -1,0 +1,59 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// Fast path for the model's even K dimensions.  Two FP16 weights are fetched
+// as one naturally aligned uint and converted together.  A 16-lane clustered
+// subgroup reduction replaces four workgroup barriers and shared-memory passes
+// from the portable kernel.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuffer {
+    uint packed_values[];
+} weight_data;
+layout(set = 0, binding = 1, std430) readonly buffer InputBuffer {
+    vec2 packed_values[];
+} input_data;
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float values[];
+} output_data;
+
+layout(push_constant) uniform MatmulShape {
+    uint rows;
+    uint cols;
+    uint tokens;
+} shape;
+
+const uint kRowsPerGroup = 8u;
+const uint kLanesPerRow = 16u;
+const uint kMaxTokens = 8u;
+
+void main() {
+    const uint local_id = gl_LocalInvocationID.x;
+    const uint row_in_group = local_id / kLanesPerRow;
+    const uint lane = local_id % kLanesPerRow;
+    const uint row = gl_WorkGroupID.x * kRowsPerGroup + row_in_group;
+    const uint pairs_per_row = shape.cols / 2u;
+    float accum[kMaxTokens];
+    for (uint token = 0u; token < kMaxTokens; ++token) accum[token] = 0.0;
+
+    if (row < shape.rows) {
+        const uint weight_base = row * pairs_per_row;
+        for (uint pair = lane; pair < pairs_per_row; pair += kLanesPerRow) {
+            const vec2 weights = unpackHalf2x16(weight_data.packed_values[weight_base + pair]);
+            for (uint token = 0u; token < shape.tokens; ++token) {
+                const vec2 inputs =
+                    input_data.packed_values[token * pairs_per_row + pair];
+                accum[token] = fma(weights.x, inputs.x, accum[token]);
+                accum[token] = fma(weights.y, inputs.y, accum[token]);
+            }
+        }
+    }
+
+    for (uint token = 0u; token < shape.tokens; ++token) {
+        const float sum = subgroupClusteredAdd(accum[token], kLanesPerRow);
+        if (lane == 0u && row < shape.rows)
+            output_data.values[token * shape.rows + row] = sum;
+    }
+}

@@ -1,0 +1,79 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// DFlash/target verify use very small token batches (normally 1..8).  One
+// workgroup processes eight output rows and reuses every FP16 weight across all
+// active token columns.  Activations and accumulation stay FP32 so this matches
+// the existing f16-weight/f32-activation CPU contract.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuffer {
+    float16_t values[];
+} weight_data;
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuffer {
+    float values[];
+} input_data;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float values[];
+} output_data;
+
+layout(push_constant) uniform MatmulShape {
+    uint rows;
+    uint cols;
+    uint tokens;
+} shape;
+
+const uint kRowsPerGroup = 8u;
+const uint kLanesPerRow = 16u;
+const uint kMaxTokens = 8u;
+
+// [row-in-group][lane][token], flattened because some Android GLSL compilers
+// reject multi-dimensional workgroup arrays even though SPIR-V supports them.
+shared float partials[8u * 16u * 8u];
+
+void main() {
+    const uint local_id = gl_LocalInvocationID.x;
+    const uint row_in_group = local_id / kLanesPerRow;
+    const uint lane = local_id % kLanesPerRow;
+    const uint row = gl_WorkGroupID.x * kRowsPerGroup + row_in_group;
+
+    float accum[kMaxTokens];
+    for (uint token = 0u; token < kMaxTokens; ++token) accum[token] = 0.0;
+
+    if (row < shape.rows) {
+        const uint weight_base = row * shape.cols;
+        for (uint col = lane; col < shape.cols; col += kLanesPerRow) {
+            const float w = float(weight_data.values[weight_base + col]);
+            for (uint token = 0u; token < shape.tokens; ++token) {
+                accum[token] = fma(w,
+                                   input_data.values[token * shape.cols + col],
+                                   accum[token]);
+            }
+        }
+    }
+
+    const uint partial_base = (row_in_group * kLanesPerRow + lane) * kMaxTokens;
+    for (uint token = 0u; token < shape.tokens; ++token)
+        partials[partial_base + token] = accum[token];
+    barrier();
+
+    // Tree reduction over the 16 lanes assigned to one output row.  All 128
+    // invocations execute every barrier, including the tail group.
+    for (uint stride = 8u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            const uint rhs = partial_base + stride * kMaxTokens;
+            for (uint token = 0u; token < shape.tokens; ++token)
+                partials[partial_base + token] += partials[rhs + token];
+        }
+        barrier();
+    }
+
+    if (lane == 0u && row < shape.rows) {
+        for (uint token = 0u; token < shape.tokens; ++token)
+            output_data.values[token * shape.rows + row] = partials[partial_base + token];
+    }
+}

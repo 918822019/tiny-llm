@@ -1,0 +1,66 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufferA { float values[]; } a;
+layout(set = 0, binding = 1, std430) readonly buffer BufferB { float values[]; } b;
+layout(set = 0, binding = 2, std430) buffer BufferC { float values[]; } c;
+layout(set = 0, binding = 3, std430) buffer BufferD { float values[]; } d;
+
+layout(push_constant) uniform ElementwiseParams {
+    uint op;
+    uint p0;
+    uint p1;
+    uint p2;
+    uint p3;
+    uint p4;
+    uint p5;
+    uint p6;
+} params;
+
+const uint kFuse = 0u;
+const uint kResidualAdd = 1u;
+const uint kSwiGlu = 2u;
+const uint kStoreKv = 3u;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (params.op == kFuse) {
+        // target hidden: [ctx, selected_layers, hidden]
+        const uint ctx = params.p0;
+        const uint selected_layers = params.p1;
+        const uint hidden = params.p2;
+        if (index >= ctx * hidden) return;
+        const uint token = index / hidden;
+        const uint dim = index - token * hidden;
+        float sum = 0.0;
+        for (uint layer = 0u; layer < selected_layers; ++layer) {
+            sum = fma(a.values[(token * selected_layers + layer) * hidden + dim],
+                      b.values[layer], sum);
+        }
+        c.values[index] = sum;
+    } else if (params.op == kResidualAdd) {
+        const uint count = params.p0;
+        if (index < count) a.values[index] += b.values[index];
+    } else if (params.op == kSwiGlu) {
+        const uint count = params.p0;
+        if (index < count) {
+            const float gate = a.values[index];
+            a.values[index] = gate / (1.0 + exp(-gate)) * b.values[index];
+        }
+    } else if (params.op == kStoreKv) {
+        // Source is token-major [tokens, kv_dim].  Cache is
+        // [layers, max_seq, kv_dim], also token-major within a layer.
+        const uint tokens = params.p0;
+        const uint kv_dim = params.p1;
+        const uint layer = params.p2;
+        const uint max_seq = params.p3;
+        const uint seq_start = params.p4;
+        if (index >= tokens * kv_dim) return;
+        const uint token = index / kv_dim;
+        const uint dim = index - token * kv_dim;
+        const uint dst = ((layer * max_seq + seq_start + token) * kv_dim) + dim;
+        c.values[dst] = a.values[index];
+        d.values[dst] = b.values[index];
+    }
+}

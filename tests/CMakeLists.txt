@@ -51,6 +51,12 @@ if (TINYQWEN_HAS_CUDA)
     target_sources(tinyqwen_tests PRIVATE test_gpu_ops.cpp)
 endif ()
 
+# Android 真机上的 Vulkan FP16 matvec/matmul 数值门禁。主机侧使用 stub，
+# 不注册这些需要物理 Vulkan 设备的测试。
+if (TINYQWEN_HAS_VULKAN)
+    target_sources(tinyqwen_tests PRIVATE test_backend_vulkan.cpp)
+endif ()
+
 # ---------------------------------------------------------------------------
 # 链接依赖库
 # ---------------------------------------------------------------------------

@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer DataBuffer {
+    float values[];
+} data;
+
+layout(push_constant) uniform RopeParams {
+    uint heads;
+    uint head_dim;
+    uint tokens;
+    uint start_position;
+    float theta;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} params;
+
+void main() {
+    const uint half_dim = params.head_dim / 2u;
+    const uint pair_count = params.tokens * params.heads * half_dim;
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= pair_count) return;
+    const uint pair = index % half_dim;
+    const uint head_token = index / half_dim;
+    const uint head = head_token % params.heads;
+    const uint token = head_token / params.heads;
+    const uint base = (token * params.heads + head) * params.head_dim;
+    const float exponent = -2.0 * float(pair) / float(params.head_dim);
+    const float angle = float(params.start_position + token) * pow(params.theta, exponent);
+    const float cosine = cos(angle);
+    const float sine = sin(angle);
+    const float x0 = data.values[base + pair];
+    const float x1 = data.values[base + pair + half_dim];
+    data.values[base + pair] = x0 * cosine - x1 * sine;
+    data.values[base + pair + half_dim] = x1 * cosine + x0 * sine;
+}

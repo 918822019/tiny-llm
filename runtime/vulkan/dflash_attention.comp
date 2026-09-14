@@ -1,0 +1,90 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QueryBuffer { float values[]; } query;
+layout(set = 0, binding = 1, std430) readonly buffer NoiseKeyBuffer { float values[]; } noise_key;
+layout(set = 0, binding = 2, std430) readonly buffer NoiseValueBuffer { float values[]; } noise_value;
+layout(set = 0, binding = 3, std430) readonly buffer KeyCacheBuffer { float values[]; } key_cache;
+layout(set = 0, binding = 4, std430) readonly buffer ValueCacheBuffer { float values[]; } value_cache;
+layout(set = 0, binding = 5, std430) writeonly buffer OutputBuffer { float values[]; } output_data;
+
+layout(push_constant) uniform AttentionParams {
+    uint layer;
+    uint max_seq;
+    uint kv_dim;
+    uint total_context;
+    uint noise_tokens;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    float attention_scale;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} params;
+
+shared float reductions[128];
+shared float softmax_scales[2];
+shared float inverse_denom;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint group = gl_WorkGroupID.x;
+    const uint token = group / params.query_heads;
+    const uint query_head = group % params.query_heads;
+    if (token >= params.noise_tokens) return;
+    const uint groups_per_kv = params.query_heads / params.kv_heads;
+    const uint kv_head = query_head / groups_per_kv;
+    const uint q_base = (token * params.query_heads + query_head) * params.head_dim;
+    const bool active_lane = lane < params.head_dim;
+    const float q = active_lane ? query.values[q_base + lane] : 0.0;
+
+    float maximum = -1.0 / 0.0;
+    float denominator = 0.0;
+    float accumulated = 0.0;
+    const uint total = params.total_context + params.noise_tokens;
+    for (uint position = 0u; position < total; ++position) {
+        float key = 0.0;
+        float value = 0.0;
+        if (active_lane) {
+            if (position < params.total_context) {
+                const uint offset =
+                    ((params.layer * params.max_seq + position) * params.kv_dim) +
+                    kv_head * params.head_dim + lane;
+                key = key_cache.values[offset];
+                value = value_cache.values[offset];
+            } else {
+                const uint noise_position = position - params.total_context;
+                const uint offset = noise_position * params.kv_dim +
+                                    kv_head * params.head_dim + lane;
+                key = noise_key.values[offset];
+                value = noise_value.values[offset];
+            }
+        }
+
+        reductions[lane] = q * key;
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) reductions[lane] += reductions[lane + stride];
+            barrier();
+        }
+        if (lane == 0u) {
+            const float score = reductions[0] * params.attention_scale;
+            const float next_maximum = max(maximum, score);
+            softmax_scales[0] = exp(maximum - next_maximum);
+            softmax_scales[1] = exp(score - next_maximum);
+            denominator = denominator * softmax_scales[0] + softmax_scales[1];
+            maximum = next_maximum;
+        }
+        barrier();
+        if (active_lane) {
+            accumulated = accumulated * softmax_scales[0] +
+                          value * softmax_scales[1];
+        }
+        barrier();
+    }
+    if (lane == 0u) inverse_denom = 1.0 / denominator;
+    barrier();
+    if (active_lane) output_data.values[q_base + lane] = accumulated * inverse_denom;
+}

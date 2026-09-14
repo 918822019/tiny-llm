@@ -189,6 +189,7 @@ namespace tinyqwen {
         bool copy_embedding(int token_id, float *out) const;
         void project_lm_head_raw(const float *hidden, float *logits) const;
         void project_lm_head_raw_batch(const float *hidden, float *logits, int n) const;
+        bool lm_head_weight(WeightTensor *out) const;
 
         // ---------------------------------------------------------------------
         // forward_ppl: 批量 prefill + 全位置 lm_head + 交叉熵，计算困惑度

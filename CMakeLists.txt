@@ -10,9 +10,8 @@
 #   tinyqwen：面向单模型（Qwen2.5-like decoder-only）的实验 runtime。
 #
 # 范围刻意收窄：
-#   - CPU-only 的 reference 路径（FP32）是主线，batch = 1，token-by-token decode；
-#     matvec 的 CUDA 变体是可选的第二条腿（见下方 CUDA 检测块），检测不到
-#     nvcc 时完全不参与构建，不影响这条主线。
+#   - CPU reference 路径仍是主线，batch = 1，token-by-token decode；CUDA、Metal
+#     和 Android Vulkan 都是按平台检测的可选后端，检测不到时编译 stub，不影响主线。
 #   - 不做 graph executor、不做 operator registry、不做 scheduler。
 #   - Android 通过 NDK toolchain 文件支持（见 docs/android.md）。
 #
@@ -29,9 +28,8 @@ project(tinyqwen CXX)                  # 项目名称和语言（C++）
 # tinyqwen：面向单模型（Qwen2.5-like decoder-only）的实验 runtime。
 #
 # 范围刻意收窄：
-#   - CPU-only 的 reference 路径（FP32）是主线，batch = 1，token-by-token decode；
-#     matvec 的 CUDA 变体是可选的第二条腿（见下方 CUDA 检测块），检测不到
-#     nvcc 时完全不参与构建，不影响这条主线。
+#   - CPU reference 路径仍是主线，batch = 1，token-by-token decode；平台 GPU
+#     后端按需启用，缺失工具链时编译 stub，不影响 CPU 行为。
 #   - 不做 graph executor、不做 operator registry、不做 scheduler。
 #   - Android 通过 NDK toolchain 文件支持（见 docs/android.md）。
 # ---------------------------------------------------------------------------
@@ -87,6 +85,33 @@ if (APPLE)
 else ()
     message(STATUS "tinyqwen: 非 Apple 平台，跳过 Metal prefill 引擎")
     set(TINYQWEN_HAS_METAL OFF)
+endif ()
+
+# ---------------------------------------------------------------------------
+# Android Vulkan compute：Adreno/Mali 等 Android GPU 的 FP16 weight-only 后端。
+#
+# Vulkan loader 由 Android 系统提供；GLSL shader 在宿主机上用 NDK 自带 glslc
+# 编译成 SPIR-V，再嵌入最终可执行文件，所以部署时仍只需 push 一个 tinyqwen。
+# 非 Android 构建编译 stub，主机侧 CPU/Metal/CUDA 工作流不受影响。
+# ---------------------------------------------------------------------------
+option(TINYQWEN_ENABLE_VULKAN "Build the Android Vulkan FP16 backend" ON)
+set(TINYQWEN_HAS_VULKAN OFF)
+if (ANDROID AND TINYQWEN_ENABLE_VULKAN)
+    find_library(TINYQWEN_VULKAN_LIBRARY vulkan)
+    find_program(TINYQWEN_GLSLC glslc
+            HINTS
+            "${CMAKE_ANDROID_NDK}/shader-tools/darwin-x86_64"
+            "${CMAKE_ANDROID_NDK}/shader-tools/linux-x86_64"
+            "${ANDROID_NDK}/shader-tools/darwin-x86_64"
+            "${ANDROID_NDK}/shader-tools/linux-x86_64")
+    if (TINYQWEN_VULKAN_LIBRARY AND TINYQWEN_GLSLC)
+        set(TINYQWEN_HAS_VULKAN ON)
+        message(STATUS "tinyqwen: 启用 Android Vulkan FP16 后端 (${TINYQWEN_GLSLC})")
+    else ()
+        message(WARNING
+                "tinyqwen: Android Vulkan 后端已关闭（libvulkan=${TINYQWEN_VULKAN_LIBRARY}, "
+                "glslc=${TINYQWEN_GLSLC}）")
+    endif ()
 endif ()
 
 # 构建子目录：计算内核（matvec、非 matvec 算子、CUDA kernel）
