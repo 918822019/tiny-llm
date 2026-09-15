@@ -1,0 +1,8 @@
+run	order	sequential_tps	batched_tps	seq_drafted	seq_accept	seq_tgt_calls	seq_tgt_tokens	bat_drafted	bat_accept	bat_tgt_calls	bat_tgt_tokens	tile_speedup
+1	sequential-batched	111.094	185.346	42	22	84	84	42	22	42	84	1.668371
+2	batched-sequential	111.819	190.708	42	22	84	84	42	22	42	84	1.705506
+3	sequential-batched	111.106	188.591	42	22	84	84	42	22	42	84	1.697397
+4	batched-sequential	111.976	190.611	42	22	84	84	42	22	42	84	1.702249
+5	sequential-batched	112.224	190.519	42	22	84	84	42	22	42	84	1.697667
+6	batched-sequential	112.240	191.089	42	22	84	84	42	22	42	84	1.702504
+7	sequential-batched	112.001	190.596	42	22	84	84	42	22	42	84	1.701735

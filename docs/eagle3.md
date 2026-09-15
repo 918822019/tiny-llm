@@ -274,7 +274,7 @@ EAGLE3_BENCH_MODE=pair ./scripts/bench_eagle3_ablation_android.sh \
 `draft_ms` 中位为 571.11 ms，`target_verify_ms` 中位为 6077.74 ms。第二次独立的
 7 轮手工配对也得到 decode 中位 1.241x，所以当前权威结论取 **约 1.24x decode、
 约 1.15x 请求内端到端**。早先 1.406x 保留为测量修正前的历史结果，不再作为性能
-结论；它与 llama.cpp 单轮约 1.41x 接近不足以证明两边具有相同的稳定加速倍率。
+结论；此前 llama.cpp 的单轮数字同样不再使用，严格消融见下一节。
 
 #### 宽度与 prompt 探索
 
@@ -300,6 +300,40 @@ token，投机调度把 63 个串行 target step 变成 41 个验证块，而 to
 输入合并执行；二者是乘法交互。**禁用 tile 后投机为 0.741x 负收益，说明执行层面的
 决定性收益来自 batch/tile；但没有 drafter 提案，greedy 路径也没有第二个未来 token
 可以填入 tile。
+
+### 5.4 llama.cpp Metal 的 token tile 消融（2026-09-15）
+
+为了把 llama.cpp 的 EAGLE3 提案与批量验证分开，在
+`llama-speculative-simple` 增加了诊断参数 `--spec-verify-sequential`。默认 batched
+路径一次验证 `[pending root, draft...]`；sequential 路径保持相同输入和 EAGLE3 状态，
+但每个 target token 单独调用一次 decode。程序同时报告 `tgt_calls`、`tgt_tokens` 和
+每次调用的平均 token 数。
+
+测试环境为 Apple M5 Pro MacBook Pro、48 GB 内存、Release + Metal；target 与 EAGLE3
+drafter 都是 Qwen3-0.6B FP16，全部层放到 Metal。使用同一个 41-token Qwen3 chat prompt，
+greedy 强制生成 64 token，`n_max=1`，三路径交替顺序跑 7 轮：
+
+| 路径 | decode 速度中位（token/s） | proposal / accepted | target 调用 / 输入 |
+|---|---:|---:|---:|
+| llama.cpp target-only | 170.490 | - | 64 / 64 |
+| llama.cpp EAGLE3 sequential | 111.954 | 42 / 22 | 84 / 84 |
+| llama.cpp EAGLE3 batched | 189.968 | 42 / 22 | 42 / 84 |
+
+按每轮相邻结果计算，中位数为：无批量验证的投机相对 target-only **0.655x**，投机场景
+内部 batched 相对 sequential **1.697x**，完整 batched EAGLE3 相对 target-only
+**1.112x**。另做一组只包含 sequential/batched 的 7 轮紧邻配对并交替顺序，tile 加速
+中位为 **1.702x**，范围 **1.668-1.706x**，与三路径结果一致。
+
+测试后系统 load average 为 3.88 / 3.17 / 3.24，并非完全空闲；10 秒 `vm_stat` 采样没有
+发生 pageout、swapin 或 swapout。所以下面的归因采用抗后台扰动的相邻配对中位数，绝对
+token/s 仍应在空闲或重启后的机器上复测后再用于跨机器比较。
+
+所有正式样本的输出逐字节相同，sequential 与 batched 的 42 个 proposal ID 也逐项相同；
+两边都处理 84 个 target 输入，唯一控制变量是把相同验证输入按 84 次单-token 调用，
+还是按 42 次双-token block 提交。因此在 llama.cpp/Metal 上，tile 同样是把 EAGLE3
+从负收益转为正收益的关键；但最终 1.112x 仍是 drafter 提案与批量验证的组合收益，
+不能全部归给任一方。逐轮 TSV、proposal trace 与机器信息保存在
+[`artifacts/llama-cpp-eagle3-tile-macbook-7x-20260915/`](../artifacts/llama-cpp-eagle3-tile-macbook-7x-20260915/)。
 
 ## 6. 如何解读“是否符合论文预期”
 

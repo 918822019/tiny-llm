@@ -1,0 +1,8 @@
+run	order	target_tps	sequential_tps	batched_tps	seq_drafted	seq_accept	seq_tgt_calls	seq_tgt_tokens	bat_drafted	bat_accept	bat_tgt_calls	bat_tgt_tokens	tile_speedup	combined_speedup
+1	target-sequential-batched	170.490	111.367	187.173	42	22	84	84	42	22	42	84	1.680686	1.097853
+2	batched-sequential-target	171.051	112.006	192.057	42	22	84	84	42	22	42	84	1.714703	1.122805
+3	target-sequential-batched	171.263	112.185	190.332	42	22	84	84	42	22	42	84	1.696590	1.111343
+4	batched-sequential-target	170.515	111.954	192.318	42	22	84	84	42	22	42	84	1.717831	1.127866
+5	target-sequential-batched	168.740	111.421	174.793	42	22	84	84	42	22	42	84	1.568762	1.035872
+6	batched-sequential-target	170.124	110.685	189.115	42	22	84	84	42	22	42	84	1.708587	1.111630
+7	target-sequential-batched	162.714	112.189	189.968	42	22	84	84	42	22	42	84	1.693285	1.167496

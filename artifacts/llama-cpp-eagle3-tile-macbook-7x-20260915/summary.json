@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-15",
+  "engine": "llama.cpp",
+  "llama_cpp_base_commit": "391fac16460f15233a7740550d858ac96df3419d",
+  "hardware": {
+    "model": "MacBook Pro",
+    "model_identifier": "Mac17,9",
+    "chip": "Apple M5 Pro",
+    "cpu_cores": 15,
+    "memory_gb": 48,
+    "os": "macOS 26.3.2 (25D2140)"
+  },
+  "build": {
+    "type": "Release",
+    "ggml_metal": true,
+    "ggml_accelerate": true,
+    "target_gpu_layers": "all",
+    "draft_gpu_layers": "all"
+  },
+  "measurement_health": {
+    "load_average_after_benchmark": [3.88, 3.17, 3.24],
+    "memory_free_percent_after_benchmark": 49,
+    "swap_used_mb_after_benchmark": 13346.5,
+    "active_paging_sample_seconds": 10,
+    "active_pageouts_during_sample": 0,
+    "active_swapins_during_sample": 0,
+    "active_swapouts_during_sample": 0,
+    "assessment": "Background load was present, but no active paging was observed and adjacent paired ratios were stable. Use the paired median for attribution; rerun on an idle machine for publication-grade absolute throughput."
+  },
+  "models": {
+    "target": "/Users/wzy/code/llama-models/qwen3-0.6b-eagle3/Qwen3-0.6B-F16.gguf",
+    "draft": "/Users/wzy/code/llama-models/qwen3-0.6b-eagle3/Qwen3-0.6B-EAGLE3-SpecForge-F16.gguf",
+    "precision": "F16"
+  },
+  "workload": {
+    "prompt": "Explain why the sky is blue in one concise sentence.",
+    "chat_template": "Qwen3 system/user/assistant",
+    "prompt_tokens": 41,
+    "generated_tokens": 64,
+    "temperature": 0.0,
+    "seed": 1,
+    "ignore_eos": true,
+    "context_tokens": 256,
+    "draft_n_max": 1,
+    "draft_n_min": 1,
+    "max_verify_block_tokens": 2
+  },
+  "ablation_definition": {
+    "target_only": "No drafter; one target token per decode call.",
+    "eagle_sequential": "EAGLE3 enabled; the same root and draft target inputs are evaluated in separate one-token decode calls.",
+    "eagle_batched": "EAGLE3 enabled; root and draft target inputs are evaluated in one multi-token decode call.",
+    "tile_speedup": "eagle_batched_tps / eagle_sequential_tps",
+    "no_tile_speculation_vs_target": "eagle_sequential_tps / target_only_tps",
+    "combined_speedup": "eagle_batched_tps / target_only_tps"
+  },
+  "invariants": {
+    "draft_proposed": 42,
+    "draft_accepted": 22,
+    "acceptance_rate": 0.523809524,
+    "sequential_target_decode_calls": 84,
+    "sequential_target_input_tokens": 84,
+    "batched_target_decode_calls": 42,
+    "batched_target_input_tokens": 84,
+    "target_only_decode_calls": 64,
+    "target_only_input_tokens": 64,
+    "all_generated_outputs_byte_identical": true,
+    "sequential_and_batched_proposal_ids_identical": true,
+    "sequential_and_batched_draft_statistics_identical": true,
+    "sequential_and_batched_target_input_counts_identical": true
+  },
+  "three_way_7x": {
+    "target_only_tps": [170.490, 171.051, 171.263, 170.515, 168.740, 170.124, 162.714],
+    "eagle_sequential_tps": [111.367, 112.006, 112.185, 111.954, 111.421, 110.685, 112.189],
+    "eagle_batched_tps": [187.173, 192.057, 190.332, 192.318, 174.793, 189.115, 189.968],
+    "median_tps": {
+      "target_only": 170.490,
+      "eagle_sequential": 111.954,
+      "eagle_batched": 189.968
+    },
+    "paired_no_tile_speculation_vs_target": [0.653217, 0.654811, 0.655045, 0.656564, 0.660312, 0.650614, 0.689486],
+    "paired_tile_speedup": [1.680686, 1.714703, 1.696590, 1.717831, 1.568762, 1.708587, 1.693285],
+    "paired_combined_speedup": [1.097853, 1.122805, 1.111343, 1.127866, 1.035872, 1.111630, 1.167496],
+    "paired_median": {
+      "no_tile_speculation_vs_target": 0.655045,
+      "tile_speedup": 1.696590,
+      "combined_speedup": 1.111630
+    }
+  },
+  "tile_pair_repeat_7x": {
+    "eagle_sequential_tps": [111.094, 111.819, 111.106, 111.976, 112.224, 112.240, 112.001],
+    "eagle_batched_tps": [185.346, 190.708, 188.591, 190.611, 190.519, 191.089, 190.596],
+    "paired_tile_speedup": [1.668371, 1.705506, 1.697397, 1.702249, 1.697667, 1.702504, 1.701735],
+    "median_tps": {
+      "eagle_sequential": 111.976,
+      "eagle_batched": 190.596
+    },
+    "paired_tile_speedup_median": 1.701735,
+    "paired_tile_speedup_mean": 1.696490,
+    "paired_tile_speedup_min": 1.668371,
+    "paired_tile_speedup_max": 1.705506
+  },
+  "files": {
+    "three_way_results": "results.tsv",
+    "tile_pair_repeat_results": "tile-pair-results.tsv",
+    "sequential_proposal_ids": "trace-sequential-proposal-ids.txt",
+    "batched_proposal_ids": "trace-batched-proposal-ids.txt"
+  },
+  "notes": [
+    "Decode throughput excludes model loading and prompt prefill.",
+    "Recorded path order is reversed on alternating runs.",
+    "The second seven-run sequential/batched adjacent pairing is the primary tile measurement.",
+    "The first run in the repeat has a lower batched throughput; the paired median is used as the headline result.",
+    "Background load makes absolute throughput provisional, while the stable adjacent paired ratio supports the tile attribution."
+  ]
+}
